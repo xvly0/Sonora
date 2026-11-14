@@ -425,6 +425,64 @@ function syncNativeNextTrack(force) {
     }
   } catch (e) {}
 }
+function enqueueTracks(tracks, mode, autoPlayIfIdle) {
+  const list = (Array.isArray(tracks) ? tracks : [tracks]).filter(tr => tr && tr.id);
+  if (!list.length) return [];
+  const wrapped = list.map(tr => Object.assign({}, tr, { _queued: true, _smartRec: false }));
+  if (!PL.queue.length && typeof reconcileNativePlayback === 'function') {
+    reconcileNativePlayback();
+  }
+  if (!PL.queue.length && typeof window !== 'undefined' && window.SonoraNative && typeof window.SonoraNative.getPlaybackSnapshot === 'function') {
+    try {
+      const snap = JSON.parse(window.SonoraNative.getPlaybackSnapshot() || 'null');
+      if (snap && snap.active && snap.trackId) {
+        const fallback = {
+          id: snap.trackId,
+          title: snap.title || '',
+          artist: snap.artist || '',
+          thumb: snap.thumb || null,
+          dur: Math.round(snap.durSec > 1 ? snap.durSec : 180)
+        };
+        const activeTr = typeof ingestTrack === 'function' ? ingestTrack(fallback) : fallback;
+        if (activeTr) {
+          PL.queue = [activeTr];
+          PL.qi = 0;
+          PL.playing = !!snap.isPlaying;
+        }
+      }
+    } catch (e) {}
+  }
+  if (!PL.queue.length) {
+    if (autoPlayIfIdle) {
+      if (wrapped.length === 1 && typeof playOne === 'function') playOne(wrapped[0]);
+      else if (typeof playList === 'function') playList(wrapped, 0);
+      return wrapped;
+    }
+    PL.queue = wrapped.slice();
+    PL.qi = 0;
+  } else {
+    PL.qi = Math.max(0, Math.min(PL.qi | 0, PL.queue.length - 1));
+    if (mode === 'next') {
+      PL.queue.splice(PL.qi + 1, 0, ...wrapped);
+    } else {
+      PL.queue.push(...wrapped);
+    }
+  }
+  syncNativeNextTrack(true);
+  const nx = PL.queue[PL.qi + 1];
+  if (nx && nx.id) {
+    if (typeof window !== 'undefined' && window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') {
+      try { window.SonoraNative.prefetch(nx.id); } catch (e) {}
+    } else if (typeof fetch === 'function') {
+      fetch('/api/prefetch/' + nx.id).catch(() => {});
+    }
+    if (typeof preloadArt === 'function') preloadArt(nx, false);
+    if (typeof liveLy === 'function') liveLy(nx);
+  }
+  if (typeof savePlayerState === 'function') savePlayerState();
+  if (typeof redraw === 'function') redraw();
+  return wrapped;
+}
 function syncNativeRepeat() {
   const N = typeof window !== 'undefined' && window.SonoraNative;
   if (N && typeof N.setRepeatMode === 'function') {

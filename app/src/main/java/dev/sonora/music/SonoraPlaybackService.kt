@@ -847,6 +847,7 @@ class SonoraPlaybackService : MediaSessionService() {
                     }
                     val newId = mediaItem.mediaId
                     if (newId.isNotEmpty() && newId != currentTrackId) {
+                        trimPlayedMediaItemsOnMain()
                         currentTrackId = newId
                         currentTitle = mediaItem.mediaMetadata.title?.toString() ?: currentTitle
                         currentArtist = mediaItem.mediaMetadata.artist?.toString() ?: currentArtist
@@ -1135,15 +1136,44 @@ class SonoraPlaybackService : MediaSessionService() {
         }
     }
 
+    private fun trimPlayedMediaItemsOnMain() {
+        if (!::player.isInitialized) return
+        val curIdx = player.currentMediaItemIndex
+        if (curIdx > 0 && curIdx < player.mediaItemCount) {
+            player.removeMediaItems(0, curIdx)
+        }
+    }
+
+    private fun syncNextMediaItemOnMain(nextItem: MediaItem?) {
+        if (!::player.isInitialized || player.mediaItemCount == 0) return
+        trimPlayedMediaItemsOnMain()
+        val curIdx = player.currentMediaItemIndex.coerceAtLeast(0)
+        val nextIdx = curIdx + 1
+        if (nextItem == null) {
+            if (player.mediaItemCount > nextIdx) {
+                player.removeMediaItems(nextIdx, player.mediaItemCount)
+            }
+            return
+        }
+        if (player.mediaItemCount == nextIdx) {
+            player.addMediaItem(nextItem)
+        } else if (player.mediaItemCount > nextIdx) {
+            if (player.getMediaItemAt(nextIdx).mediaId != nextItem.mediaId) {
+                player.replaceMediaItem(nextIdx, nextItem)
+            }
+            if (player.mediaItemCount > nextIdx + 1) {
+                player.removeMediaItems(nextIdx + 1, player.mediaItemCount)
+            }
+        }
+    }
+
     fun setNextTrack(trackId: String, title: String, artist: String, thumbUrl: String?) {
         scope.launch(Dispatchers.Main) {
             val isRepeatOne = currentRepeatMode == 2
             nextTrackId = if (!isRepeatOne && trackId.isNotBlank() && trackId != currentTrackId) trackId else ""
             if (isRepeatOne || trackId.isBlank() || trackId == currentTrackId || crossfadeSec > 0) {
                 nextThumb = ""
-                if (player.mediaItemCount > 1) {
-                    player.removeMediaItems(1, player.mediaItemCount)
-                }
+                syncNextMediaItemOnMain(null)
                 if (nextTrackId.isNotEmpty()) {
                     prefetch(nextTrackId)
                     prewarmNextAudioBytes(nextTrackId)
@@ -1152,26 +1182,10 @@ class SonoraPlaybackService : MediaSessionService() {
                 }
                 return@launch
             }
-            if (player.mediaItemCount > 1 && player.getMediaItemAt(1).mediaId == trackId) {
-                nextThumb = thumbUrl ?: nextThumb
-                if (player.mediaItemCount > 2) {
-                    player.removeMediaItems(2, player.mediaItemCount)
-                }
-                prefetch(trackId)
-                prewarmNextAudioBytes(trackId)
-                return@launch
-            }
             nextThumb = thumbUrl ?: ""
             prefetch(trackId)
             val nextItem = buildMediaItem(trackId, title, artist, thumbUrl)
-            if (player.mediaItemCount == 1) {
-                player.addMediaItem(nextItem)
-            } else if (player.mediaItemCount > 1) {
-                player.replaceMediaItem(1, nextItem)
-                if (player.mediaItemCount > 2) {
-                    player.removeMediaItems(2, player.mediaItemCount)
-                }
-            }
+            syncNextMediaItemOnMain(nextItem)
             prewarmNextAudioBytes(trackId)
         }
     }
@@ -1215,9 +1229,7 @@ class SonoraPlaybackService : MediaSessionService() {
             nextTrackId = ""
             nextThumb = ""
             cancelPrewarmBytesJob()
-            if (::player.isInitialized && player.mediaItemCount > 1) {
-                player.removeMediaItems(1, player.mediaItemCount)
-            }
+            syncNextMediaItemOnMain(null)
         }
         updateMediaSessionCustomLayout()
     }
@@ -1428,8 +1440,8 @@ class SonoraPlaybackService : MediaSessionService() {
         skipFadeEnabled = skipFade
         mixer.skipFadeMs = { if (skipFadeEnabled) 520 else 0 }
         scope.launch(Dispatchers.Main) {
-            if (crossfadeSec > 0 && player.mediaItemCount > 1) {
-                player.removeMediaItems(1, player.mediaItemCount)
+            if (crossfadeSec > 0) {
+                syncNextMediaItemOnMain(null)
             }
             if (crossfadeSec <= 0 && fadeJob?.isActive != true) {
                 retireTail()

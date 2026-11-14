@@ -290,13 +290,14 @@ class InnerTube {
         query: String? = null,
         params: String? = null,
         continuation: String? = null,
+        localeOverride: YouTubeLocale? = null,
     ) = withRetry {
         httpClient.post("search") {
             ytClient(client, setLogin = false)
             setBody(
                 SearchBody(
                     context = client.toContext(
-                        locale,
+                        localeOverride ?: locale,
                         visitorData,
                         null
                     ),

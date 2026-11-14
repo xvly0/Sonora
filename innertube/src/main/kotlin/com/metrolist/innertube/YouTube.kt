@@ -192,9 +192,12 @@ object YouTube {
             )
         }
 
-    suspend fun searchSummary(query: String): Result<SearchSummaryPage> =
+    suspend fun searchSummary(
+        query: String,
+        localeOverride: YouTubeLocale? = null,
+    ): Result<SearchSummaryPage> =
         runCatching {
-            val response = innerTube.search(WEB_REMIX, query).body<SearchResponse>()
+            val response = innerTube.search(WEB_REMIX, query, localeOverride = localeOverride).body<SearchResponse>()
             val allSummaries = mutableListOf<SearchSummary>()
 
             response.contents
@@ -342,9 +345,10 @@ object YouTube {
     suspend fun search(
         query: String,
         filter: SearchFilter,
+        localeOverride: YouTubeLocale? = null,
     ): Result<SearchResult> =
         runCatching {
-            val response = innerTube.search(WEB_REMIX, query, filter.value).body<SearchResponse>()
+            val response = innerTube.search(WEB_REMIX, query, filter.value, localeOverride = localeOverride).body<SearchResponse>()
             val searchItems = mutableListOf<YTItem>()
             var searchContinuation: String? = null
 

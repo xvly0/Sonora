@@ -596,9 +596,9 @@ function cmAct(i) {
     closeCM();
     const arTr = tracksOf(trItem).slice(0, 5);
     if (arTr.length) {
-      PL.queue.push(...arTr.map(qWrap));
+      if (typeof enqueueTracks === 'function') enqueueTracks(arTr, 'end', false);
+      else { PL.queue.push(...arTr.map(qWrap)); redraw(); }
       if (typeof liveToast === 'function') liveToast(t('toast.popular_added_queue'), 2000);
-      redraw();
     }
     return;
   }
@@ -633,10 +633,12 @@ function cmAct(i) {
 
   if (isTr(trItem)) {
     if (k === 'next') {
-      PL.queue.splice(PL.qi + 1, 0, qWrap(trItem));
+      if (typeof enqueueTracks === 'function') enqueueTracks(trItem, 'next', false);
+      else PL.queue.splice(PL.qi + 1, 0, qWrap(trItem));
       if (typeof liveToast === 'function') liveToast(t('toast.play_next', { title: trItem.title }), 2000);
     } else if (k === 'queue') {
-      PL.queue.push(qWrap(trItem));
+      if (typeof enqueueTracks === 'function') enqueueTracks(trItem, 'end', false);
+      else PL.queue.push(qWrap(trItem));
       if (typeof liveToast === 'function') liveToast(t('toast.added_to_queue', { title: trItem.title }), 2000);
     } else if (k === 'fav') {
       PL.fav[trItem.id] = !PL.fav[trItem.id];
@@ -648,10 +650,13 @@ function cmAct(i) {
     if (typeof liveToast === 'function') liveToast(t(isPinned(trItem) ? 'toast.pin_added' : 'toast.pin_removed'), 1800);
   } else if (k === 'next' || k === 'queue') {
     const add = tr => {
-      const wTr = tr.map(qWrap);
-      if (k === 'next') PL.queue.splice(PL.qi + 1, 0, ...wTr);
-      else PL.queue.push(...wTr);
-      redraw();
+      if (typeof enqueueTracks === 'function') enqueueTracks(tr, k === 'next' ? 'next' : 'end', false);
+      else {
+        const wTr = tr.map(qWrap);
+        if (k === 'next') PL.queue.splice(PL.qi + 1, 0, ...wTr);
+        else PL.queue.push(...wTr);
+        redraw();
+      }
     };
     if (LIVE.on && !trItem.loaded && !tracksOf(trItem).length) {
       liveLoad(trItem).then(() => add(tracksOf(trItem)));
@@ -2538,11 +2543,16 @@ function swqFireThreshold() {
 
 function swqEnqueue(tr) {
   if (!tr) return;
+  if (typeof enqueueTracks === 'function') {
+    enqueueTracks(tr, 'next', true);
+    return;
+  }
   const qtr = Object.assign({}, tr, { _queued: true, _smartRec: false });
   if (!PL.queue.length) {
     if (typeof playOne === 'function') playOne(qtr);
     else playList([qtr], 0);
   } else {
+    PL.qi = Math.max(0, Math.min(PL.qi | 0, PL.queue.length - 1));
     PL.queue.splice(PL.qi + 1, 0, qtr);
   }
 }

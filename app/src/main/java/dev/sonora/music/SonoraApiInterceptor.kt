@@ -2832,17 +2832,19 @@ object SonoraApiInterceptor {
             else -> "songs"
         }
 
+        val searchLocale = SonoraLocaleManager.effectiveRegionalYoutubeLocale()
+
         if (type == "all") {
             val (summary, songResults) = coroutineScope {
                 val summaryDef = async(Dispatchers.IO) {
-                    runCatching { YouTube.searchSummary(cleanQ).getOrNull() }.getOrElse {
+                    runCatching { YouTube.searchSummary(cleanQ, localeOverride = searchLocale).getOrNull() }.getOrElse {
                         android.util.Log.w("SonoraSearch", "searchSummary failed for $cleanQ: ${it.message}")
                         null
                     }
                 }
                 val songsDef = async(Dispatchers.IO) {
                     runCatching {
-                        YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_SONG).getOrNull()
+                        YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_SONG, localeOverride = searchLocale).getOrNull()
                             ?.items?.filterIsInstance<SongItem>().orEmpty()
                     }.getOrElse {
                         android.util.Log.w("SonoraSearch", "FILTER_SONG failed for $cleanQ: ${it.message}")
@@ -2863,12 +2865,22 @@ object SonoraApiInterceptor {
                 else -> "songs"
             }
 
-            if (firstTopItem is SongItem) addSong(firstTopItem)
+            if (firstTopItem is SongItem && !firstTopItem.isVideoSong && !isNoisyVideoTitle(firstTopItem.title, cleanQ)) {
+                addSong(firstTopItem)
+            }
+            if (firstTopItem !is SongItem) {
+                topSec?.items?.filterIsInstance<SongItem>()
+                    ?.filter { !it.isVideoSong && !isNoisyVideoTitle(it.title, cleanQ) }
+                    ?.forEach { addSong(it) }
+            }
+            songResults.filter { !it.isVideoSong && !isNoisyVideoTitle(it.title, cleanQ) }.forEach { addSong(it) }
             for (sec in summary?.summaries.orEmpty()) {
-                if (sec.title.equals("Songs", true) || sec.title.equals("Brani", true)) {
+                val secLow = sec.title.lowercase()
+                if (secLow in setOf("songs", "brani", "titres", "titel", "canciones", "musicas", "músicas")) {
                     sec.items.filterIsInstance<SongItem>().forEach { addSong(it) }
                 }
             }
+            if (firstTopItem is SongItem) addSong(firstTopItem)
             songResults.forEach { addSong(it) }
 
             when (firstTopItem) {
@@ -2897,19 +2909,19 @@ object SonoraApiInterceptor {
         } else {
             when (type) {
                 "songs" -> runCatching {
-                    YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_SONG).getOrNull()
+                    YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_SONG, localeOverride = searchLocale).getOrNull()
                         ?.items?.filterIsInstance<SongItem>().orEmpty()
                 }.getOrDefault(emptyList()).forEach { addSong(it) }
                 "albums" -> runCatching {
-                    YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_ALBUM).getOrNull()
+                    YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_ALBUM, localeOverride = searchLocale).getOrNull()
                         ?.items?.filterIsInstance<AlbumItem>().orEmpty()
                 }.getOrDefault(emptyList()).forEach { addAlbum(it) }
                 "artists" -> runCatching {
-                    YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_ARTIST).getOrNull()
+                    YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_ARTIST, localeOverride = searchLocale).getOrNull()
                         ?.items?.filterIsInstance<ArtistItem>().orEmpty()
                 }.getOrDefault(emptyList()).forEach { addArtist(it) }
                 "playlists" -> runCatching {
-                    YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_COMMUNITY_PLAYLIST).getOrNull()
+                    YouTube.search(cleanQ, YouTube.SearchFilter.FILTER_COMMUNITY_PLAYLIST, localeOverride = searchLocale).getOrNull()
                         ?.items?.filterIsInstance<PlaylistItem>().orEmpty()
                 }.getOrDefault(emptyList()).forEach { addPlaylist(it) }
             }
@@ -3072,7 +3084,7 @@ object SonoraApiInterceptor {
         }.toString())
 
         val locKey = SonoraLocaleManager.cacheTag()
-        val cacheKey = "search_v12:$locKey:$type:${cleanQ.lowercase()}"
+        val cacheKey = "search_v13:$locKey:$type:${cleanQ.lowercase()}"
         ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
 
         val disk = SnapshotDiskCache.get(cacheKey, freshTtlMs = 1_800_000L)
