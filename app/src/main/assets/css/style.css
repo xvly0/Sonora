@@ -1,0 +1,225 @@
+:root {
+  --stage-a: #7fa9d6; --stage-b: #d98fb3; --bezel: #0b0b0d; --bg: #ffffff; --bg-rgb: 255, 255, 255; --fg: #000000;
+  --font: -apple-system, "SF Pro Display", system-ui, "Inter", sans-serif;
+  --bar-h: 112px;
+  --prompt-sheet-bg: rgba(255, 255, 255, 0.72);
+  --prompt-sheet-border: rgba(0, 0, 0, 0.08);
+  --prompt-badge-bg: rgba(0, 0, 0, 0.055);
+  --prompt-sub-color: rgba(0, 0, 0, 0.56);
+  --prompt-input-bg: rgba(0, 0, 0, 0.06);
+  --prompt-input-border: rgba(0, 0, 0, 0.10);
+  --prompt-cancel-bg: rgba(120, 120, 128, 0.14);
+  --prompt-cancel-hover: rgba(120, 120, 128, 0.24);
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --stage-a: #1b2740; --stage-b: #3a1d33; --bezel: #0d0d0d; --bg: #000000; --bg-rgb: 0, 0, 0; --fg: #ffffff; color-scheme: dark; --prompt-sheet-bg: rgba(28, 28, 32, 0.78); --prompt-sheet-border: rgba(255, 255, 255, 0.14); --prompt-badge-bg: rgba(255, 255, 255, 0.09); --prompt-sub-color: rgba(235, 235, 245, 0.62); --prompt-input-bg: rgba(255, 255, 255, 0.09); --prompt-input-border: rgba(255, 255, 255, 0.14); --prompt-cancel-bg: rgba(255, 255, 255, 0.12); --prompt-cancel-hover: rgba(255, 255, 255, 0.20); } }
+:root[data-theme="dark"] { --stage-a: #1b2740; --stage-b: #3a1d33; --bezel: #0d0d0d; --bg: #000000; --bg-rgb: 0, 0, 0; --fg: #ffffff; color-scheme: dark; --prompt-sheet-bg: rgba(28, 28, 32, 0.78); --prompt-sheet-border: rgba(255, 255, 255, 0.14); --prompt-badge-bg: rgba(255, 255, 255, 0.09); --prompt-sub-color: rgba(235, 235, 245, 0.62); --prompt-input-bg: rgba(255, 255, 255, 0.09); --prompt-input-border: rgba(255, 255, 255, 0.14); --prompt-cancel-bg: rgba(255, 255, 255, 0.12); --prompt-cancel-hover: rgba(255, 255, 255, 0.20); }
+:root[data-theme="light"] { --bg: #ffffff; --bg-rgb: 255, 255, 255; --fg: #000000; color-scheme: light; --prompt-sheet-bg: rgba(255, 255, 255, 0.72); --prompt-sheet-border: rgba(0, 0, 0, 0.08); --prompt-badge-bg: rgba(0, 0, 0, 0.055); --prompt-sub-color: rgba(0, 0, 0, 0.56); --prompt-input-bg: rgba(0, 0, 0, 0.06); --prompt-input-border: rgba(0, 0, 0, 0.10); --prompt-cancel-bg: rgba(120, 120, 128, 0.14); --prompt-cancel-hover: rgba(120, 120, 128, 0.24); }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font); overflow: hidden; overscroll-behavior: none; -webkit-user-select: none; user-select: none; }
+.stage { height: 100%; display: flex; align-items: center; justify-content: center; }
+.phone { position: relative; width: 100%; max-width: 640px; height: 100%; background: var(--bg); }
+#out { display: block; width: 100%; height: 100%; touch-action: none; outline: none; position: relative; z-index: 1; }
+#top { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 20; }
+
+/* ---------- Topbar blur ---------- */
+.topbar {
+  position: absolute;
+  inset: 0 0 auto 0;
+  z-index: 10;
+  pointer-events: none;
+  --p0: 0; --p1: 0;
+  --rgb0: 255, 255, 255; --rgb1: 255, 255, 255;
+  --split: 0px;
+}
+.topbar .blur {
+  position: absolute;
+  top: 0;
+  height: var(--bar-h, 112px);
+}
+.topbar .blur.prev {
+  left: 0;
+  width: var(--split);
+}
+.topbar .blur.curr {
+  left: var(--split);
+  right: 0;
+}
+.topbar .blur span {
+  position: absolute;
+  inset: 0;
+  -webkit-mask-size: 100% 100%;
+  mask-size: 100% 100%;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}
+.topbar .blur.prev span {
+  opacity: var(--p0);
+}
+.topbar .blur.curr span {
+  opacity: var(--p1);
+}
+.topbar .blur .l1 { -webkit-backdrop-filter: blur(24px);   backdrop-filter: blur(24px);   -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0) -16.7%, #000 0%,    #000 16.7%,  rgba(0,0,0,0) 33.3%);  mask-image: linear-gradient(to bottom, rgba(0,0,0,0) -16.7%, #000 0%,    #000 16.7%,  rgba(0,0,0,0) 33.3%); }
+.topbar .blur .l2 { -webkit-backdrop-filter: blur(12px);   backdrop-filter: blur(12px);   -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 0%,     #000 16.7%, #000 33.3%,  rgba(0,0,0,0) 50%);    mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 0%,     #000 16.7%, #000 33.3%,  rgba(0,0,0,0) 50%); }
+.topbar .blur .l3 { -webkit-backdrop-filter: blur(6px);    backdrop-filter: blur(6px);    -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 16.7%,  #000 33.3%, #000 50%,    rgba(0,0,0,0) 66.7%);  mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 16.7%,  #000 33.3%, #000 50%,    rgba(0,0,0,0) 66.7%); }
+.topbar .blur .l4 { -webkit-backdrop-filter: blur(3px);    backdrop-filter: blur(3px);    -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 33.3%,  #000 50%,   #000 66.7%,  rgba(0,0,0,0) 83.3%);  mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 33.3%,  #000 50%,   #000 66.7%,  rgba(0,0,0,0) 83.3%); }
+.topbar .blur .l5 { -webkit-backdrop-filter: blur(1.5px);  backdrop-filter: blur(1.5px);  -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 50%,    #000 66.7%, #000 83.3%,  rgba(0,0,0,0) 100%);   mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 50%,    #000 66.7%, #000 83.3%,  rgba(0,0,0,0) 100%); }
+.topbar .blur .l6 { -webkit-backdrop-filter: blur(0.75px); backdrop-filter: blur(0.75px); -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 66.7%,  #000 83.3%, rgba(0,0,0,0) 100%);                   mask-image: linear-gradient(to bottom, rgba(0,0,0,0) 66.7%,  #000 83.3%, rgba(0,0,0,0) 100%); }
+
+/* Backdrop tint keeps topbar text legible over bright covers */
+.topbar .blur.prev .tint {
+  background: linear-gradient(to bottom, rgba(var(--rgb0), 0.82), rgba(var(--rgb0), 0));
+}
+.topbar .blur.curr .tint {
+  background: linear-gradient(to bottom, rgba(var(--rgb1), 0.82), rgba(var(--rgb1), 0));
+}
+#q { -webkit-appearance: none; appearance: none; position: fixed; left: 0; top: 0; width: 320px; height: 48px; opacity: 0; font-size: 16px; border: 0; padding: 0; pointer-events: none; -webkit-user-select: text; user-select: text; direction: ltr; text-align: left; }
+@supports (height: 100dvh) { .stage { height: 100dvh; } }
+
+/* ---------- LiquidGlass Prompt Modal ---------- */
+#sonoraPrompt,
+.prompt-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  padding: 20px;
+  padding-bottom: calc(20px + var(--prompt-kb, 0px));
+  box-sizing: border-box;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+}
+#sonoraPrompt.fallback-gl,
+.prompt-backdrop.fallback-gl {
+  background: rgba(0, 0, 0, 0.34);
+}
+#sonoraPrompt.visible,
+#sonoraPrompt.active,
+.prompt-backdrop.visible,
+.prompt-backdrop.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+.prompt-sheet {
+  width: 100%;
+  max-width: 332px;
+  background: transparent;
+  border: none;
+  border-radius: 28px;
+  padding: 24px 20px 20px;
+  box-sizing: border-box;
+  box-shadow: none;
+  transform: scale(0.92) translateY(10px);
+  opacity: 0;
+  transition: transform 0.30s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+#sonoraPrompt.fallback-gl .prompt-sheet,
+.prompt-backdrop.fallback-gl .prompt-sheet {
+  background: var(--prompt-sheet-bg, rgba(28, 28, 32, 0.78));
+  border: 1px solid var(--prompt-sheet-border, rgba(255, 255, 255, 0.14));
+}
+#sonoraPrompt.visible .prompt-sheet,
+#sonoraPrompt.active .prompt-sheet,
+.prompt-backdrop.visible .prompt-sheet,
+.prompt-backdrop.active .prompt-sheet {
+  transform: scale(1) translateY(0);
+  opacity: 1;
+}
+.prompt-badge {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  background: var(--prompt-badge-bg, rgba(255, 255, 255, 0.09));
+  color: #fa2e49;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 12px;
+  box-shadow: none;
+}
+.prompt-title {
+  font-family: var(--font);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.35px;
+  text-align: center;
+  margin-bottom: 4px;
+  color: var(--fg);
+}
+.prompt-sub {
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 500;
+  text-align: center;
+  margin-bottom: 16px;
+  color: var(--prompt-sub-color, rgba(140, 140, 150, 0.85));
+}
+.prompt-input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 46px;
+  padding: 0 15px;
+  border-radius: 14px;
+  border: 1px solid var(--prompt-input-border, rgba(255, 255, 255, 0.15));
+  background: var(--prompt-input-bg, rgba(255, 255, 255, 0.08));
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 15.5px;
+  font-weight: 500;
+  outline: none;
+  margin-bottom: 18px;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.prompt-input:focus {
+  border-color: #fa2e49;
+  box-shadow: none;
+}
+.prompt-btns {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+}
+.prompt-btn {
+  flex: 1;
+  height: 44px;
+  border-radius: 14px;
+  font-family: var(--font);
+  font-size: 15px;
+  font-weight: 600;
+  border: none;
+  box-shadow: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  outline: none;
+  transition: opacity 0.15s ease, transform 0.12s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+.prompt-btn:active {
+  transform: scale(0.97);
+}
+.prompt-btn-cancel {
+  background: var(--prompt-cancel-bg, rgba(120, 120, 128, 0.14));
+  color: var(--fg);
+}
+.prompt-btn-cancel:active {
+  background: var(--prompt-cancel-hover, rgba(120, 120, 128, 0.24));
+}
+.prompt-btn-confirm {
+  background: #fa2e49;
+  color: #ffffff;
+  border: none;
+  box-shadow: none;
+}
+.prompt-btn-confirm:active {
+  opacity: 0.86;
+}

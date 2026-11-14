@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sonora</string>
+    <string name="pick_cover_title">Choose cover</string>
+    <string name="share_title">Share</string>
+    <string name="playback_default_artist">Playing</string>
+    <string name="playback_error_generic">Playback error</string>
+    <string name="notification_channel_name">Sonora Playback</string>
+    <string name="notification_channel_description">Background music playback controls</string>
+    <string name="repeat_all">Repeat all</string>
+    <string name="repeat_one">Repeat track</string>
+    <string name="repeat_off">Repeat</string>
+    <string name="remove_from_favorites">Remove from favorites</string>
+    <string name="add_to_favorites">Add to favorites</string>
+    <string name="audio_output_speaker">Phone speaker</string>
+    <string name="audio_output_wired">Wired headphones</string>
+    <string name="audio_output_bluetooth">Bluetooth device</string>
+    <string name="audio_output_usb">USB Audio</string>
+    <string name="audio_output_default">Audio output</string>
+</resources>

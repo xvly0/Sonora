@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sonora</string>
+    <string name="pick_cover_title">Scegli copertina</string>
+    <string name="share_title">Condividi</string>
+    <string name="playback_default_artist">In riproduzione</string>
+    <string name="playback_error_generic">Errore durante la riproduzione</string>
+    <string name="notification_channel_name">Sonora Riproduzione</string>
+    <string name="notification_channel_description">Controlli di riproduzione musicale in background</string>
+    <string name="repeat_all">Ripeti tutto</string>
+    <string name="repeat_one">Ripeti brano</string>
+    <string name="repeat_off">Ripeti</string>
+    <string name="remove_from_favorites">Rimuovi dai preferiti</string>
+    <string name="add_to_favorites">Aggiungi ai preferiti</string>
+    <string name="audio_output_speaker">Altoparlante telefono</string>
+    <string name="audio_output_wired">Cuffie con filo</string>
+    <string name="audio_output_bluetooth">Dispositivo Bluetooth</string>
+    <string name="audio_output_usb">Audio USB</string>
+    <string name="audio_output_default">Uscita audio</string>
+</resources>

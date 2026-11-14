@@ -1,0 +1,32 @@
+# Gradle & Kotlin
+.gradle/
+build/
+*/build/
+.kotlin/
+*.hprof
+
+# Android local config & signing secrets
+local.properties
+keystore.properties
+*.jks
+*.keystore
+
+# Build artifacts
+*.apk
+*.ap_
+*.aab
+*.dex
+
+# IDE
+.idea/
+*.iml
+.cxx/
+
+# Scratch, local guides & backups
+scratch/
+AGENTS.md
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
