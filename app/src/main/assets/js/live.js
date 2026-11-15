@@ -4864,6 +4864,9 @@ init();
 if (!LIVE.on) fetch('/api/health', { cache: 'no-store' }).then(r => r.ok ? r.json() : null).then(j => { if (j && j.ok) liveEnable(); }).catch(() => {});
 
 let _promptModalCallback = null;
+let _promptOnCancel = null;
+let _promptKeepOpenOnConfirm = false;
+let _promptDownBackdrop = false;
 let _promptOpenTime = 0;
 let _promptGlassRaf = 0;
 let _promptCloseTimer = 0;
@@ -4906,10 +4909,15 @@ function pumpPromptGlass(ms) {
   _promptGlassRaf = requestAnimationFrame(step);
 }
 
-function closePromptModal() {
+function closePromptModal(force, skipCancelCb) {
   const el = document.getElementById('sonoraPrompt');
   if (!el) return;
+  if (!force && el.dataset && el.dataset.locked === '1') return;
   _promptFocusGuardUntil = 0;
+  _promptKeepOpenOnConfirm = false;
+  const cancelCb = (!skipCancelCb && typeof _promptOnCancel === 'function') ? _promptOnCancel : null;
+  _promptOnCancel = null;
+  el.dataset.locked = '0';
   el.classList.remove('visible', 'active');
   el.setAttribute('aria-hidden', 'true');
   const inp = document.getElementById('promptInput');
@@ -4926,6 +4934,7 @@ function closePromptModal() {
   _promptCloseTimer = setTimeout(() => {
     _promptCloseTimer = 0;
     if (!el.classList.contains('visible') && !el.classList.contains('active')) {
+      el.classList.remove('update-modal');
       stopPromptGlass();
       el.style.display = 'none';
       window._promptGlassAlpha = 0;
@@ -4933,6 +4942,9 @@ function closePromptModal() {
       if (typeof FALLBACK !== 'undefined' && FALLBACK && typeof redraw === 'function') redraw();
     }
   }, 260);
+  if (cancelCb) {
+    try { cancelCb(); } catch (_) {}
+  }
 }
 
 const _PROMPT_ICONS = {
@@ -4955,25 +4967,67 @@ function showPromptModal(opts) {
   stopPromptGlass();
   const titleEl = document.getElementById('promptTitle');
   const subEl = document.getElementById('promptSub');
+  const notesEl = document.getElementById('promptNotes');
+  const progressWrap = document.getElementById('promptProgressWrap');
+  const progressFill = document.getElementById('promptProgressFill');
+  const progressLabel = document.getElementById('promptProgressLabel');
+  const btnsEl = document.getElementById('promptBtns');
   const badgeEl = el.querySelector('.prompt-badge');
   const inp = document.getElementById('promptInput');
   const cancelBtn = document.getElementById('promptCancel');
   const confirmBtn = document.getElementById('promptConfirm');
   const confirmOnly = Boolean(opts.confirmOnly);
   el.dataset.confirmOnly = confirmOnly ? '1' : '0';
+  el.dataset.locked = opts.locked ? '1' : '0';
+  el.classList.toggle('update-modal', Boolean(opts.updateModal));
+  _promptKeepOpenOnConfirm = Boolean(opts.keepOpenOnConfirm);
+  _promptOnCancel = typeof opts.onCancel === 'function' ? opts.onCancel : null;
+  _promptDownBackdrop = false;
 
   if (badgeEl) {
     badgeEl.innerHTML = _PROMPT_ICONS[opts.icon] || _PROMPT_ICONS.music;
   }
   if (titleEl) titleEl.textContent = opts.title || window.t('prompt.new_playlist_title');
   if (subEl) {
-    subEl.textContent = opts.subtitle || (opts.defaultVal ? window.t('prompt.rename_playlist_sub') : window.t('prompt.new_playlist_sub'));
-    subEl.style.marginBottom = confirmOnly ? '20px' : '';
+    const subText = opts.subtitle !== undefined
+      ? String(opts.subtitle)
+      : (opts.defaultVal ? window.t('prompt.rename_playlist_sub') : window.t('prompt.new_playlist_sub'));
+    subEl.textContent = subText;
+    subEl.style.display = subText ? '' : 'none';
+    subEl.style.marginBottom = (confirmOnly && !opts.notesHtml && !opts.showProgress) ? '20px' : (opts.subMarginBottom || '');
   }
   if (inp) {
     inp.style.display = confirmOnly ? 'none' : '';
     inp.placeholder = opts.placeholder || window.t('prompt.playlist_placeholder');
     inp.value = confirmOnly ? '' : (opts.defaultVal || '');
+  }
+  if (notesEl) {
+    if (opts.notesHtml) {
+      notesEl.innerHTML = opts.notesHtml;
+      notesEl.style.display = '';
+      notesEl.scrollTop = 0;
+    } else {
+      notesEl.innerHTML = '';
+      notesEl.style.display = 'none';
+    }
+  }
+  if (progressWrap) {
+    progressWrap.style.display = opts.showProgress ? '' : 'none';
+    if (progressFill) {
+      if (typeof opts.progress === 'number' && opts.progress >= 0) {
+        const pct = Math.max(0, Math.min(100, Math.round(opts.progress * 100)));
+        progressFill.classList.remove('indeterminate');
+        progressFill.style.width = pct + '%';
+        if (progressLabel) progressLabel.textContent = pct + '%';
+      } else {
+        progressFill.classList.add('indeterminate');
+        progressFill.style.width = '';
+        if (progressLabel) progressLabel.textContent = window.t('update.downloading');
+      }
+    }
+  }
+  if (btnsEl) {
+    btnsEl.style.display = opts.hideButtons ? 'none' : '';
   }
   if (cancelBtn) cancelBtn.textContent = opts.cancelText || window.t('prompt.cancel');
   if (confirmBtn) confirmBtn.textContent = opts.confirmText || window.t('prompt.create');
@@ -5040,11 +5094,15 @@ function initPromptModal() {
   }
 
   const doConfirm = () => {
+    if (el.dataset && el.dataset.locked === '1') return;
     const confirmOnly = el.dataset.confirmOnly === '1';
     const val = (inp ? inp.value : '').trim();
     const cb = _promptModalCallback;
+    const keepOpen = _promptKeepOpenOnConfirm;
     _promptFocusGuardUntil = 0;
-    closePromptModal();
+    if (!keepOpen) {
+      closePromptModal(true, true);
+    }
     if (cb) cb(confirmOnly ? true : val);
   };
 
@@ -5083,18 +5141,32 @@ function initPromptModal() {
     };
   }
 
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    const isOpen = el.classList.contains('visible') || el.classList.contains('active') || (el.style.display === 'flex' && el.getAttribute('aria-hidden') !== 'true');
+    if (!isOpen) return;
+    e.stopPropagation();
+    e.preventDefault();
+    if (!el.dataset || el.dataset.locked !== '1') {
+      closePromptModal();
+    }
+  });
+
   el.onclick = e => {
     if (Date.now() - _promptOpenTime < 400) {
       e.stopPropagation();
       e.preventDefault();
+      _promptDownBackdrop = false;
       return;
     }
-    if (e.target === el) {
+    if (e.target === el && _promptDownBackdrop && (!el.dataset || el.dataset.locked !== '1')) {
       e.stopPropagation();
       closePromptModal();
     }
+    _promptDownBackdrop = false;
   };
   el.onpointerdown = e => {
+    _promptDownBackdrop = (e.target === el);
     if (Date.now() - _promptOpenTime < 400) {
       e.stopPropagation();
     }
@@ -5116,7 +5188,9 @@ window.onSonoraBackPressed = function() {
   const promptEl = document.getElementById('sonoraPrompt');
   const isOpen = promptEl && (promptEl.classList.contains('visible') || promptEl.classList.contains('active') || (promptEl.style.display === 'flex' && promptEl.getAttribute('aria-hidden') !== 'true'));
   if (isOpen) {
-    closePromptModal();
+    if (!promptEl.dataset || promptEl.dataset.locked !== '1') {
+      closePromptModal();
+    }
     return "true";
   }
   if (typeof _origOnSonoraBackPressed === 'function') {
@@ -5124,6 +5198,269 @@ window.onSonoraBackPressed = function() {
   }
   return "false";
 };
+
+window.SONORA_UPDATE = window.SONORA_UPDATE || { state: 'idle' };
+let _lastUpdateState = window.SONORA_UPDATE.state || 'idle';
+let _lastAutoUpdateCheckAt = 0;
+
+function _escUpdateHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function _formatUpdateInline(text) {
+  const cleaned = String(text || '').replace(/`/g, '');
+  const parts = cleaned.split(/(\*\*[^*]+\*\*)/g);
+  let out = '';
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part) continue;
+    if (part.length > 4 && part.startsWith('**') && part.endsWith('**')) {
+      out += '<strong>' + _escUpdateHtml(part.slice(2, -2)) + '</strong>';
+    } else {
+      out += _escUpdateHtml(part);
+    }
+  }
+  return out;
+}
+
+function formatReleaseNotesHtml(notes) {
+  const raw = String(notes || '').replace(/\r\n?/g, '\n').trim();
+  if (!raw) return '';
+  const lines = raw.split('\n');
+  const blocks = [];
+  let prevWasGap = true;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) {
+      if (!prevWasGap) {
+        blocks.push('<div class="prompt-notes-gap"></div>');
+        prevWasGap = true;
+      }
+      continue;
+    }
+    prevWasGap = false;
+    const hMatch = line.match(/^#{1,6}\s+(.+)$/);
+    if (hMatch) {
+      blocks.push('<div class="prompt-notes-h">' + _formatUpdateInline(hMatch[1]) + '</div>');
+      continue;
+    }
+    const bMatch = line.match(/^(?:[-*]|•)\s+(.+)$/);
+    if (bMatch) {
+      blocks.push('<div class="prompt-notes-line">&bull;&nbsp;&nbsp;' + _formatUpdateInline(bMatch[1]) + '</div>');
+      continue;
+    }
+    blocks.push('<div class="prompt-notes-line">' + _formatUpdateInline(line) + '</div>');
+  }
+  while (blocks.length && blocks[blocks.length - 1] === '<div class="prompt-notes-gap"></div>') {
+    blocks.pop();
+  }
+  return blocks.join('');
+}
+
+function formatUpdateBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return Math.round(n / 1024) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+function isUpdateModalOpen() {
+  const el = document.getElementById('sonoraPrompt');
+  if (!el || !el.classList.contains('update-modal')) return false;
+  return el.classList.contains('visible') || el.classList.contains('active') || (el.style.display === 'flex' && el.getAttribute('aria-hidden') !== 'true');
+}
+
+function setUpdateProgressDom(upd) {
+  const el = document.getElementById('sonoraPrompt');
+  if (!el) return;
+  el.dataset.locked = '1';
+  const btnsEl = document.getElementById('promptBtns');
+  const progressWrap = document.getElementById('promptProgressWrap');
+  const progressFill = document.getElementById('promptProgressFill');
+  const progressLabel = document.getElementById('promptProgressLabel');
+  if (btnsEl) btnsEl.style.display = 'none';
+  if (progressWrap) progressWrap.style.display = '';
+  if (progressFill) {
+    if (upd && typeof upd.progress === 'number' && upd.progress >= 0) {
+      const pct = Math.max(0, Math.min(100, Math.round(upd.progress * 100)));
+      progressFill.classList.remove('indeterminate');
+      progressFill.style.width = pct + '%';
+      if (progressLabel) progressLabel.textContent = pct + '%';
+    } else {
+      progressFill.classList.add('indeterminate');
+      progressFill.style.width = '';
+      if (progressLabel) progressLabel.textContent = window.t('update.downloading');
+    }
+  }
+}
+
+function showUpdateModal(upd) {
+  if (!upd || !upd.version) return;
+  const sizeText = formatUpdateBytes(upd.bytes);
+  let sub = sizeText;
+  if (upd.state === 'failed') {
+    const errText = (upd.reason === 'permission' || upd.reason === 'needs_permission')
+      ? window.t('update.needs_permission')
+      : window.t('update.failed');
+    sub = sizeText ? (sizeText + ' · ' + errText) : errText;
+  }
+  const isDownloading = upd.state === 'downloading';
+  showPromptModal({
+    confirmOnly: true,
+    updateModal: true,
+    icon: 'download',
+    title: String(window.t('update.available')).replace('{version}', upd.version || ''),
+    subtitle: sub,
+    notesHtml: formatReleaseNotesHtml(upd.notes || ''),
+    showProgress: isDownloading,
+    progress: upd.progress,
+    hideButtons: isDownloading,
+    locked: isDownloading,
+    keepOpenOnConfirm: true,
+    cancelText: window.t('update.later'),
+    confirmText: window.t('update.now'),
+    onConfirm: () => {
+      if (window.SonoraNative && typeof window.SonoraNative.installUpdate === 'function') {
+        try { window.SonoraNative.installUpdate(); } catch (_) {}
+      }
+    },
+    onCancel: () => {
+      if (window.SonoraNative && typeof window.SonoraNative.dismissUpdate === 'function') {
+        try { window.SonoraNative.dismissUpdate(); } catch (_) {}
+      }
+    }
+  });
+}
+
+window.onSonoraUpdateState = function(raw) {
+  let upd = raw;
+  if (typeof upd === 'string') {
+    try { upd = JSON.parse(upd); } catch (_) { return; }
+  }
+  if (!upd || typeof upd !== 'object') return;
+  const prev = _lastUpdateState;
+  const next = upd.state || 'idle';
+  _lastUpdateState = next;
+  window.SONORA_UPDATE = upd;
+
+  if (next === 'downloading') {
+    if (isUpdateModalOpen()) {
+      const subEl = document.getElementById('promptSub');
+      const sizeText = formatUpdateBytes(upd.bytes);
+      if (subEl) {
+        subEl.textContent = sizeText;
+        subEl.style.display = sizeText ? '' : 'none';
+      }
+      setUpdateProgressDom(upd);
+      if (prev !== 'downloading') pumpPromptGlass(260);
+    } else {
+      showUpdateModal(upd);
+    }
+  } else if (next === 'installing') {
+    if (isUpdateModalOpen()) {
+      closePromptModal(true, true);
+    }
+  } else if (next === 'available') {
+    if (prev !== 'installing' && prev !== 'available') {
+      showUpdateModal(upd);
+    }
+  } else if (next === 'failed') {
+    if (isUpdateModalOpen()) {
+      const el = document.getElementById('sonoraPrompt');
+      const btnsEl = document.getElementById('promptBtns');
+      const progressWrap = document.getElementById('promptProgressWrap');
+      const subEl = document.getElementById('promptSub');
+      if (el) el.dataset.locked = '0';
+      if (btnsEl) btnsEl.style.display = '';
+      if (progressWrap) progressWrap.style.display = 'none';
+      if (subEl) {
+        const sizeText = formatUpdateBytes(upd.bytes);
+        const errText = (upd.reason === 'permission' || upd.reason === 'needs_permission')
+          ? window.t('update.needs_permission')
+          : window.t('update.failed');
+        const msg = sizeText ? (sizeText + ' · ' + errText) : errText;
+        subEl.textContent = msg;
+        subEl.style.display = msg ? '' : 'none';
+      }
+      pumpPromptGlass(240);
+    }
+  }
+
+  if (typeof redraw === 'function') redraw();
+};
+
+window.triggerSonoraUpdateCheck = function(manual) {
+  if (window.SonoraNative && typeof window.SonoraNative.checkForUpdates === 'function') {
+    try { window.SonoraNative.checkForUpdates(Boolean(manual)); } catch (_) {}
+  }
+};
+
+function runAutoUpdateCheck() {
+  if (!window.SonoraNative || typeof window.SonoraNative.checkForUpdates !== 'function') return;
+  if (typeof document !== 'undefined' && document.hidden) return;
+  const st = (window.SONORA_UPDATE && window.SONORA_UPDATE.state) || 'idle';
+  if (st === 'checking' || st === 'downloading' || st === 'installing' || isUpdateModalOpen()) return;
+  const now = Date.now();
+  if (now - _lastAutoUpdateCheckAt < 3000) return;
+  _lastAutoUpdateCheckAt = now;
+  window.triggerSonoraUpdateCheck(false);
+}
+
+window.onSonoraUpdateRowTap = function() {
+  const upd = window.SONORA_UPDATE || { state: 'idle' };
+  const st = upd.state || 'idle';
+  if (st === 'checking' || st === 'downloading' || st === 'installing') return;
+  if (st === 'available') {
+    showUpdateModal(upd);
+    return;
+  }
+  if (st === 'failed') {
+    const isPerm = upd.reason === 'permission' || upd.reason === 'needs_permission';
+    if (isPerm && upd.url && window.SonoraNative && typeof window.SonoraNative.installUpdate === 'function') {
+      try { window.SonoraNative.installUpdate(); } catch (_) {}
+      return;
+    }
+    if (!isPerm && upd.url) {
+      showUpdateModal(upd);
+      return;
+    }
+  }
+  window.triggerSonoraUpdateCheck(true);
+};
+
+(function initUpdaterBridge() {
+  if (!window.SonoraNative || typeof window.SonoraNative.getUpdateState !== 'function') return;
+  try {
+    const rawInit = window.SonoraNative.getUpdateState();
+    if (rawInit) {
+      const parsed = typeof rawInit === 'string' ? JSON.parse(rawInit) : rawInit;
+      if (parsed && typeof parsed === 'object') window.SONORA_UPDATE = parsed;
+    }
+  } catch (_) {}
+  const origResume = window.onSonoraResume;
+  window.onSonoraResume = function() {
+    if (typeof origResume === 'function') origResume.apply(this, arguments);
+    runAutoUpdateCheck();
+  };
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) runAutoUpdateCheck();
+    });
+  }
+  setTimeout(() => {
+    try {
+      const raw = window.SonoraNative.getUpdateState();
+      if (raw) window.onSonoraUpdateState(raw);
+    } catch (_) {}
+    runAutoUpdateCheck();
+  }, 900);
+})();
 
 function clearLiveCachesAndRefresh() {
   try { localStorage.removeItem(HOME_CACHE_KEY); } catch (e) {}

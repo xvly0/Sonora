@@ -639,6 +639,23 @@ const _SUN_RAYS = Array.from({ length: 8 }, (_, i) => {
 const _GEAR_D = 'M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915Z';
 let _GEAR_PATH = null;
 try { if (typeof Path2D !== 'undefined') _GEAR_PATH = new Path2D(_GEAR_D); } catch (e) {}
+const _SHUFFLE_DS = [
+  'M18 4l3 3l-3 3',
+  'M18 20l3 -3l-3 -3',
+  'M3 7h3a5 5 0 0 1 5 5a5 5 0 0 0 5 5h5',
+  'M21 7h-5a4.978 4.978 0 0 0 -3 1m-4 8a4.984 4.984 0 0 1 -3 1h-3'
+];
+const _REPEAT_DS = [
+  'M4 12v-3a3 3 0 0 1 3 -3h13m-3 -3l3 3l-3 3',
+  'M20 12v3a3 3 0 0 1 -3 3h-13m3 3l-3 -3l3 -3'
+];
+let _SHUFFLE_PATHS = null, _REPEAT_PATHS = null;
+try {
+  if (typeof Path2D !== 'undefined') {
+    _SHUFFLE_PATHS = _SHUFFLE_DS.map(d => new Path2D(d));
+    _REPEAT_PATHS = _REPEAT_DS.map(d => new Path2D(d));
+  }
+} catch (e) {}
 function _rPoly(c, pts, r) {
   const m = pts.length, p0 = pts[m - 1], p1 = pts[0];
   c.moveTo((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2);
@@ -711,21 +728,33 @@ function icon(c, n, x, y, s, col, o) {
     }
     case 'dots': for (let i = 0; i < 3; i++) { c.beginPath(); c.arc(_DOTS_X[i], 0, 1.9, 0, TAU); c.fill(); } break;
     case 'shuffle':
-      c.lineWidth = 2;
-      c.beginPath(); c.moveTo(-10, -6); c.lineTo(-5, -6); c.bezierCurveTo(-1, -6, -1, 6, 3, 6); c.lineTo(8, 6); c.stroke();
-      c.beginPath(); c.moveTo(-10, 6); c.lineTo(-5, 6); c.bezierCurveTo(-3, 6, -2.5, 4.2, -2, 3.2); c.stroke();
-      c.beginPath(); c.moveTo(3, -6); c.lineTo(8, -6); c.stroke();
-      for (let i = 0; i < 2; i++) { const yy = _SHUFFLE_Y[i]; c.beginPath(); c.moveTo(6, yy - 3.4); c.lineTo(10, yy); c.lineTo(6, yy + 3.4); c.stroke(); }
+      c.lineWidth = o.lw || 2;
+      if (_SHUFFLE_PATHS) {
+        c.save(); c.translate(-12, -12);
+        for (let i = 0; i < _SHUFFLE_PATHS.length; i++) c.stroke(_SHUFFLE_PATHS[i]);
+        c.restore();
+      } else {
+        c.beginPath(); c.moveTo(-9, -5); c.lineTo(-6, -5); c.bezierCurveTo(-1, -5, -1, 5, 4, 5); c.lineTo(9, 5); c.stroke();
+        c.beginPath(); c.moveTo(-9, 5); c.lineTo(-6, 5); c.bezierCurveTo(-3.5, 5, -2.5, 3.8, -2, 3); c.stroke();
+        c.beginPath(); c.moveTo(2, -4); c.lineTo(4, -5); c.lineTo(9, -5); c.stroke();
+        for (let i = 0; i < 2; i++) { const yy = i ? 5 : -5; c.beginPath(); c.moveTo(6, yy - 3); c.lineTo(9, yy); c.lineTo(6, yy + 3); c.stroke(); }
+      }
       break;
     case 'repeat':
-      c.lineWidth = 2;
-      c.beginPath(); c.moveTo(-5, -7); c.lineTo(5, -7); c.arcTo(10, -7, 10, -2, 5); c.lineTo(10, 0); c.stroke();
-      c.beginPath(); c.moveTo(5, 7); c.lineTo(-5, 7); c.arcTo(-10, 7, -10, 2, 5); c.lineTo(-10, 0); c.stroke();
-      c.beginPath(); c.moveTo(-8, -10); c.lineTo(-4.6, -7); c.lineTo(-8, -4); c.stroke();
-      c.beginPath(); c.moveTo(8, 10); c.lineTo(4.6, 7); c.lineTo(8, 4); c.stroke();
+      c.lineWidth = o.lw || 2;
+      if (_REPEAT_PATHS) {
+        c.save(); c.translate(-12, -12);
+        for (let i = 0; i < _REPEAT_PATHS.length; i++) c.stroke(_REPEAT_PATHS[i]);
+        c.restore();
+      } else {
+        c.beginPath(); c.moveTo(-8, 0); c.lineTo(-8, -3); c.arcTo(-8, -6, -5, -6, 3); c.lineTo(8, -6); c.stroke();
+        c.beginPath(); c.moveTo(5, -9); c.lineTo(8, -6); c.lineTo(5, -3); c.stroke();
+        c.beginPath(); c.moveTo(8, 0); c.lineTo(8, 3); c.arcTo(8, 6, 5, 6, 3); c.lineTo(-8, 6); c.stroke();
+        c.beginPath(); c.moveTo(-5, 9); c.lineTo(-8, 6); c.lineTo(-5, 3); c.stroke();
+      }
       if (o.one) {
-        c.lineWidth = 1.85; c.lineCap = 'round'; c.lineJoin = 'round';
-        c.beginPath(); c.moveTo(-1.15, -1.8); c.lineTo(1.15, -3.8); c.lineTo(1.15, 3.8); c.stroke();
+        c.lineWidth = 1.75; c.lineCap = 'round'; c.lineJoin = 'round';
+        c.beginPath(); c.moveTo(-1, -1.6); c.lineTo(1, -3.2); c.lineTo(1, 3.2); c.stroke();
       }
       break;
     case 'infinity': c.lineWidth = 2.4; c.beginPath(); c.moveTo(0, 0); c.bezierCurveTo(3, -6.5, 10.5, -6.5, 10.5, 0); c.bezierCurveTo(10.5, 6.5, 3, 6.5, 0, 0); c.bezierCurveTo(-3, -6.5, -10.5, -6.5, -10.5, 0); c.bezierCurveTo(-10.5, 6.5, -3, 6.5, 0, 0); c.stroke(); break;
@@ -1172,6 +1201,69 @@ function shaderPalette(item) {
   });
   const firstChr = res.findIndex(p => (Math.max(...p) - Math.min(...p)) / 255 >= .12);
   if (firstChr > 0) { const [c] = res.splice(firstChr, 1); res.unshift(c); }
+  const domC = cls.length ? cls[0].c : res[0];
+  const [domH] = rgb2hsl(...domC), domCh = (Math.max(...domC) - Math.min(...domC)) / 255;
+  let domN = 0;
+  for (let i = 0; i < cls.length; i++) {
+    const kc = cls[i].c, kCh = (Math.max(...kc) - Math.min(...kc)) / 255;
+    const [kH] = rgb2hsl(...kc);
+    const dh = Math.min(Math.abs(kH - domH), 360 - Math.abs(kH - domH));
+    if (dist(kc, domC) < 4200 || (domCh >= .12 && kCh >= .12 && dh < 18)) domN += cls[i].n;
+  }
+  const domShare = domN / total;
+  let maxD2 = 0, maxHueDiff = 0, minL4 = 1, maxL4 = 0, allNeu4 = true;
+  const hsl4 = res.slice(0, 4).map(p => {
+    const [h, s, l] = rgb2hsl(...p), ch = (Math.max(...p) - Math.min(...p)) / 255;
+    if (l < minL4) minL4 = l;
+    if (l > maxL4) maxL4 = l;
+    if (ch >= .12) allNeu4 = false;
+    return [h, s, l, ch];
+  });
+  for (let i = 0; i < 4; i++) {
+    for (let j = i + 1; j < 4; j++) {
+      const d2 = dist(res[i], res[j]);
+      if (d2 > maxD2) maxD2 = d2;
+      if (hsl4[i][3] >= .12 && hsl4[j][3] >= .12) {
+        const dh = Math.min(Math.abs(hsl4[i][0] - hsl4[j][0]), 360 - Math.abs(hsl4[i][0] - hsl4[j][0]));
+        if (dh > maxHueDiff) maxHueDiff = dh;
+      } else if (hsl4[i][3] >= .12 || hsl4[j][3] >= .12) {
+        maxHueDiff = 180;
+      }
+    }
+  }
+  const maxLSpread = maxL4 - minL4;
+  const isMonoCover = domShare >= .84 || maxD2 < 4500 || (!allNeu4 && maxHueDiff < 18 && maxLSpread < .16);
+  if (isMonoCover) {
+    const baseRgb = cls.length ? cls[0].c : res[0];
+    const [h0, s0, l0] = rgb2hsl(...baseRgb), ch0 = (Math.max(...baseRgb) - Math.min(...baseRgb)) / 255;
+    if (ch0 < .12) {
+      if (l0 < .22) {
+        res[0] = hsl2rgb(h0, 0, clamp(l0, .16, .24));
+        res[1] = hsl2rgb(h0, 0, .06);
+        res[2] = hsl2rgb(h0, 0, .36);
+        res[3] = hsl2rgb(h0, 0, .12);
+        res[4] = hsl2rgb(h0, 0, .28);
+        res[5] = hsl2rgb(h0, 0, .08);
+      } else {
+        res[0] = hsl2rgb(h0, 0, clamp(l0, .36, .62));
+        res[1] = hsl2rgb(h0, 0, .14);
+        res[2] = hsl2rgb(h0, 0, .74);
+        res[3] = hsl2rgb(h0, 0, .28);
+        res[4] = hsl2rgb(h0, 0, .56);
+        res[5] = hsl2rgb(h0, 0, .20);
+      }
+    } else {
+      const isPink0 = h0 >= 320 && h0 <= 346;
+      const hb = isPink0 ? clamp(h0, 332, 344) : h0;
+      const sb = clamp(s0 * (isPink0 ? 1.2 : 1.35), .55, .95);
+      res[0] = hsl2rgb(hb, sb, clamp(l0, .42, .54));
+      res[1] = hsl2rgb((hb - 6 + 360) % 360, clamp(sb * .95, .48, .90), .14);
+      res[2] = hsl2rgb((hb + 8) % 360, clamp(sb * .92, .52, .92), .66);
+      res[3] = hsl2rgb((hb - 10 + 360) % 360, clamp(sb * .90, .45, .86), .25);
+      res[4] = hsl2rgb((hb + 5) % 360, clamp(sb * .88, .45, .88), .57);
+      res[5] = hsl2rgb((hb - 8 + 360) % 360, clamp(sb * .85, .42, .82), .18);
+    }
+  }
   if (trkId) SHAD_PALC[trkId] = res;
   if (albId) SHAD_PALC[albId] = res;
   return res;

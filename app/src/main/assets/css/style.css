@@ -223,3 +223,88 @@ body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--fo
 .prompt-btn-confirm:active {
   opacity: 0.86;
 }
+#sonoraPrompt.update-modal {
+  overscroll-behavior: contain;
+}
+#sonoraPrompt.update-modal .prompt-sheet {
+  max-width: 348px;
+}
+.prompt-notes {
+  width: 100%;
+  box-sizing: border-box;
+  max-height: 200px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px 14px;
+  margin-bottom: 18px;
+  border-radius: 16px;
+  background: var(--prompt-badge-bg, rgba(255, 255, 255, 0.08));
+  color: var(--prompt-sub-color, rgba(235, 235, 245, 0.72));
+  font-family: var(--font);
+  font-size: 13.5px;
+  line-height: 1.48;
+  text-align: left;
+  word-break: break-word;
+}
+.prompt-notes-h {
+  color: var(--fg);
+  font-weight: 700;
+  font-size: 13.5px;
+  margin-top: 6px;
+}
+.prompt-notes-h:first-child {
+  margin-top: 0;
+}
+.prompt-notes-line {
+  margin-top: 2px;
+}
+.prompt-notes-line:first-child {
+  margin-top: 0;
+}
+.prompt-notes strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+.prompt-notes-gap {
+  height: 6px;
+}
+.prompt-progress-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  width: 100%;
+}
+.prompt-progress-track {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--prompt-input-bg, rgba(255, 255, 255, 0.14));
+  overflow: hidden;
+}
+.prompt-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: #fa2e49;
+  transition: width 0.16s ease-out;
+}
+.prompt-progress-fill.indeterminate {
+  width: 38%;
+  animation: sonoraUpdateIndet 1.2s ease-in-out infinite;
+}
+@keyframes sonoraUpdateIndet {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(280%); }
+}
+.prompt-progress-label {
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--prompt-sub-color, rgba(235, 235, 245, 0.72));
+  text-align: center;
+}

@@ -2098,6 +2098,55 @@ PAGES.settings = (c, P) => {
     });
     y += 66;
 
+    eyebrow(c, t('settings.updates_section'), 26, y + 12); y += 22;
+    const upd = (typeof window !== 'undefined' && window.SONORA_UPDATE) ? window.SONORA_UPDATE : { state: 'idle' };
+    const uState = upd.state || 'idle';
+    const uBusy = uState === 'checking' || uState === 'downloading' || uState === 'installing';
+    let uStatus = '';
+    if (uState === 'checking') {
+      uStatus = t('update.checking');
+    } else if (uState === 'up_to_date') {
+      uStatus = t('update.none');
+    } else if (uState === 'available') {
+      uStatus = String(t('update.available')).replace('{version}', upd.version || '');
+    } else if (uState === 'downloading') {
+      uStatus = (typeof upd.progress === 'number' && upd.progress >= 0)
+        ? (Math.round(upd.progress * 100) + '%')
+        : t('update.downloading');
+    } else if (uState === 'installing') {
+      uStatus = t('update.installing');
+    } else if (uState === 'failed') {
+      uStatus = (upd.reason === 'permission' || upd.reason === 'needs_permission')
+        ? t('update.needs_permission')
+        : t('update.failed');
+    }
+    const updRowH = 56;
+    if (vis(P, y, updRowH)) {
+      drawSetCard(c, 20, y, W - 40, updRowH, 22);
+      if (!uBusy) {
+        c.save();
+        rrPath(c, 20, y, W - 40, updRowH, 22);
+        c.clip();
+        drawRowPressTint(c, 'set_upd', 20, y, W - 40, updRowH, 0);
+        c.restore();
+      }
+      c.save();
+      if (uBusy) c.globalAlpha = 0.65;
+      txt(c, t('update.check'), 36, y + 33, F(500, 15.5), pal.fg, 'left', uStatus ? (W - 220) : (W - 76));
+      c.restore();
+      if (uStatus) {
+        txt(c, uStatus, W - 36, y + 33, F(600, 13.5), uState === 'available' ? '#fa2e49' : pal.sub, 'right', 164);
+      }
+    }
+    if (!uBusy) {
+      hit(20, y, W - 40, updRowH, () => {
+        if (typeof window !== 'undefined' && typeof window.onSonoraUpdateRowTap === 'function') {
+          window.onSonoraUpdateRowTap();
+        }
+      }, { pressKey: 'set_upd' });
+    }
+    y += updRowH + 18;
+
     if (vis(P, y, 48)) {
       txt(c, t('settings.version_label'), W / 2, y + 22, F(600, 14), pal.sub, 'center', W - 48);
     }

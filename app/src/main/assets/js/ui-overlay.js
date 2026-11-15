@@ -1790,10 +1790,10 @@ function drawOverlay() {
           c.translate(x + pw / 2, py + 21);
           c.scale(sc, sc);
           if (i === 0 && PL.shuffle && PL.smartShuffle) {
-            icon(c, ic, -4, 0, 21, shFg);
+            icon(c, ic, -4, 0, 23, shFg);
             icon(c, 'spark', 13, -7, 11, shFg, { fill: true });
           } else {
-            icon(c, ic, 0, 0, 22, shFg, { one: ic === 'repeat' && PL.repeat === 2 });
+            icon(c, ic, 0, 0, ic === 'infinity' ? 22 : 24, shFg, { one: ic === 'repeat' && PL.repeat === 2 });
           }
           c.restore();
         });

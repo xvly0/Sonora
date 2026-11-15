@@ -23,8 +23,8 @@ android {
         applicationId = "dev.sonora.music"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0-beta"
+        versionCode = 3
+        versionName = "1.0.1-beta"
     }
 
     signingConfigs {

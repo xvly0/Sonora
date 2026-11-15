@@ -17,4 +17,6 @@
     <string name="audio_output_bluetooth">Bluetooth device</string>
     <string name="audio_output_usb">USB Audio</string>
     <string name="audio_output_default">Audio output</string>
+    <string name="update_downloading">Downloading…</string>
+    <string name="update_channel">App updates</string>
 </resources>

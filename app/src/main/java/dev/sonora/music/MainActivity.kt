@@ -77,6 +77,22 @@ class MainActivity : AppCompatActivity() {
     private var pendingRepeatMode: Int = 0
     private val pendingFavStates = ConcurrentHashMap<String, Boolean>()
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+    @Volatile
+    private var pendingInstallUpdate: SonoraUpdater.State.Available? = null
+    private var updateListener: ((String) -> Unit)? = null
+
+    private val updatePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        val update = pendingInstallUpdate ?: return@registerForActivityResult
+        pendingInstallUpdate = null
+        val updater = SonoraUpdater.getInstance(this)
+        if (updater.canInstall()) {
+            updater.install(update, manual = true)
+        } else {
+            updateListener?.invoke(updater.stateJson(manual = true))
+        }
+    }
 
     private val pickMediaLauncher = registerForActivityResult(
         ActivityResultContracts.PickVisualMedia()
@@ -543,6 +559,19 @@ class MainActivity : AppCompatActivity() {
         servicePlaybackListener = listener
         SonoraPlaybackService.playbackListener = listener
 
+        val ul: (String) -> Unit = { json ->
+            runOnUiThread {
+                if (::webView.isInitialized && !isDestroyed) {
+                    webView.evaluateJavascript(
+                        "if (window.onSonoraUpdateState) window.onSonoraUpdateState($json);",
+                        null
+                    )
+                }
+            }
+        }
+        updateListener = ul
+        SonoraUpdater.getInstance(this).listener = ul
+
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 webView.evaluateJavascript(
@@ -634,6 +663,11 @@ class MainActivity : AppCompatActivity() {
             SonoraPlaybackService.playbackListener = null
         }
         servicePlaybackListener = null
+        val upd = SonoraUpdater.getInstance(this)
+        if (upd.listener === updateListener) {
+            upd.listener = null
+        }
+        updateListener = null
         if (isServiceBound) {
             try {
                 unbindService(serviceConnection)
@@ -1105,6 +1139,38 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun isNative(): Boolean = true
+
+        @JavascriptInterface
+        fun getUpdateState(): String = SonoraUpdater.getInstance(this@MainActivity).stateJson()
+
+        @JavascriptInterface
+        fun checkForUpdates(manual: Boolean) {
+            SonoraUpdater.getInstance(this@MainActivity).checkAsync(manual)
+        }
+
+        @JavascriptInterface
+        fun installUpdate() {
+            runOnUiThread {
+                val updater = SonoraUpdater.getInstance(this@MainActivity)
+                val update = updater.currentAvailable()
+                if (update == null) {
+                    updater.checkAsync(true)
+                    return@runOnUiThread
+                }
+                if (updater.canInstall()) {
+                    updater.install(update, manual = true)
+                } else {
+                    pendingInstallUpdate = update
+                    updater.install(update, manual = true)
+                    updatePermissionLauncher.launch(updater.permissionIntent())
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun dismissUpdate() {
+            SonoraUpdater.getInstance(this@MainActivity).dismiss()
+        }
 
         @JavascriptInterface
         fun getLocaleConfig(): String = SonoraLocaleManager.toJson().toString()
