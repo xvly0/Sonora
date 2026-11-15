@@ -15,9 +15,9 @@ import org.json.JSONObject
 object KuGou {
 
     private val http = OkHttpClient.Builder()
-        .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-        .callTimeout(6, java.util.concurrent.TimeUnit.SECONDS)
+        .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .callTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
     suspend fun lyrics(title: String, artist: String, durationMs: Long): Lyrics? =
@@ -62,7 +62,7 @@ object KuGou {
                 }
                 if (!matchesArtistName(singer, fullArtist)) return@filter false
                 val candDur = candidate.optLong("duration", 0L)
-                durationMs <= 0 || candDur <= 0 || abs(candDur - durationMs) <= MAX_DRIFT_MS
+                durationMs <= 0 || durationMs == FALLBACK_DURATION_MS || candDur <= 0 || abs(candDur - durationMs) <= MAX_DRIFT_MS
             }
             .minByOrNull { candidate ->
                 val songName = candidate.optString("song")
@@ -140,6 +140,7 @@ object KuGou {
     private val KEY = intArrayOf(64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105)
 
     private const val MAX_DRIFT_MS = 4_000L
+    private const val FALLBACK_DURATION_MS = 210_000L
 
     private const val TAG = "KuGou"
     private const val SEARCH_URL = "https://lyrics.kugou.com/search"

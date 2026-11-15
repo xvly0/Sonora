@@ -14,13 +14,13 @@ import java.util.concurrent.TimeUnit
 object LyricsOvh {
 
     private val http = OkHttpClient.Builder()
-        .connectTimeout(4, TimeUnit.SECONDS)
-        .readTimeout(4, TimeUnit.SECONDS)
-        .callTimeout(6, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .callTimeout(10, TimeUnit.SECONDS)
         .build()
 
     private const val BASE_URL = "https://api.lyrics.ovh/v1"
-    private const val USER_AGENT = "SquareMusicApp/1.0"
+    private const val USER_AGENT = "SonoraMusicApp/1.0"
 
     suspend fun lyrics(title: String, artist: String, durationMs: Long): Lyrics? =
         withContext(Dispatchers.IO) {

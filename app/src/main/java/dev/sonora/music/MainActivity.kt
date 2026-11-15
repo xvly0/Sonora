@@ -205,6 +205,7 @@ class MainActivity : AppCompatActivity() {
         com.metrolist.innertube.YouTube.cacheDir = java.io.File(cacheDir, "innertube")
         com.metrolist.innertube.YouTube.locale = SonoraLocaleManager.youtubeLocale()
         SonoraApiInterceptor.attach(this)
+        SonoraDownloadManager.attach(this)
         AppleCatalog.attach(this)
         dev.sonora.music.lyrics.LyricsLibrary.attach(this)
 
@@ -989,12 +990,16 @@ class MainActivity : AppCompatActivity() {
                     return innerCached
                 }
                 val mediaBytes = SonoraPlaybackService.getMediaCacheSizeBytes(this@MainActivity)
+                val downloadsBytes = SonoraDownloadManager.getDownloadsSizeBytes(this@MainActivity)
+                val downloadsCount = SonoraDownloadManager.getCompletedDownloadCount(this@MainActivity)
                 val httpCoverBytes = SonoraApiInterceptor.getCoverAndHttpCacheBytes()
                 val lyricsBytes = dev.sonora.music.lyrics.LyricsLibrary.getDiskCacheSizeBytes()
                 val lyricsCount = dev.sonora.music.lyrics.LyricsLibrary.getCachedEntryCount()
                 val coverCount = CoverCache.count()
                 val json = JSONObject().apply {
                     put("mediaBytes", mediaBytes)
+                    put("downloadsBytes", downloadsBytes)
+                    put("downloadsCount", downloadsCount)
                     put("httpCoverBytes", httpCoverBytes)
                     put("lyricsBytes", lyricsBytes)
                     put("totalBytes", mediaBytes + httpCoverBytes + lyricsBytes)
@@ -1008,10 +1013,54 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun getDownloadsStatus(): String {
+            return SonoraDownloadManager.getDownloadsStatusJson(this@MainActivity)
+        }
+
+        @JavascriptInterface
+        fun isTrackDownloaded(id: String): Boolean {
+            return SonoraDownloadManager.isTrackDownloaded(this@MainActivity, id)
+        }
+
+        @JavascriptInterface
+        fun isTrackCached(id: String): Boolean {
+            return SonoraPlaybackService.isTrackCached(this@MainActivity, id)
+        }
+
+        @JavascriptInterface
+        fun enqueueDownload(id: String): Boolean {
+            val clean = SonoraDownloadManager.normalizeTrackId(id)
+            if (clean.isEmpty() || clean.startsWith("local_")) return false
+            SonoraDownloadManager.enqueue(this@MainActivity, clean)
+            cachedCacheStatsJson = null
+            cachedCacheStatsAtMs = 0L
+            return true
+        }
+
+        @JavascriptInterface
+        fun deleteDownloadedTrack(id: String): Boolean {
+            val removed = SonoraPlaybackService.deleteDownloadedTrack(this@MainActivity, id)
+            cachedCacheStatsJson = null
+            cachedCacheStatsAtMs = 0L
+            return removed
+        }
+
+        @JavascriptInterface
         fun clearCache(): Boolean {
             return runCatching {
                 SonoraApiInterceptor.clearCaches()
                 SonoraPlaybackService.clearAudioDiskCache(this@MainActivity)
+                listOf(
+                    java.io.File(cacheDir, "innertube_http_cache"),
+                    java.io.File(cacheDir, "innertube/innertube_http_cache"),
+                    java.io.File(cacheDir, "apple_http_cache"),
+                    java.io.File(cacheDir, "lyrics_v4"),
+                    java.io.File(cacheDir, "sonora_lyrics_cache"),
+                ).forEach { dir ->
+                    runCatching {
+                        if (dir.exists()) dir.deleteRecursively()
+                    }
+                }
                 cachedCacheStatsJson = null
                 cachedCacheStatsAtMs = 0L
                 true

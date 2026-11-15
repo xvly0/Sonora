@@ -13,16 +13,17 @@ import org.json.JSONObject
 object Lossless {
 
     private val http = OkHttpClient.Builder()
-        .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-        .callTimeout(6, java.util.concurrent.TimeUnit.SECONDS)
+        .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .callTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
     suspend fun lyrics(title: String, artist: String, durationMs: Long): Lyrics? =
         withContext(Dispatchers.IO) {
             val titles = title.titleVariants()
             if (titles.isEmpty()) return@withContext null
-            val artists = listOf(artist.trim(), artist.primaryArtist())
+            val primary = artist.primaryArtist()
+            val artists = listOf(artist.trim(), primary, primary.foldDiacritics())
                 .filter { it.isNotBlank() }
                 .distinct()
             if (artists.isEmpty()) return@withContext null
@@ -79,7 +80,7 @@ object Lossless {
             if (!matchesArtistName(artistName, queryArtist)) return@filter false
 
             val resultDurSec = result.optLong("duration", 0L)
-            if (durationMs > 0 && resultDurSec > 0) {
+            if (durationMs > 0 && durationMs != FALLBACK_DURATION_MS && resultDurSec > 0) {
                 val drift = abs(resultDurSec * 1000L - durationMs)
                 if (drift > MAX_DRIFT_MS) return@filter false
             }
@@ -115,6 +116,8 @@ object Lossless {
     private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
     private const val MAX_DRIFT_MS = 10_000L
+
+    private const val FALLBACK_DURATION_MS = 210_000L
 
     private const val TAG = "Lossless"
 

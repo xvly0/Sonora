@@ -151,7 +151,7 @@ function rgb2oklab(q) {
   return [.2104542553 * l + .793617785 * m - .0040720468 * s, 1.9779984951 * l - 2.428592205 * m + .4505937099 * s, .0259040371 * l + .7827717662 * m - .808675766 * s];
 }
 const _FLU_C = [new Float32Array(3), new Float32Array(3), new Float32Array(3), new Float32Array(3)], _FLU_BASE = new Float32Array(3);
-let _FLU_COLS = null;
+let _FLU_COLS = null, _fluCacheCv = null, _fluCacheCtx = null, _fluLastPh = NaN, _fluLastW = 0, _fluLastH = 0;
 function fluidPaint(c, cl, ph, w, h) {
   if (FLU.ok === null) fluidInit(); if (!FLU.ok) return false;
   const gl = FLU.gl, cv = FLU.cv, L = FLU.loc, ch = Math.round(160 * h / w);
@@ -161,6 +161,11 @@ function fluidPaint(c, cl, ph, w, h) {
     for (let i = 0; i < cl.length; i++) {
       if (_FLU_COLS[i][0] !== cl[i][0] || _FLU_COLS[i][1] !== cl[i][1] || _FLU_COLS[i][2] !== cl[i][2]) { colsDirty = true; break; }
     }
+  }
+  const samePh = !colsDirty && _fluCacheCv && _fluLastW === cv.width && _fluLastH === cv.height && Math.abs(ph - _fluLastPh) < 1e-5;
+  if (samePh) {
+    c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high'; c.drawImage(_fluCacheCv, 0, 0, w, h);
+    return true;
   }
   if (colsDirty) {
     _FLU_COLS = cl.map(q => [q[0], q[1], q[2]]);
@@ -181,7 +186,11 @@ function fluidPaint(c, cl, ph, w, h) {
   for (let i = 0; i < 4; i++) gl.uniform3fv(L.c[i], _FLU_C[i]);
   gl.uniform3fv(L.base, _FLU_BASE);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
-  c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high'; c.drawImage(cv, 0, 0, w, h);
+  if (!_fluCacheCv) { _fluCacheCv = document.createElement('canvas'); _fluCacheCtx = _fluCacheCv.getContext('2d'); }
+  if (_fluCacheCv.width !== cv.width || _fluCacheCv.height !== cv.height) { _fluCacheCv.width = cv.width; _fluCacheCv.height = cv.height; }
+  _fluCacheCtx.drawImage(cv, 0, 0);
+  _fluLastPh = ph; _fluLastW = cv.width; _fluLastH = cv.height;
+  c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high'; c.drawImage(_fluCacheCv, 0, 0, w, h);
   return true;
 }
 
@@ -648,7 +657,8 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
       const pad = Math.ceil(qBlur * 2.5) + 10;
       const bh = Math.ceil(b.h + pad * 2);
       const needsBuild = !b._bCv || b._bBlur !== qBlur || b._bW !== W || b._bH !== bh || b._bTint !== ink.qKey;
-      if (needsBuild && morphing && blurBuiltThisFrame >= 1) {
+      const maxBlurBuilds = morphing ? 1 : 2;
+      if (needsBuild && blurBuiltThisFrame >= maxBlurBuilds) {
         paintK = 1;
         if (typeof scheduleAnimRedraw === 'function') scheduleAnimRedraw();
       } else {
@@ -1024,6 +1034,62 @@ function drawSrcPicker(c, t, L, fadeAlpha = 1, activeHit = true) {
 }
 
 let _qFadeCv = null, _qFadeCtx = null;
+function drawQueueSwipeRemoveBg(c, rx, ry, rw, rh, r, sw) {
+  const sRow = sw || (typeof SWQ !== 'undefined' ? SWQ : null);
+  const cp = clamp((sRow && sRow.crossP) || 0, 0, 1);
+  const bgR = Math.round(mix(205, 250, cp));
+  const bgG = Math.round(mix(34, 46, cp));
+  const bgB = Math.round(mix(52, 73, cp));
+  const bgA = mix(0.38, 0.92, cp);
+  c.fillStyle = 'rgba(' + bgR + ',' + bgG + ',' + bgB + ',' + bgA.toFixed(3) + ')';
+  c.fillRect(rx, ry, rw, rh);
+
+  const glAlpha = Math.min(1, r / 40);
+  if (glAlpha <= 0.01) return;
+
+  const glR = 255;
+  const glG = Math.round(mix(175, 255, cp));
+  const glB = Math.round(mix(182, 255, cp));
+  const glCol = 'rgb(' + glR + ',' + glG + ',' + glB + ')';
+
+  const shift = Math.min(r / 2, 46);
+  const glScale = 0.55 + 0.45 * Math.min(1, r / 64);
+  const gx = rx + rw - shift;
+  const gy = ry + rh / 2;
+  const nowMs = performance.now();
+
+  let hitScale = 1;
+  if (sRow && sRow.hitT > 0) {
+    const ht = (nowMs - sRow.hitT) / 380;
+    if (ht >= 0 && ht < 1) {
+      if (ht < 0.4) {
+        const p = ht / 0.4;
+        hitScale = 1 + 0.32 * (1 - (1 - p) * (1 - p));
+      } else {
+        const p = (ht - 0.4) / 0.6;
+        hitScale = 1.32 - 0.32 * (p * p * (3 - 2 * p));
+      }
+    }
+  }
+
+  c.save();
+  c.translate(gx, gy);
+  c.scale(glScale, glScale);
+  c.globalAlpha *= glAlpha;
+
+  c.save();
+  c.translate(0, -8.5);
+  if (hitScale !== 1) c.scale(hitScale, hitScale);
+  icon(c, 'trash', 0, 0, 20, glCol, { lw: 2.1 });
+  c.restore();
+
+  c.font = F(600, 11.5);
+  c.textAlign = 'center';
+  c.textBaseline = 'middle';
+  c.fillStyle = glCol;
+  c.fillText(window.t('common.remove'), 0, 15);
+  c.restore();
+}
 function drawQueueSkeleton(tc, startY, top, bot, qInk) {
   const rh = 60;
   const count = Math.max(5, Math.min(9, Math.ceil((bot - startY) / rh) + 1));
@@ -1202,10 +1268,92 @@ function drawQueue(c, L, fadeAlpha = 1) {
     icon(tc, 'grip', W - 36, y + 30, 20, qInk.rgba(mix(0.50, 0.92, k).toFixed(3), true));
     tc.restore();
   };
+  const drawQueueRowBody = (rc, dt, y) => {
+    drawArt(rc, dt, 24, y + 8, 44, 6);
+    txt(rc, dt.title, 80, y + 28, F(500, 16), qInk.hi, 'left', W - 80 - 70);
+    const isDl = typeof isDownloaded === 'function' && isDownloaded(dt);
+    let sx = 80;
+    if (isDl) {
+      if (typeof drawDlBadge === 'function') drawDlBadge(rc, sx + 7.5, y + 42.2, 7.5, dlCols.fill, dlCols.arrow);
+      sx += 21;
+    }
+    if (dt._smartRec) {
+      icon(rc, 'spark', sx + 6, y + 42, 12, qInk.rgba(.84), { fill: true });
+      txt(rc, dt.artist, sx + 18, y + 47, F(400, 14), qInk.rgba(.66, true), 'left', W - (sx + 18) - 70);
+    } else if (dt._queued) {
+      txt(rc, window.t('queue.in_queue_artist', { artist: dt.artist }), sx, y + 47, F(400, 14), qInk.rgba(.70, true), 'left', W - sx - 70);
+    } else {
+      txt(rc, dt.artist, sx, y + 47, F(400, 14), qInk.rgba(.62, true), 'left', W - sx - 70);
+    }
+    icon(rc, 'grip', W - 36, y + 30, 20, qInk.rgba(.50, true));
+    rc.fillStyle = qInk.rgba(.12, true);
+    rc.fillRect(80, y + rh - .5, W - 80, .5);
+  };
+  const drawSwipedQueueRow = (rc, dt, y, swx, swSt) => {
+    const rx = 12, rw = W - 24, rbh = rh - 4;
+    if (swx < -0.5) {
+      const revW = Math.min(rw, -swx);
+      const revX = rx + rw - revW;
+      rc.save();
+      rrPath(rc, revX, y + 2, revW, rbh, 14);
+      rc.clip();
+      drawQueueSwipeRemoveBg(rc, revX, y + 2, revW, rbh, -swx, swSt);
+      rc.restore();
+    }
+    rc.save();
+    if (swx < -0.5) {
+      const rowRight = Math.max(0, rx + rw - Math.min(rw, -swx) - 2);
+      rc.beginPath();
+      rc.rect(0, y - 2, rowRight, rh + 4);
+      rc.clip();
+    }
+    rc.translate(swx, 0);
+    drawQueueRowBody(rc, dt, y);
+    rc.restore();
+  };
+  const drawRemovingQueueRows = (rc) => {
+    const qRem = SH.qRemoving;
+    if (!qRem || !qRem.length) return;
+    const rx = 12, rw = W - 24;
+    for (let j = 0; j < qRem.length; j++) {
+      const rm = qRem[j];
+      if (!rm || !rm.tr) continue;
+      const y = base + 52 + rm.relY;
+      const curH = rh * clamp(rm.hP, 0, 1);
+      if (curH <= 0.5 || y + curH < top - 16 || y > bot + 16) continue;
+      const rbh = Math.max(0, curH - 4);
+      const revW = Math.min(rw, Math.max(0, -rm.x));
+      const revX = rx + rw - revW;
+      rc.save();
+      rc.beginPath();
+      rc.rect(0, y, W, curH);
+      rc.clip();
+      rc.globalAlpha *= clamp(rm.hP * 1.15, 0, 1);
+      if (revW > 0.5 && rbh > 1) {
+        rc.save();
+        rrPath(rc, revX, y + 2, revW, rbh, Math.min(14, rbh / 2));
+        rc.clip();
+        drawQueueSwipeRemoveBg(rc, revX, y + 2, revW, rbh, Math.max(0, -rm.x), rm);
+        rc.restore();
+      }
+      if (rm.x > -W + 10) {
+        rc.save();
+        const rowRight = Math.max(0, revX - 2);
+        rc.beginPath();
+        rc.rect(0, y, rowRight, curH);
+        rc.clip();
+        rc.translate(rm.x, 0);
+        drawQueueRowBody(rc, rm.tr, y);
+        rc.restore();
+      }
+      rc.restore();
+    }
+  };
   txt(qc, window.t('queue.up_next'), 24, base + 14, F(700, 18), qInk.hi);
   const subTxt = (PL.shuffle && PL.smartShuffle) ? window.t('queue.smart_shuffle_sub') : (PL.infinity ? window.t('queue.autoplay_sub') : window.t('queue.end_sub'));
   txt(qc, subTxt, 24, base + 34, F(400, 14), qInk.rgba(.62, true));
-  const showSkelRows = !rowCount && !!LIVE.radioBusy;
+  const hasRemoving = Boolean(SH.qRemoving && SH.qRemoving.length);
+  const showSkelRows = !rowCount && !hasRemoving && !!LIVE.radioBusy;
   const nowMs = performance.now();
   let skelCount = 0;
   if (!rowCount) {
@@ -1215,6 +1363,7 @@ function drawQueue(c, L, fadeAlpha = 1) {
       SH._qSkelSeenMs = nowMs;
       skelCount = drawQueueSkeleton(qc, base + 52, top, bot, qInk);
     }
+    if (hasRemoving) drawRemovingQueueRows(qc);
   } else {
     if (SH._qSkelSeen) {
       SH._qSkelSeen = false;
@@ -1244,12 +1393,17 @@ function drawQueue(c, L, fadeAlpha = 1) {
     const renderQueueRows = (rc) => {
       const qOff = SH.qOff || (SH.qOff = new Map());
       const seen = new Map();
+      const qSwSeen = new Map();
       const activeKeys = new Set();
       for (let i = 0; i < rowCount; i++) {
         const t = PL.queue[qBase + i];
         const n = seen.get(t) || 0;
         seen.set(t, n + 1);
         const qk = n ? (t.id + '#' + n) : t;
+        const idKey = (t && t.id) || t;
+        const qn = qSwSeen.get(idKey) || 0;
+        qSwSeen.set(idKey, qn + 1);
+        const qSwKey = 'q:' + ((t && t.id) ? t.id : ('r' + i)) + '#' + qn;
         activeKeys.add(qk);
         if (isDragging && i === SH.dragQueue.fromIdx) {
           qOff.delete(qk);
@@ -1284,32 +1438,22 @@ function drawQueue(c, L, fadeAlpha = 1) {
         }
 
         const y = base + 52 + curRel; if (y < top - 70 || y > bot + 10) continue;
-        drawArt(rc, t, 24, y + 8, 44, 6);
-        txt(rc, t.title, 80, y + 28, F(500, 16), qInk.hi, 'left', W - 80 - 70);
-        const isDl = typeof isDownloaded === 'function' && isDownloaded(t);
-        let sx = 80;
-        if (isDl) {
-          if (typeof drawDlBadge === 'function') drawDlBadge(rc, sx + 7.5, y + 42.2, 7.5, dlCols.fill, dlCols.arrow);
-          sx += 21;
-        }
-        if (t._smartRec) {
-          icon(rc, 'spark', sx + 6, y + 42, 12, qInk.rgba(.84), { fill: true });
-          txt(rc, t.artist, sx + 18, y + 47, F(400, 14), qInk.rgba(.66, true), 'left', W - (sx + 18) - 70);
-        } else if (t._queued) {
-          txt(rc, window.t('queue.in_queue_artist', { artist: t.artist }), sx, y + 47, F(400, 14), qInk.rgba(.70, true), 'left', W - sx - 70);
+        const swSt = typeof swqRowState === 'function' ? swqRowState(qSwKey) : null;
+        const swx = swSt ? swSt.x : 0;
+        if (Math.abs(swx) > 0.05) {
+          drawSwipedQueueRow(rc, t, y, swx, swSt);
         } else {
-          txt(rc, t.artist, sx, y + 47, F(400, 14), qInk.rgba(.62, true), 'left', W - sx - 70);
+          drawQueueRowBody(rc, t, y);
         }
-        icon(rc, 'grip', W - 36, y + 30, 20, qInk.rgba(.50, true));
-        rc.fillStyle = qInk.rgba(.12, true);
-        rc.fillRect(80, y + rh - .5, W - 80, .5);
         if (!isDragging && fadeAlpha > .5 && SH.mode === 'queue' && y + rh > top && y < bot) {
           const cy0 = Math.max(top, y), cy1 = Math.min(bot, y + rh);
-          shit(0, cy0, W - 60, cy1 - cy0, () => { PL.qi += i + 1; PL.pos = 0; loadAudio(); redraw(); }, 'queue');
+          shit(0, cy0, W - 60, cy1 - cy0, () => { PL.qi += i + 1; PL.pos = 0; loadAudio(); redraw(); }, 'queue', { qRowKey: qSwKey, qRowIdx: i, qAbsIdx: qBase + i, qRowTrack: t });
           shit(W - 60, cy0, 60, cy1 - cy0, null, 'queueGrip', { rowIdx: i, absIdx: qBase + i, item: t });
         }
       }
       for (const k of qOff.keys()) { if (!activeKeys.has(k)) qOff.delete(k); }
+
+      drawRemovingQueueRows(rc);
 
       if (isDragging && SH.dragQueue && SH.dragQueue.rowItem) {
         drawPillRow(rc, SH.dragQueue.rowItem, pillY, SH.dragQueue.lift != null ? SH.dragQueue.lift : 1);
@@ -1403,3 +1547,75 @@ function reorderQueue(fromIdx, toIdx) {
   }
 }
 window.reorderQueue = reorderQueue;
+
+function removeFromQueue(rowIdx, tr, swState) {
+  if (!PL || !Array.isArray(PL.queue)) return false;
+  const qBase = PL.qi + 1;
+  let absIdx = (rowIdx != null) ? (qBase + rowIdx) : -1;
+  if (!(absIdx >= qBase && absIdx < PL.queue.length && (!tr || PL.queue[absIdx] === tr))) {
+    absIdx = tr ? PL.queue.indexOf(tr, qBase) : -1;
+  }
+  if (absIdx < qBase || absIdx >= PL.queue.length) return false;
+  const effRowIdx = absIdx - qBase;
+  const remTrack = PL.queue[absIdx];
+  const rh = 60;
+  const qOff = SH.qOff || (SH.qOff = new Map());
+  const oldRowCount = Math.max(0, PL.queue.length - qBase);
+  const oldSeen = new Map();
+  const survivingCurs = [];
+  let remRelY = effRowIdx * rh;
+  for (let i = 0; i < oldRowCount; i++) {
+    const t = PL.queue[qBase + i];
+    const n = oldSeen.get(t) || 0;
+    oldSeen.set(t, n + 1);
+    const qk = n ? (t.id + '#' + n) : t;
+    const existing = qOff.get(qk);
+    const curRel = existing ? existing.cur : i * rh;
+    if (i === effRowIdx) {
+      remRelY = curRel;
+      qOff.delete(qk);
+    } else {
+      survivingCurs.push(curRel);
+    }
+  }
+  PL.queue.splice(absIdx, 1);
+  qOff.clear();
+  const newRowCount = Math.max(0, PL.queue.length - qBase);
+  const newSeen = new Map();
+  for (let i = 0; i < newRowCount; i++) {
+    const t = PL.queue[qBase + i];
+    const n = newSeen.get(t) || 0;
+    newSeen.set(t, n + 1);
+    const qk = n ? (t.id + '#' + n) : t;
+    const oldCur = survivingCurs[i] != null ? survivingCurs[i] : i * rh;
+    const tgtRel = i * rh;
+    if (Math.abs(oldCur - tgtRel) > 0.2) {
+      qOff.set(qk, { cur: oldCur, tgt: tgtRel });
+    }
+  }
+  if (!SH.qRemoving) SH.qRemoving = [];
+  SH.qRemoving.push({
+    tr: remTrack,
+    relY: remRelY,
+    x: swState ? (swState.x || 0) : -96,
+    v: swState ? (swState.v || 0) : 0,
+    crossP: swState && swState.crossP != null ? swState.crossP : 1,
+    hitT: swState ? (swState.hitT || 0) : 0,
+    doneT: performance.now(),
+    hP: 1
+  });
+  if (typeof syncNativeNextTrack === 'function') syncNativeNextTrack(true);
+  if (absIdx === qBase) {
+    const nx = PL.queue[qBase];
+    if (nx) {
+      if (nx.id && typeof window !== 'undefined' && window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') {
+        try { window.SonoraNative.prefetch(nx.id); } catch (e) {}
+      }
+      if (typeof preloadArt === 'function') preloadArt(nx, true);
+    }
+  }
+  if (typeof savePlayerState === 'function') savePlayerState();
+  redraw();
+  return true;
+}
+window.removeFromQueue = removeFromQueue;

@@ -262,11 +262,12 @@ class PcmMixer {
                 return
             }
             val reference = source.history(REF_FRAMES)
-            val pile = target.pileMono()
+            val pileLen = target.pileMonoInto()
+            val pile = target.pileScratchBuffer
             val expected = heardUs?.let { target.frameAt(it) }?.let { (it - target.consumedFrames()).toInt() }
             request.computing = true
             worker.execute {
-                val (offset, score) = locate(reference, pile, expected?.minus(REF_FRAMES))
+                val (offset, score) = locate(reference, pile, expected?.minus(REF_FRAMES), pileLen)
                 request.result = Match(source, target, consumed, offset, score)
                 request.computing = false
             }
@@ -344,10 +345,15 @@ class PcmMixer {
          * Where [reference] starts inside [pile], by normalised cross-correlation:
          * coarsely on both decimated, then sample by sample around the best.
          */
-        internal fun locate(reference: FloatArray, pile: FloatArray, around: Int?): Pair<Int, Float> {
-            if (pile.size < reference.size) return -1 to 0f
-            val ref = decimate(reference)
-            val hay = decimate(pile)
+        internal fun locate(
+            reference: FloatArray,
+            pile: FloatArray,
+            around: Int?,
+            pileLen: Int = pile.size,
+        ): Pair<Int, Float> {
+            if (pileLen < reference.size) return -1 to 0f
+            val ref = decimate(reference, reference.size)
+            val hay = decimate(pile, pileLen)
             val refEnergy = ref.sumOf { (it * it).toDouble() }
             if (refEnergy < 1e-6) return -1 to 0f
             val prefix = DoubleArray(hay.size + 1)
@@ -372,7 +378,7 @@ class PcmMixer {
             var fine = best * DECIMATION
             var fineScore = -1.0
             val from = max(0, best * DECIMATION - 2 * DECIMATION)
-            val to = min(pile.size - reference.size, best * DECIMATION + 2 * DECIMATION)
+            val to = min(pileLen - reference.size, best * DECIMATION + 2 * DECIMATION)
             for (k in from..to) {
                 var dot = 0.0
                 var energy = 0.0
@@ -391,8 +397,8 @@ class PcmMixer {
             return fine to fineScore.toFloat()
         }
 
-        private fun decimate(samples: FloatArray): FloatArray {
-            val out = FloatArray(samples.size / DECIMATION)
+        private fun decimate(samples: FloatArray, len: Int = samples.size): FloatArray {
+            val out = FloatArray(len / DECIMATION)
             for (i in out.indices) {
                 var sum = 0f
                 for (j in 0 until DECIMATION) sum += samples[i * DECIMATION + j]
@@ -446,6 +452,8 @@ class MixerChannel internal constructor(
     private var lastGain = -1f
 
     private val history = FloatArray(PcmMixer.REF_FRAMES)
+    private val historyScratch = FloatArray(PcmMixer.REF_FRAMES)
+    internal val pileScratchBuffer = FloatArray(capacity)
     private var historyIndex = 0
     private var historyCount = 0
 
@@ -610,7 +618,11 @@ class MixerChannel internal constructor(
     internal fun firstStampUs(): Long? = synchronized(this) { stamps.firstOrNull()?.get(1) }
 
     internal fun history(frames: Int): FloatArray = synchronized(this) {
-        FloatArray(frames) { i -> history[(historyIndex - frames + i + history.size * 2) % history.size] }
+        val target = if (frames == historyScratch.size) historyScratch else FloatArray(frames)
+        for (i in 0 until frames) {
+            target[i] = history[(historyIndex - frames + i + history.size * 2) % history.size]
+        }
+        target
     }
 
     internal fun mediaTimeAt(frame: Long): Long? = synchronized(this) {
@@ -631,11 +643,13 @@ class MixerChannel internal constructor(
         before[0] + (after[0] - before[0]) * (timeUs - before[1]) / (after[1] - before[1])
     }
 
-    internal fun pileMono(): FloatArray = synchronized(this) {
-        FloatArray(queued) { i ->
+    internal fun pileMonoInto(): Int = synchronized(this) {
+        val n = min(queued, pileScratchBuffer.size)
+        for (i in 0 until n) {
             val at = (readIndex + i) % capacity
-            (ring[at * 2] + ring[at * 2 + 1]) * 0.5f
+            pileScratchBuffer[i] = (ring[at * 2] + ring[at * 2 + 1]) * 0.5f
         }
+        n
     }
 
     internal fun playedFrames(): Long = synchronized(this) {

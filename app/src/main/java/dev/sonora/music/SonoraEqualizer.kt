@@ -147,8 +147,10 @@ class SonoraEqAudioProcessor : BaseAudioProcessor() {
         if (wanted == null) {
             out.put(inputBuffer)
             out.flip()
-            if (appliedTuning != null) {
+            if (appliedTuning != null || activeBandCount != 0) {
                 appliedTuning = null
+                activeBandCount = 0
+                bands.fill(null)
                 state.fill(0.0)
             }
             return
@@ -168,6 +170,7 @@ class SonoraEqAudioProcessor : BaseAudioProcessor() {
 
         val count = activeBandCount
         if (count == 0 || (size and 1) != 0) {
+            if (count == 0) state.fill(0.0)
             out.put(inputBuffer)
             out.flip()
             return
@@ -233,7 +236,9 @@ class SonoraEqAudioProcessor : BaseAudioProcessor() {
         for (k in count until bands.size) bands[k] = null
         val sameShape = sampleRate == configuredRate && channels == configuredChannels && count == activeBandCount
         val neededState = count * channels * 2
-        if (state.size < neededState) {
+        if (count == 0) {
+            state.fill(0.0)
+        } else if (state.size < neededState) {
             state = DoubleArray(neededState)
         } else if (!sameShape) {
             state.fill(0.0, 0, neededState)

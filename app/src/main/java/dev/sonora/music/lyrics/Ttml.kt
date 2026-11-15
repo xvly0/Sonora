@@ -4,6 +4,7 @@ import android.util.Xml
 import dev.sonora.music.LyricLine
 import dev.sonora.music.LyricWord
 import dev.sonora.music.Lyrics
+import dev.sonora.music.SonoraLocaleManager
 import java.io.StringReader
 import java.util.Locale
 import org.xmlpull.v1.XmlPullParser
@@ -15,9 +16,6 @@ object Ttml {
         val document = runCatching { read(raw) }.getOrNull() ?: return null
         val lines = document.lines
         if (lines.isEmpty()) return null
-
-        // Reject partially timed documents so callers can fall back to another provider.
-        if (lines.any { it.startMs == null }) return null
 
         return Lyrics(withGaps(lines, chosen(document.translations)), synced = true)
     }
@@ -43,7 +41,12 @@ object Ttml {
             when (parser.eventType) {
                 XmlPullParser.START_TAG -> when (parser.name) {
                     "body" -> inBody = true
-                    "p" -> if (inBody) lines += readLine(parser)
+                    "p" -> if (inBody) {
+                        val line = readLine(parser)
+                        if (line.startMs != null) {
+                            lines += line
+                        }
+                    }
                     // `<translation>` lives in `<head>` outside `<body>`.
                     "translation" -> readTranslation(parser, translations)
                 }
@@ -92,7 +95,7 @@ object Ttml {
 
     private fun chosen(translations: Map<String, Map<String, String>>): Map<String, String> {
         if (translations.isEmpty()) return emptyMap()
-        val wanted = Locale.getDefault().language
+        val wanted = SonoraLocaleManager.resolvedLang.ifBlank { Locale.getDefault().language }
         return translations.entries
             .firstOrNull { it.key.substringBefore('-').equals(wanted, ignoreCase = true) }
             ?.value

@@ -1,6 +1,8 @@
 package dev.sonora.music.lyrics
 
-/** Strips video upload noise, featured artists, and edition suffixes from track titles. */
+import java.text.Normalizer
+
+/** Strips video upload noise, featured artists, producer credits, and edition suffixes from track titles. */
 internal fun String.songTitle(): String =
     replace(NOISE, "")
         .replace(FEAT_NOISE, "")
@@ -9,24 +11,43 @@ internal fun String.songTitle(): String =
         .trim()
 
 /**
- * Trims upload/edition noise while preserving "(feat. ...)" / "(ft. ...)" so
- * versions with featured artists (e.g. "Glue Song (feat. Clairo)") can be
+ * Trims upload/edition/producer noise while preserving featured-artist clauses
+ * so versions with featured artists (e.g. "Glue Song (feat. Clairo)") can be
  * looked up specifically before falling back to the base title.
  */
 internal fun String.songTitleKeepingFeat(): String =
     replace(NOISE, "")
+        .replace(PROD_NOISE, "")
         .replace(EDITION_NOISE, "")
         .replace(WHITESPACE, " ")
         .trim()
 
 /**
- * Ordered title variants to query: version with featured artist (if any) first,
- * followed by the base cleaned title.
+ * Normalizes localized feature markers like "(con ...)", "(with ...)", "(featuring ...)"
+ * or "[...]" into canonical "(feat. ...)" so international lyrics databases match.
+ */
+internal fun String.songTitleNormalizedFeat(): String =
+    songTitleKeepingFeat()
+        .replace(FEAT_CANONICAL_PAREN) { match ->
+            val featured = match.groupValues[1].ifBlank { match.groupValues[2] }.trim()
+            " (feat. $featured)"
+        }
+        .replace(WHITESPACE, " ")
+        .trim()
+
+/**
+ * Ordered title variants to query: canonical "(feat. ...)" version first (if any),
+ * followed by the base cleaned title, and finally the original feature wording if different.
  */
 internal fun String.titleVariants(): List<String> =
-    listOf(songTitleKeepingFeat(), songTitle())
+    listOf(songTitleNormalizedFeat(), songTitle(), songTitleKeepingFeat())
         .filter { it.isNotBlank() }
         .distinct()
+
+/** Folds combining diacritical marks (e.g. "Guè" -> "Gue") for accent-insensitive matching. */
+internal fun String.foldDiacritics(): String =
+    Normalizer.normalize(this, Normalizer.Form.NFD)
+        .replace(COMBINING_MARKS, "")
 
 /**
  * Extracts the lead artist from collaboration strings like "Artist A, Artist B"
@@ -117,8 +138,8 @@ internal fun matchesTrackTitle(candidateTitle: String, queryTitle: String): Bool
  * an exact version match (e.g. "Glue Song (feat. Clairo)" over "Glue Song") during scoring.
  */
 internal fun isExactTitleMatch(candidateTitle: String, queryTitle: String): Boolean {
-    val qNorm = normalizeSimple(queryTitle.songTitleKeepingFeat())
-    val cNorm = normalizeSimple(candidateTitle.songTitleKeepingFeat())
+    val qNorm = normalizeSimple(queryTitle.songTitleNormalizedFeat())
+    val cNorm = normalizeSimple(candidateTitle.songTitleNormalizedFeat())
     return qNorm.isNotEmpty() && qNorm == cNorm
 }
 
@@ -135,11 +156,18 @@ internal fun matchesArtistName(candidateArtist: String, queryArtist: String): Bo
 
     for (q in qArtists) {
         val qCompact = q.replace(" ", "")
+        val qTokens = q.split(' ').filter { it.isNotEmpty() }
         for (c in cArtists) {
             if (q == c) return true
             val cCompact = c.replace(" ", "")
             if (qCompact.isNotEmpty() && qCompact == cCompact) return true
             if (q.length >= 4 && c.length >= 4 && (c.contains(q) || q.contains(c))) return true
+            if (q.length >= 2 && c.length >= 2 && qTokens.isNotEmpty()) {
+                val cTokens = c.split(' ').filter { it.isNotEmpty() }
+                if (cTokens.isNotEmpty() && (qTokens.all { it in cTokens } || cTokens.all { it in qTokens })) {
+                    return true
+                }
+            }
         }
     }
     return false
@@ -152,11 +180,14 @@ private fun normalizeSimple(value: String): String =
     value
         .replace("\uFEFF", "")
         .replace("ï»¿", "")
+        .foldDiacritics()
         .lowercase()
         .replace(APOSTROPHES, "")
         .replace(NON_ALNUM, " ")
         .replace(WHITESPACE, " ")
         .trim()
+
+private val COMBINING_MARKS = Regex("\\p{Mn}+")
 
 private val NOISE = Regex(
     "\\((?:official|lyric|audio|video|visualizer|hd|4k|mv|m/v)[^)]*\\)" +
@@ -164,18 +195,30 @@ private val NOISE = Regex(
     RegexOption.IGNORE_CASE,
 )
 
+private val PROD_NOISE = Regex(
+    "\\s*\\(prod(?:\\.?\\s+by|\\.)?\\s+[^)]+\\)|\\s*\\[prod(?:\\.?\\s+by|\\.)?\\s+[^\\]]+\\]",
+    RegexOption.IGNORE_CASE,
+)
+
+private val FEAT_CANONICAL_PAREN = Regex(
+    "\\s*\\((?:featuring|feat|ft|with|con)\\.?\\s+([^)]+)\\)|\\s*\\[(?:featuring|feat|ft|with|con)\\.?\\s+([^\\]]+)\\]",
+    RegexOption.IGNORE_CASE,
+)
+
 private val FEAT_NOISE = Regex(
-    "\\s*\\((?:feat|ft)\\.?\\s+[^)]+\\)|\\s*\\[(?:feat|ft)\\.?\\s+[^\\]]+\\]",
+    "\\s*\\((?:featuring|feat|ft|with|con|prod(?:\\.?\\s+by|\\.)?)\\.?\\s+[^)]+\\)" +
+        "|\\s*\\[(?:featuring|feat|ft|with|con|prod(?:\\.?\\s+by|\\.)?)\\.?\\s+[^\\]]+\\]" +
+        "|\\s+(?:featuring|feat|ft)\\.?\\s+.*",
     RegexOption.IGNORE_CASE,
 )
 
 private val FEAT_TRAILING = Regex(
-    "\\s+(?:feat|ft)\\.?\\s+.*",
+    "\\s+(?:featuring|feat|ft|with|con|prod(?:\\.?\\s+by|\\.)?)\\.?\\s+.*",
     RegexOption.IGNORE_CASE,
 )
 
 private val FEAT_SPLIT = Regex(
-    "\\s+(?:feat|ft)\\.?\\s+",
+    "\\s+(?:featuring|feat|ft|with|con)\\.?\\s+",
     RegexOption.IGNORE_CASE,
 )
 

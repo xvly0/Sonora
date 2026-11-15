@@ -61,9 +61,9 @@ data class LyricSearchHit(
 
 object LyricsLibrary {
 
-    private const val DISK_CACHE_VERSION = "v4"
+    private const val DISK_CACHE_VERSION = "v5"
     private const val DISK_CACHE_TTL_MS = 7L * 24L * 3600L * 1000L
-    private const val SOURCE_TIMEOUT_MS = 10_000L
+    private const val SOURCE_TIMEOUT_MS = 12_000L
     private const val LYRIC_SEARCH_SCAN_LIMIT = 150
     private const val LYRIC_SEARCH_TIMEOUT_MS = 1_400L
     private val TOP_TIER_SOURCES = setOf("apple", "better")
@@ -161,9 +161,12 @@ object LyricsLibrary {
         return true
     }
 
+    private fun diskCacheFile(dir: File, key: String): File =
+        File(dir, "${DISK_CACHE_VERSION}_${sha1Hex(key)}.json")
+
     private fun readDiskCache(key: String): JSONObject? {
         val dir = diskCacheDir ?: return null
-        val file = File(dir, "${sha1Hex(key)}.json")
+        val file = diskCacheFile(dir, key)
         if (!file.exists()) return null
         if (System.currentTimeMillis() - file.lastModified() > DISK_CACHE_TTL_MS) {
             runCatching { file.delete() }
@@ -198,7 +201,7 @@ object LyricsLibrary {
             if (artist.isNotBlank()) diskObj.put("artist", artist.trim())
             if (videoId.isNotBlank()) diskObj.put("videoId", videoId.trim())
             if (album.isNotBlank()) diskObj.put("album", album.trim())
-            File(dir, "${sha1Hex(key)}.json").writeText(diskObj.toString(), Charsets.UTF_8)
+            diskCacheFile(dir, key).writeText(diskObj.toString(), Charsets.UTF_8)
         }
     }
 
@@ -680,7 +683,7 @@ object LyricsLibrary {
         suspendCancellableCoroutine { cont ->
             val request = Request.Builder()
                 .url(url)
-                .header("User-Agent", "Square (https://github.com/lelonio/square)")
+                .header("User-Agent", "Sonora/1.0")
                 .build()
             val call = searchHttpClient.newCall(request)
             cont.invokeOnCancellation {

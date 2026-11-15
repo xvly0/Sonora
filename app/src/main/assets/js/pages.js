@@ -102,9 +102,17 @@ function card(c, it, x, y, s, round, rad) {
   hit(x, y, s, s + 48, () => open(it), { pressKey: pk });
 }
 function grid2(c, P, y, items, pinned) {
-  const s = Math.floor((W - 40 - 16) / 2);
-  items.forEach((it, i) => { const x = 20 + (i % 2) * (s + 16), yy = y + Math.floor(i / 2) * (s + 62); if (vis(P, yy, s + 60)) card(c, it, x, yy, s, it.kind === 'artist'); });
-  return y + Math.ceil(items.length / 2) * (s + 62);
+  const s = Math.floor((W - 40 - 16) / 2), rowH = s + 62, rows = Math.ceil(items.length / 2);
+  if (rows > 0) {
+    const rowLo = Math.max(0, Math.floor((P.scroll - 30 - y) / rowH) - 1);
+    const rowHi = Math.min(rows - 1, Math.ceil((P.scroll + H + 30 - y) / rowH) + 1);
+    const iLo = rowLo * 2, iHi = Math.min(items.length, (rowHi + 1) * 2);
+    for (let i = iLo; i < iHi; i++) {
+      const it = items[i], x = 20 + (i % 2) * (s + 16), yy = y + Math.floor(i / 2) * rowH;
+      if (vis(P, yy, s + 60)) card(c, it, x, yy, s, it.kind === 'artist');
+    }
+  }
+  return y + rows * rowH;
 }
 function drawSwipeQueueBg(c, rx, ry, rw, rh, r, tn, sw) {
   const sRow = sw || (typeof SWQ !== 'undefined' ? SWQ : null);
@@ -416,8 +424,9 @@ PAGES.radio = (c, P) => {
       c.save(); rrPath(c, 20, y, w, h, 20); c.clip(); c.strokeStyle = 'rgba(255,255,255,.14)'; c.lineWidth = 2; for (let i = 1; i < 7; i++) { c.beginPath(); c.arc(20 + w - 30, y + h - 20, i * 34, 0, 7); c.stroke(); } c.restore();
       eyebrow(c, t('radio.live_now'), 38, y + 30, 'rgba(255,255,255,.8)'); txt(c, s.title, 38, y + 70, F(800, 32), '#fff', 'left', w - 110); txt(c, s.sub, 38, y + 98, F(400, 15), 'rgba(255,255,255,.85)', 'left', w - 110);
       c.fillStyle = 'rgba(255,255,255,.95)'; c.beginPath(); c.arc(20 + w - 40, y + h - 38, 22, 0, 7); c.fill(); icon(c, 'play', 20 + w - 38, y + h - 38, 18, hsl(s.hue + 20, 80, 38));
+      hit(20, y, w, h, () => playShuffled(pick(h32(s.id), 14)));
     }
-    hit(20, y, w, h, () => playShuffled(pick(h32(s.id), 14))); y += h + 14;
+    y += h + 14;
   });
   return end(y);
 };
@@ -457,30 +466,48 @@ PAGES.plist = (c, P) => {
     c.stroke();
     txt(c, t('prompt.new_playlist_btn'), W / 2, y + 29, F(600, 15.5), pal.accent, 'center');
   }
-  hit(0, y - 4, W, bh + 8, () => {
-    if (typeof showPromptModal === 'function') {
-      showPromptModal({
-        title: t('prompt.new_playlist_title'),
-        placeholder: t('prompt.playlist_placeholder'),
-        confirmText: t('prompt.create'),
-        onConfirm: title => {
-          if (!title || !title.trim()) return;
-          if (typeof createUserPlaylist === 'function') {
-            const pl = createUserPlaylist(title.trim());
-            if (pl && typeof open === 'function') open(pl);
+  if (vis(P, y - 4, bh + 8)) {
+    hit(0, y - 4, W, bh + 8, () => {
+      if (typeof showPromptModal === 'function') {
+        showPromptModal({
+          title: t('prompt.new_playlist_title'),
+          placeholder: t('prompt.playlist_placeholder'),
+          confirmText: t('prompt.create'),
+          onConfirm: title => {
+            if (!title || !title.trim()) return;
+            if (typeof createUserPlaylist === 'function') {
+              const pl = createUserPlaylist(title.trim());
+              if (pl && typeof open === 'function') open(pl);
+            }
           }
-        }
-      });
-    }
-  }, { tag: 'newPlaylistBtn' });
+        });
+      }
+    }, { tag: 'newPlaylistBtn' });
+  }
   y += bh + 12;
-  PLAYLISTS.forEach(p => { if (vis(P, y, 76)) { drawArt(c, p, 20, y + 8, 60, 8); txt(c, p.title, 96, y + 36, F(500, 17), pal.fg, 'left', W - 130); txt(c, tPlural(p.tracks.length, 'library.song_count_one', 'library.song_count_many'), 96, y + 58, F(400, 15), pal.sub); icon(c, 'chev', W - 30, y + 38, 12, pal.sub2, { lw: 3.2 }); c.fillStyle = pal.sep; c.fillRect(96, y + 75.5, W - 96, .5); } hit(0, y, W, 76, () => open(p)); y += 76; });
-  return end(y);
+  const loP = Math.max(0, Math.floor((P.scroll - 30 - y) / 76) - 1);
+  const hiP = Math.min(PLAYLISTS.length, Math.ceil((P.scroll + H + 30 - y) / 76) + 1);
+  for (let i = loP; i < hiP; i++) {
+    const p = PLAYLISTS[i], py = y + i * 76;
+    if (vis(P, py, 76)) {
+      drawArt(c, p, 20, py + 8, 60, 8); txt(c, p.title, 96, py + 36, F(500, 17), pal.fg, 'left', W - 130); txt(c, tPlural(p.tracks.length, 'library.song_count_one', 'library.song_count_many'), 96, py + 58, F(400, 15), pal.sub); icon(c, 'chev', W - 30, py + 38, 12, pal.sub2, { lw: 3.2 }); c.fillStyle = pal.sep; c.fillRect(96, py + 75.5, W - 96, .5);
+      hit(0, py, W, 76, () => open(p));
+    }
+  }
+  return end(y + PLAYLISTS.length * 76);
 };
 PAGES.artists = (c, P) => {
   let y = listTop();
-  ARTISTS.forEach(a => { if (vis(P, y, 76)) { drawArt(c, a, 20, y + 8, 60, 30); txt(c, a.title, 96, y + 36, F(500, 17), pal.fg, 'left', W - 130); txt(c, subOf(a), 96, y + 58, F(400, 15), pal.sub); icon(c, 'chev', W - 30, y + 38, 12, pal.sub2, { lw: 3.2 }); c.fillStyle = pal.sep; c.fillRect(96, y + 75.5, W - 96, .5); } hit(0, y, W, 76, () => open(a)); y += 76; });
-  return end(y);
+  const loA = Math.max(0, Math.floor((P.scroll - 30 - y) / 76) - 1);
+  const hiA = Math.min(ARTISTS.length, Math.ceil((P.scroll + H + 30 - y) / 76) + 1);
+  for (let i = loA; i < hiA; i++) {
+    const a = ARTISTS[i], py = y + i * 76;
+    if (vis(P, py, 76)) {
+      drawArt(c, a, 20, py + 8, 60, 30); txt(c, a.title, 96, py + 36, F(500, 17), pal.fg, 'left', W - 130); txt(c, subOf(a), 96, py + 58, F(400, 15), pal.sub); icon(c, 'chev', W - 30, py + 38, 12, pal.sub2, { lw: 3.2 }); c.fillStyle = pal.sep; c.fillRect(96, py + 75.5, W - 96, .5);
+      hit(0, py, W, 76, () => open(a));
+    }
+  }
+  return end(y + ARTISTS.length * 76);
 };
 PAGES.songs = (c, P) => {
   let y = listTop() + 6; const list = P.data.list || [];
@@ -1605,7 +1632,11 @@ function setSliderRow(c, P, y, id, label, valStr, norm, onSet, isLast, accentCol
         ctrl.val.t = nf; onSet(nf);
       }
     },
-    lqMove: () => { onSet(clamp(ctrl.val.t, 0, 1)); }
+    lqMove: () => { onSet(clamp(ctrl.val.t, 0, 1)); },
+    lqCommit: () => {
+      onSet(clamp(ctrl.val.t, 0, 1));
+      if (typeof flushPrefsSave === 'function') flushPrefsSave();
+    }
   });
   return y + h;
 }

@@ -100,17 +100,62 @@ function makeArt(o) {
 }
 const _artUpQ = [];
 let _artUpAct = 0, _artUpTimer = 0, _artColdRetryTimer = 0;
+function _isScrollOrAnimBusy() {
+  if (typeof _isUiAnimatingOrBusy === 'function') return _isUiAnimatingOrBusy();
+  if (typeof INP !== 'undefined' && INP && INP.down) return true;
+  if (typeof topPage === 'function') {
+    const tp = topPage();
+    if (tp && Math.abs(tp.vel || 0) > 45) return true;
+  }
+  if (typeof NAV !== 'undefined' && NAV && (NAV.popP > 0.01 || NAV.pushP > 0.01 || NAV.popT > 0.01)) return true;
+  if (typeof _tabTrans !== 'undefined' && _tabTrans && _tabTrans.active) return true;
+  if (typeof SH !== 'undefined' && SH && (SH.drag || (SH.t > 0.01 && SH.t < 0.99) || Math.abs(SH.qVel || 0) > 25 || Math.abs(SH.lVel || 0) > 25)) return true;
+  return false;
+}
+function _redrawAfterArt(it) {
+  const cTr = typeof cur === 'function' ? cur() : null;
+  const isCur = Boolean(it && cTr && (cTr.id === it.id || (it.kind === 'album' && cTr.album === it.id)));
+  if (!isCur && typeof redrawSheetContent === 'function') redrawSheetContent();
+  else if (typeof redraw === 'function') redraw();
+}
 function _isHiResCoverUrl(u) {
   return Boolean(u && /[?&]s=(?:1080|1200|1400)\b/.test(u));
 }
+function _enqueueArtUp(target, pri) {
+  if (!target) return;
+  if (pri) target._artUpPri = true;
+  if (!target._appleUpgradeTried) {
+    target._appleUpgradeTried = true;
+    if (pri) _artUpQ.unshift(target);
+    else _artUpQ.push(target);
+    if (!_artUpTimer) {
+      const busy = _isScrollOrAnimBusy();
+      if ((typeof window !== 'undefined' && window.__IN_DRAW_SCENE) || busy) {
+        if (typeof setTimeout === 'function') _artUpTimer = setTimeout(_pumpArtUpQ, busy ? 28 : 0);
+      } else {
+        _pumpArtUpQ();
+      }
+    }
+  } else if (pri) {
+    const idx = _artUpQ.indexOf(target);
+    if (idx > 0) {
+      _artUpQ.splice(idx, 1);
+      _artUpQ.unshift(target);
+    }
+  }
+}
+if (typeof window !== 'undefined') window._enqueueArtUp = _enqueueArtUp;
 function _pumpArtUpQ() {
   _artUpTimer = 0;
   if (!_artUpQ.length) return;
-  while (_artUpAct < 3 && _artUpQ.length) {
+  const busy = _isScrollOrAnimBusy();
+  const maxConc = busy ? 2 : 6;
+  while (_artUpAct < maxConc && _artUpQ.length) {
     const it = _artUpQ.shift();
     if (!it) continue;
     const isAlbum = it.kind === 'album';
     const isTrack = !isAlbum && it.kind !== 'artist' && (!it.kind || it.kind === 'track');
+    if (it._appleUpgradeSettled || (isTrack && it.canonicalCover)) continue;
     const fetcher = isAlbum
       ? (typeof fetchAlbumThumb === 'function' ? () => fetchAlbumThumb(it.title, it.artist, it.id) : null)
       : isTrack
@@ -118,17 +163,24 @@ function _pumpArtUpQ() {
         : (typeof fetchArtistThumb === 'function' ? () => fetchArtistThumb(it.title, it.id) : null);
     if (!fetcher) continue;
     _artUpAct++;
+    const isCur = Boolean(typeof cur === 'function' && cur() && cur().id === it.id);
+    const priArt = isCur || Boolean(it._artUpPri);
     Promise.resolve(fetcher()).then(hq => {
       if (hq) {
         it._appleUpgradeSettled = true;
         const sameBase = Boolean(it.thumb && hq && typeof isSameCoverBase === 'function' && isSameCoverBase(it.thumb, hq));
         if (sameBase && _isHiResCoverUrl(it.thumb) && !_isHiResCoverUrl(hq)) {
-          if (typeof preloadArt === 'function') preloadArt(it, true);
+          if (typeof preloadArt === 'function') preloadArt(it, priArt);
           return;
         }
         const hasSameArt = Boolean(it.id && ARTC[it.id] && ARTC[it.id]._real &&
           (ARTC[it.id]._url === hq || (typeof isSameCoverBase === 'function' && isSameCoverBase(ARTC[it.id]._url, hq) && (!_isHiResCoverUrl(hq) || _isHiResCoverUrl(ARTC[it.id]._url)))));
         const bothApple = it.thumb && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(it.thumb) && isAppleArtistThumb(hq);
+        const hqReady = Boolean(typeof _covUrl !== 'undefined' && _covUrl[hq] && _covUrl[hq].width > 0);
+        const hadRealArt = Boolean((it.id && ARTC[it.id] && ARTC[it.id]._real) || (it.album && ARTC[it.album] && ARTC[it.album]._real));
+        if (hqReady && hadRealArt) {
+          try { _covUrl[hq]._fadePending = false; _covUrl[hq]._t0 = 0; } catch (e) {}
+        }
         if (it.thumb !== hq || !hasSameArt) {
           it.thumb = hq;
           if (it.id && typeof BYID !== 'undefined' && BYID[it.id] && BYID[it.id] !== it) {
@@ -139,25 +191,26 @@ function _pumpArtUpQ() {
           }
           if (isTrack && it.album && typeof BYID !== 'undefined' && BYID[it.album] &&
               (it.album === 's_' + it.id || !(ARTC[it.album] && ARTC[it.album]._real && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(ARTC[it.album]._url)))) {
-            if (!(ARTC[it.album] && ARTC[it.album]._real && typeof isSameCoverBase === 'function' && isSameCoverBase(ARTC[it.album]._url, hq))) {
+            if ((hqReady || !(ARTC[it.album] && ARTC[it.album]._real)) &&
+                !(ARTC[it.album] && ARTC[it.album]._real && typeof isSameCoverBase === 'function' && isSameCoverBase(ARTC[it.album]._url, hq))) {
               delete ARTC[it.album];
             }
           }
-          if (it.id && !sameBase && (isTrack || !bothApple || !(ARTC[it.id] && ARTC[it.id]._real))) delete ARTC[it.id];
-          if (it.id && !sameBase) {
+          if (it.id && !sameBase && (hqReady || !(ARTC[it.id] && ARTC[it.id]._real)) && (isTrack || !bothApple || !(ARTC[it.id] && ARTC[it.id]._real))) delete ARTC[it.id];
+          if (it.id && !sameBase && (hqReady || !(ARTC[it.id] && ARTC[it.id]._real))) {
             if (typeof PALC !== 'undefined') delete PALC[it.id];
             if (typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[it.id];
             if (typeof TINTC !== 'undefined') { delete TINTC[it.id + 'd']; delete TINTC[it.id + 'l']; }
           }
-          if (typeof preloadArt === 'function') preloadArt(it, true);
-          if (typeof redraw === 'function') redraw();
+          if (typeof preloadArt === 'function') preloadArt(it, priArt);
+          _redrawAfterArt(it);
         } else if (isTrack) {
-          if (it.album === 's_' + it.id && ARTC[it.album] && ARTC[it.album]._real &&
+          if (it.album === 's_' + it.id && ARTC[it.album] && ARTC[it.album]._real && hqReady &&
               typeof isSameCoverBase === 'function' && !isSameCoverBase(ARTC[it.album]._url, hq)) {
             delete ARTC[it.album];
           }
-          if (typeof preloadArt === 'function') preloadArt(it, true);
-          if (typeof redraw === 'function') redraw();
+          if (typeof preloadArt === 'function') preloadArt(it, priArt);
+          _redrawAfterArt(it);
         }
       } else if (!isTrack && it.title && (isAlbum
           ? (typeof isAppleAlbumThumbCold === 'function' && isAppleAlbumThumbCold(it.title, it.artist))
@@ -166,23 +219,23 @@ function _pumpArtUpQ() {
         if (it._coldRetries >= 4) {
           it._appleUpgradeSettled = true;
           if (it.thumb) {
-            if (typeof preloadArt === 'function') preloadArt(it, true);
-            if (typeof redraw === 'function') redraw();
+            if (typeof preloadArt === 'function') preloadArt(it, priArt);
+            _redrawAfterArt(it);
           }
         } else {
           it._appleUpgradeTried = false;
           if (!_artColdRetryTimer && typeof setTimeout === 'function') {
             _artColdRetryTimer = setTimeout(() => {
               _artColdRetryTimer = 0;
-              if (typeof redraw === 'function') redraw();
+              _redrawAfterArt(it);
             }, 2100);
           }
         }
       } else {
         it._appleUpgradeSettled = true;
         if (it.thumb) {
-          if (typeof preloadArt === 'function') preloadArt(it, true);
-          if (typeof redraw === 'function') redraw();
+          if (typeof preloadArt === 'function') preloadArt(it, priArt);
+          _redrawAfterArt(it);
         }
       }
     }).catch(() => {
@@ -190,7 +243,7 @@ function _pumpArtUpQ() {
     }).finally(() => {
       _artUpAct = Math.max(0, _artUpAct - 1);
       if (_artUpQ.length && !_artUpTimer && typeof setTimeout === 'function') {
-        _artUpTimer = setTimeout(_pumpArtUpQ, 0);
+        _artUpTimer = setTimeout(_pumpArtUpQ, _isScrollOrAnimBusy() ? 36 : 0);
       }
     });
   }
@@ -198,18 +251,21 @@ function _pumpArtUpQ() {
 function _resolveTrackArtItem(item) {
   if (!item) return item;
   const kKnown = (typeof LIVE !== 'undefined' && LIVE.known && item.id) ? LIVE.known[item.id] : null;
-  if (kKnown && kKnown !== item && kKnown.thumb) {
-    const shouldSync = Boolean(
-      (kKnown.canonicalCover && (!item.canonicalCover || kKnown.thumb !== item.thumb || kKnown.album !== item.album || kKnown.albumTitle !== item.albumTitle)) ||
-      !item.thumb
-    );
-    if (shouldSync) {
-      item.thumb = kKnown.thumb;
-      item.album = kKnown.album;
-      item.albumTitle = kKnown.albumTitle;
-      item.albumId = kKnown.albumId;
-      item.canonicalCover = kKnown.canonicalCover;
-      if (kKnown._appleUpgradeSettled || kKnown.canonicalCover) item._appleUpgradeSettled = true;
+  if (kKnown && kKnown !== item) {
+    if (kKnown._appleUpgradeSettled && !item._appleUpgradeSettled) item._appleUpgradeSettled = true;
+    if (kKnown.thumb) {
+      const shouldSync = Boolean(
+        (kKnown.canonicalCover && (!item.canonicalCover || kKnown.thumb !== item.thumb || kKnown.album !== item.album || kKnown.albumTitle !== item.albumTitle)) ||
+        !item.thumb
+      );
+      if (shouldSync) {
+        item.thumb = kKnown.thumb;
+        item.album = kKnown.album;
+        item.albumTitle = kKnown.albumTitle;
+        item.albumId = kKnown.albumId;
+        item.canonicalCover = kKnown.canonicalCover;
+        if (kKnown._appleUpgradeSettled || kKnown.canonicalCover) item._appleUpgradeSettled = true;
+      }
     }
   }
   const alb = albumOf(item);
@@ -255,54 +311,69 @@ function artOf(item) {
   const needsAlbumApple = isAlbum && !isTrackRaw && liveOn &&
     typeof isAppleArtistThumb === 'function' && (!th || !isAppleArtistThumb(th)) &&
     typeof fetchAlbumThumb === 'function' && Boolean(item.title);
+  const isAppleUrl = u => Boolean(u && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(u));
+  const thIsApple = isAppleUrl(th);
+  const saveReal = cv => { if (raw && cv && cv._real && cv.width > 0) raw._lastRealArt = cv; return cv; };
+  const canSeedKey = Boolean(k && raw && (k === raw.id || String(k).indexOf('s_') === 0));
   if (needsTrackApple) {
-    if (!raw._appleUpgradeTried) {
-      raw._appleUpgradeTried = true;
-      _artUpQ.push(raw);
-      if (!_artUpTimer) _pumpArtUpQ();
-    }
-    if (th && typeof liveCover === 'function' &&
+    _enqueueArtUp(raw, false);
+    if (th && thIsApple && typeof liveCover === 'function' &&
         (!ARTC[k] || !ARTC[k]._real || (ARTC[k]._url !== th && !(typeof isSameCoverBase === 'function' && isSameCoverBase(ARTC[k]._url, th))))) {
       liveCover(item, k, false);
     }
-    if (ARTC[k] && ARTC[k].width > 0 && ARTC[k]._real) return ARTC[k];
-    return (ARTC[k] && ARTC[k].width > 0) ? ARTC[k] : (ARTC[k] = makeArt(item));
+    if (ARTC[k] && ARTC[k].width > 0 && ARTC[k]._real && isAppleUrl(ARTC[k]._url)) return saveReal(ARTC[k]);
+    if (raw && raw.id && ARTC[raw.id] && ARTC[raw.id]._real && ARTC[raw.id].width > 0 && isAppleUrl(ARTC[raw.id]._url)) return saveReal(ARTC[raw.id]);
+    if (raw && raw._lastRealArt && raw._lastRealArt._real && raw._lastRealArt.width > 0 && isAppleUrl(raw._lastRealArt._url)) return raw._lastRealArt;
+    if (ARTC[k] && ARTC[k].width > 0 && !ARTC[k]._real) return ARTC[k];
+    const ph = makeArt(item);
+    if (!ARTC[k] || !ARTC[k]._real) ARTC[k] = ph;
+    return ph;
   }
   if ((needsArtistApple || needsAlbumApple) && !item._appleUpgradeSettled) {
-    if (!item._appleUpgradeTried) {
-      item._appleUpgradeTried = true;
-      _artUpQ.push(item);
-      if (!_artUpTimer) _pumpArtUpQ();
-    }
-    if (th && typeof liveCover === 'function' &&
+    _enqueueArtUp(item, false);
+    if (th && thIsApple && typeof liveCover === 'function' &&
         (!ARTC[k] || !ARTC[k]._real || (ARTC[k]._url !== th && !(typeof isSameCoverBase === 'function' && isSameCoverBase(ARTC[k]._url, th))))) {
       liveCover(item, k, false);
     }
-    if (ARTC[k] && ARTC[k].width > 0 && ARTC[k]._real) return ARTC[k];
-    return (ARTC[k] && ARTC[k].width > 0) ? ARTC[k] : (ARTC[k] = makeArt(item));
+    if (ARTC[k] && ARTC[k].width > 0 && ARTC[k]._real && isAppleUrl(ARTC[k]._url)) return saveReal(ARTC[k]);
+    if (raw && raw._lastRealArt && raw._lastRealArt._real && raw._lastRealArt.width > 0 && isAppleUrl(raw._lastRealArt._url)) return raw._lastRealArt;
+    if (ARTC[k] && ARTC[k].width > 0 && !ARTC[k]._real) return ARTC[k];
+    const ph = makeArt(item);
+    if (!ARTC[k] || !ARTC[k]._real) ARTC[k] = ph;
+    return ph;
   }
   if (ARTC[k] && ARTC[k]._real && ARTC[k].width > 0) {
-    if (ARTC[k]._url === th) return ARTC[k];
+    if (ARTC[k]._url === th) return saveReal(ARTC[k]);
     if (th && typeof isSameCoverBase === 'function' && isSameCoverBase(ARTC[k]._url, th)) {
-      if (!_isHiResCoverUrl(ARTC[k]._url) || _isHiResCoverUrl(th)) {
+      if ((!_isHiResCoverUrl(ARTC[k]._url) || _isHiResCoverUrl(th)) && typeof liveCover === 'function') {
         liveCover(item, k, true);
       }
-      return ARTC[k];
+      return saveReal(ARTC[k]);
     }
-    if (th) liveCover(item, k, true);
-    return ARTC[k];
+    if (th && typeof liveCover === 'function') liveCover(item, k, true);
+    return saveReal(ARTC[k]);
   }
   if (raw && raw.id && ARTC[raw.id] && ARTC[raw.id]._real && ARTC[raw.id].width > 0) {
-    if (ARTC[raw.id]._url === th) return ARTC[raw.id];
-    if (th && typeof isSameCoverBase === 'function' && isSameCoverBase(ARTC[raw.id]._url, th)) {
-      if (!_isHiResCoverUrl(ARTC[raw.id]._url) || _isHiResCoverUrl(th)) {
+    const prevRawArt = ARTC[raw.id];
+    if (prevRawArt._url === th) return saveReal(prevRawArt);
+    if (canSeedKey && (!ARTC[k] || !ARTC[k]._real)) ARTC[k] = prevRawArt;
+    if (th && typeof isSameCoverBase === 'function' && isSameCoverBase(prevRawArt._url, th)) {
+      if ((!_isHiResCoverUrl(prevRawArt._url) || _isHiResCoverUrl(th)) && typeof liveCover === 'function') {
         liveCover(item, k, true);
       }
-      return ARTC[raw.id];
+      return saveReal((ARTC[k] && ARTC[k]._real && ARTC[k].width > 0) ? ARTC[k] : prevRawArt);
     }
+    if (th && typeof liveCover === 'function') liveCover(item, k, true);
+    return saveReal((ARTC[k] && ARTC[k]._real && ARTC[k].width > 0) ? ARTC[k] : prevRawArt);
   }
-  if (th) liveCover(item, k, true);
-  if (ARTC[k] && ARTC[k].width > 0) return ARTC[k];
+  if (raw && raw._lastRealArt && raw._lastRealArt._real && raw._lastRealArt.width > 0) {
+    const lastReal = raw._lastRealArt;
+    if (canSeedKey && (!ARTC[k] || !ARTC[k]._real)) ARTC[k] = lastReal;
+    if (th && typeof liveCover === 'function') liveCover(item, k, true);
+    return saveReal((ARTC[k] && ARTC[k]._real && ARTC[k].width > 0) ? ARTC[k] : lastReal);
+  }
+  if (th && typeof liveCover === 'function') liveCover(item, k, true);
+  if (ARTC[k] && ARTC[k].width > 0) return saveReal(ARTC[k]);
   return (ARTC[k] = makeArt(item));
 }
 function preloadArt(it, pri) {
@@ -317,14 +388,22 @@ function preloadArt(it, pri) {
   if (a && th && !a.thumb) a.thumb = th;
   const isRealAlbum = a && a.kind === 'album' && !a.user && a.id && String(a.id).indexOf('s_') !== 0;
   const liveOn = typeof LIVE === 'undefined' || Boolean(LIVE && LIVE.on);
-  if (liveOn && isTrack && !it.canonicalCover && !it._appleUpgradeSettled && !it._local &&
-      typeof fetchTrackThumb === 'function' && Boolean(it.title) && Boolean(it.artist)) {
-    artOf(it);
+  const needsArtistApple = isArtist && liveOn &&
+    (!th || (typeof isAppleArtistThumb === 'function' && !isAppleArtistThumb(th))) &&
+    typeof fetchArtistThumb === 'function' && Boolean((a && a.title) || it.title);
+  const isTrackRaw = isTrack && !it._local && (!a || !a.user);
+  const needsTrackApple = isTrackRaw && liveOn && !needsArtistApple &&
+    !it.canonicalCover && !it._appleUpgradeSettled &&
+    typeof fetchTrackThumb === 'function' && Boolean(it.title) && Boolean(it.artist);
+  const needsAlbumApple = isRealAlbum && !isTrackRaw && liveOn &&
+    typeof isAppleArtistThumb === 'function' && (!th || !isAppleArtistThumb(th)) &&
+    typeof fetchAlbumThumb === 'function' && Boolean(a && a.title);
+  if (needsTrackApple) {
+    _enqueueArtUp(it, Boolean(pri));
     return;
   }
-  if (liveOn && a && (isArtist || (!isTrack && isRealAlbum)) && !a._appleUpgradeSettled &&
-      (!th || (typeof isAppleArtistThumb === 'function' && !isAppleArtistThumb(th)))) {
-    artOf(a);
+  if ((needsArtistApple || needsAlbumApple) && a && !a._appleUpgradeSettled) {
+    _enqueueArtUp(a, Boolean(pri));
     return;
   }
   const aHasArt = a && a.thumb && ARTC[a.id] && ARTC[a.id]._real && ARTC[a.id].width > 0 &&
@@ -340,7 +419,8 @@ function scheduleAnimRedraw() {
   if (typeof requestAnimationFrame === 'function') {
     _animRaf = requestAnimationFrame(() => {
       _animRaf = 0;
-      if (typeof redraw === 'function') redraw();
+      if (typeof redrawSheetContent === 'function') redrawSheetContent();
+      else if (typeof redraw === 'function') redraw();
     });
   }
 }
@@ -403,7 +483,8 @@ function drawArt(c, item, x, y, s, r) {
     const dpr = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 2, 2);
     const pw = Math.round(s * dpr), pr = Math.round(rad * dpr), key = pw + ':' + pr;
     let tc = im._tiles && im._tiles[key];
-    if (!tc && _tileBuiltFrame < 24 && pw > 0) {
+    const deferTileBuild = _isScrollOrAnimBusy();
+    if (!tc && !deferTileBuild && _tileBuiltFrame < 3 && pw > 0) {
       if (!_tileBudgetRaf && typeof requestAnimationFrame === 'function') {
         _tileBudgetRaf = requestAnimationFrame(() => { _tileBudgetRaf = 0; _tileBuiltFrame = 0; });
       }
@@ -1103,7 +1184,8 @@ function txt(c, s, x, y, font, col, align, maxW, subpx) {
   return s;
 }
 const _FIT_CACHE = new Map(), _FIT_MAX = 800;
-function _clearFitCache() { _FIT_CACHE.clear(); }
+const _WRAP_CACHE = new Map(), _WRAP_MAX = 600;
+function _clearFitCache() { _FIT_CACHE.clear(); _WRAP_CACHE.clear(); }
 function fit(c, s, w) {
   if (!s) return s;
   const key = c.font + '\0' + w + '\0' + s;
@@ -1125,9 +1207,19 @@ function fit(c, s, w) {
   return res;
 }
 function wrap(c, s, w) {
+  const key = c.font + '|' + w + '|' + s;
+  const hit = _WRAP_CACHE.get(key);
+  if (hit !== undefined) {
+    _WRAP_CACHE.delete(key);
+    _WRAP_CACHE.set(key, hit);
+    return hit.slice();
+  }
   const words = s.split(' '), out = []; let line = '';
   words.forEach(wd => { const t = line ? line + ' ' + wd : wd; if (c.measureText(t).width > w && line) { out.push(line); line = wd; } else line = t; });
-  if (line) out.push(line); return out;
+  if (line) out.push(line);
+  if (_WRAP_CACHE.size >= _WRAP_MAX) _WRAP_CACHE.delete(_WRAP_CACHE.keys().next().value);
+  _WRAP_CACHE.set(key, out);
+  return out.slice();
 }
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const ease = (v, t, rate, dt) => v + (t - v) * (1 - Math.exp(-rate * dt));

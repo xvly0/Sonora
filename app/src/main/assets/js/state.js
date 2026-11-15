@@ -84,6 +84,21 @@ const D = { scene: true, ov: true, gl: true };
 let _skulletActive = false;
 const redraw = () => { D.scene = D.ov = D.gl = true; };
 const redrawSceneOnly = () => { D.scene = D.gl = true; };
+const redrawSheetContent = () => {
+  if (typeof SH !== 'undefined' && SH && SH.t >= 0.999 &&
+      !(typeof CM !== 'undefined' && CM && CM.open) &&
+      !(typeof OUT_DRAWER !== 'undefined' && OUT_DRAWER && OUT_DRAWER.open) &&
+      !(typeof NAV !== 'undefined' && NAV && NAV.menu) &&
+      !(typeof TOAST !== 'undefined' && TOAST && TOAST.t > 0.01)) {
+    redrawSceneOnly();
+  } else {
+    redraw();
+  }
+};
+if (typeof window !== 'undefined') {
+  window.redrawSceneOnly = redrawSceneOnly;
+  window.redrawSheetContent = redrawSheetContent;
+}
 
 window.haptic = function(kind) {
   const N = typeof window !== 'undefined' && window.SonoraNative;
@@ -255,11 +270,36 @@ function syncNativeVolume(vol) {
     } catch (e) {}
   }, 32);
 }
-function savePrefs() {
+let _prefsSaveTimer = 0, _prefsSaveDirty = false;
+function _writePrefsStorage() {
   try { localStorage.setItem('sonora-prefs', JSON.stringify(PREFS)); } catch (e) {}
+}
+function flushPrefsSave() {
+  if (_prefsSaveTimer) { clearTimeout(_prefsSaveTimer); _prefsSaveTimer = 0; }
+  if (!_prefsSaveDirty) return;
+  _prefsSaveDirty = false;
+  _writePrefsStorage();
+}
+function savePrefs(immediate) {
+  _prefsSaveDirty = true;
+  if (immediate) {
+    flushPrefsSave();
+  } else {
+    if (_prefsSaveTimer) clearTimeout(_prefsSaveTimer);
+    _prefsSaveTimer = setTimeout(flushPrefsSave, 200);
+  }
   syncNativeAudioConfig();
   if (typeof lg !== 'undefined' && lg) { lg.setDefaults(glassStyle()); applyStyles(); }
   redraw();
+}
+if (typeof window !== 'undefined') {
+  window.flushPrefsSave = flushPrefsSave;
+  window.addEventListener('pagehide', flushPrefsSave);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushPrefsSave();
+    });
+  }
 }
 function glassStyle() {
   const b = PREFS.glassProfile === 'light' ? 0 : (PREFS.glassBlur != null ? PREFS.glassBlur : 2);
@@ -1135,12 +1175,171 @@ function seedMockPlayer() {
 _mockPlayerSeedReady = true;
 seedMockPlayer();
 
+const SONORA_IDB_NAME = 'sonora-idb-v1';
+const SONORA_IDB_STORE = 'kv';
+let _sonoraIdbPromise = null;
+function _openSonoraIdb() {
+  if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+  if (_sonoraIdbPromise) return _sonoraIdbPromise;
+  _sonoraIdbPromise = new Promise(resolve => {
+    try {
+      const req = indexedDB.open(SONORA_IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        try {
+          const db = req.result;
+          if (db && !db.objectStoreNames.contains(SONORA_IDB_STORE)) {
+            db.createObjectStore(SONORA_IDB_STORE);
+          }
+        } catch (e) {}
+      };
+      req.onsuccess = () => {
+        const db = req.result;
+        try {
+          db.onclose = () => { _sonoraIdbPromise = null; };
+          db.onversionchange = () => { try { db.close(); } catch (e) {} _sonoraIdbPromise = null; };
+        } catch (e) {}
+        resolve(db);
+      };
+      req.onerror = () => { _sonoraIdbPromise = null; resolve(null); };
+      req.onblocked = () => { resolve(null); };
+    } catch (e) {
+      _sonoraIdbPromise = null;
+      resolve(null);
+    }
+  });
+  return _sonoraIdbPromise;
+}
+function idbGet(key) {
+  return _openSonoraIdb().then(db => {
+    if (!db) return null;
+    return new Promise(resolve => {
+      try {
+        const tx = db.transaction(SONORA_IDB_STORE, 'readonly');
+        const req = tx.objectStore(SONORA_IDB_STORE).get(String(key));
+        req.onsuccess = () => resolve(req.result !== undefined ? req.result : null);
+        req.onerror = () => resolve(null);
+        tx.onabort = () => resolve(null);
+        tx.onerror = () => resolve(null);
+      } catch (e) {
+        _sonoraIdbPromise = null;
+        resolve(null);
+      }
+    });
+  });
+}
+function idbSet(key, val) {
+  return _openSonoraIdb().then(db => {
+    if (!db) return false;
+    return new Promise(resolve => {
+      try {
+        const tx = db.transaction(SONORA_IDB_STORE, 'readwrite');
+        tx.objectStore(SONORA_IDB_STORE).put(val, String(key));
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+        tx.onabort = () => resolve(false);
+      } catch (e) {
+        _sonoraIdbPromise = null;
+        resolve(false);
+      }
+    });
+  });
+}
+function idbDel(key) {
+  return _openSonoraIdb().then(db => {
+    if (!db) return false;
+    return new Promise(resolve => {
+      try {
+        const tx = db.transaction(SONORA_IDB_STORE, 'readwrite');
+        tx.objectStore(SONORA_IDB_STORE).delete(String(key));
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+        tx.onabort = () => resolve(false);
+      } catch (e) {
+        _sonoraIdbPromise = null;
+        resolve(false);
+      }
+    });
+  });
+}
+if (typeof window !== 'undefined') {
+  window.idbGet = idbGet;
+  window.idbSet = idbSet;
+  window.idbDel = idbDel;
+}
+
 const IT_MONTHS = ['Gennaio', 'Febbraio', 'Marzo', 'Aprile', 'Maggio', 'Giugno', 'Luglio', 'Agosto', 'Settembre', 'Ottobre', 'Novembre', 'Dicembre'];
+const RECAP_KEY = 'sonora-recap';
 let REC_HIST = { months: {} };
-try {
-  const rh = JSON.parse(localStorage.getItem('sonora-recap') || 'null');
-  if (rh && rh.months && typeof rh.months === 'object') REC_HIST = rh;
-} catch (e) {}
+let _recHydrated = false;
+function _mergeRecapHist(base, delta) {
+  const out = {};
+  const bMonths = (base && base.months && typeof base.months === 'object') ? base.months : {};
+  const dMonths = (delta && delta.months && typeof delta.months === 'object') ? delta.months : {};
+  const ymSet = new Set(Object.keys(bMonths).concat(Object.keys(dMonths)));
+  for (const ym of ymSet) {
+    const bm = bMonths[ym];
+    const dm = dMonths[ym];
+    if (!dm) {
+      out[ym] = bm;
+      continue;
+    }
+    if (!bm) {
+      out[ym] = dm;
+      continue;
+    }
+    const mergedTracks = {};
+    const bt = (bm.tracks && typeof bm.tracks === 'object') ? bm.tracks : {};
+    const dt = (dm.tracks && typeof dm.tracks === 'object') ? dm.tracks : {};
+    const tidSet = new Set(Object.keys(bt).concat(Object.keys(dt)));
+    for (const tid of tidSet) {
+      const be = bt[tid];
+      const de = dt[tid];
+      if (!de) mergedTracks[tid] = be;
+      else if (!be) mergedTracks[tid] = de;
+      else {
+        mergedTracks[tid] = Object.assign({}, be, de, {
+          thumb: de.thumb || be.thumb || null,
+          artistThumb: de.artistThumb || be.artistThumb || null,
+          artistId: de.artistId || be.artistId || null,
+          plays: (be.plays || 0) + (de.plays || 0),
+          sec: (be.sec || 0) + (de.sec || 0)
+        });
+      }
+    }
+    out[ym] = {
+      sec: (bm.sec || 0) + (dm.sec || 0),
+      plays: (bm.plays || 0) + (dm.plays || 0),
+      tracks: mergedTracks
+    };
+  }
+  return out;
+}
+(function initRecapStorage() {
+  let lsRaw = null;
+  try { lsRaw = localStorage.getItem(RECAP_KEY); } catch (e) {}
+  if (lsRaw) {
+    try {
+      const rh = JSON.parse(lsRaw);
+      if (rh && rh.months && typeof rh.months === 'object') REC_HIST = rh;
+    } catch (e) {}
+    _recHydrated = true;
+    idbSet(RECAP_KEY, REC_HIST).then(ok => {
+      if (ok) { try { localStorage.removeItem(RECAP_KEY); } catch (e) {} }
+    });
+  } else {
+    idbGet(RECAP_KEY).then(stored => {
+      _recHydrated = true;
+      const hadDelta = Boolean(REC_HIST && REC_HIST.months && Object.keys(REC_HIST.months).length > 0);
+      if (stored && stored.months && typeof stored.months === 'object') {
+        REC_HIST.months = _mergeRecapHist(stored, REC_HIST);
+        if (hadDelta || _recDirty) saveRecap(true);
+        if (typeof redraw === 'function') redraw();
+      } else if (hadDelta || _recDirty) {
+        saveRecap(true);
+      }
+    });
+  }
+})();
 let _recSaveT = 0, _recCurId = null, _recCurTrack = null, _recCurSec = 0, _recCounted = false;
 let _recPlayGen = 0, _recAffSkippedGen = -1, _recAffCompletedGen = -1;
 
@@ -1273,6 +1472,7 @@ function recFlushCurrent() {
   _recCurSec = 0;
   _recCounted = false;
   _recPlayGen++;
+  if (_recDirty) saveRecap();
 }
 if (typeof window !== 'undefined') {
   window.AFFINITY = AFFINITY;
@@ -1301,8 +1501,15 @@ let _recSaveTimer = 0, _recDirty = false;
 function flushRecap() {
   if (_recSaveTimer) { clearTimeout(_recSaveTimer); _recSaveTimer = 0; }
   if (!_recDirty) return;
+  if (!_recHydrated) return;
   _recDirty = false;
-  try { localStorage.setItem('sonora-recap', JSON.stringify(REC_HIST)); } catch (e) {}
+  idbSet(RECAP_KEY, REC_HIST).then(ok => {
+    if (ok) {
+      try { localStorage.removeItem(RECAP_KEY); } catch (e) {}
+    } else {
+      try { localStorage.setItem(RECAP_KEY, JSON.stringify(REC_HIST)); } catch (e) {}
+    }
+  });
 }
 function saveRecap(immediate) {
   _recDirty = true;
@@ -1354,6 +1561,7 @@ function recRecordPlay(t, addSec, ymKey) {
   } else if (typeof addSec === 'number' && addSec > 0) {
     entry.sec = (entry.sec || 0) + addSec;
     m.sec = (m.sec || 0) + addSec;
+    _recDirty = true;
   }
 }
 function recTick(t, dt) {
@@ -1817,16 +2025,18 @@ const TINT_ACC = 'rgba(250,46,73,.82)', TINT_NEU = 'rgba(255,255,255,.22)';
 
 function initGlass() {
   lg = new LiquidGlass($out, { maxDpr: 3, autoUpload: false, defaults: glassStyle(), onResize: relayout, onContextRestored: () => { if (typeof window !== 'undefined' && typeof window.onSonoraResume === 'function') window.onSonoraResume(); else if (typeof redraw === 'function') redraw(); } });
+  const setCtrlNames = [];
+  for (let i = 0; i < 24; i++) setCtrlNames.push('setCtrl' + i);
   const names = ['tab', 'thumb', 'search', 'mini', 'more', 'av', 'back', 'apill', 'pSearch', 'backPrev', 'apillPrev', 'pSearchPrev', 'hShufPrev', 'hDownPrev', 'hShuf', 'hDown', 'menu', 'cm', 'outDrawer', 'prompt', 'sStar', 'sMore', 'sP1', 'sP2', 'sP3', 'sP4',
     'recapPlay', 'recapMonth', 'filt0', 'filt1', 'filt2', 'filt3', 'filt4', 'filtAct', 'sLyAnim', 'sLyClassic',
-    'setPrevBar', 'setPrevThumb', 'setCtrl0', 'setCtrl1', 'setCtrl2', 'setCtrl3', 'setCtrl4', 'setCtrl5', 'setCtrl6', 'setCtrl7', 'setCtrl8', 'setCtrl9'];
+    'setPrevBar', 'setPrevThumb', ...setCtrlNames];
   names.forEach(n => { G[n] = lg.add({ visible: false, x: 0, y: 0, width: 10, height: 10 }); });
   G.hShuf.set({ layer: 0 }); G.hDown.set({ layer: 0 }); G.hShufPrev.set({ layer: 0 }); G.hDownPrev.set({ layer: 0 });
   ['recapPlay', 'recapMonth', 'filt0', 'filt1', 'filt2', 'filt3', 'filt4', 'filtAct'].forEach(n => G[n].set({ layer: 0 }));
   G.sLyAnim.set({ layer: 1 }); G.sLyClassic.set({ layer: 1 });
   G.tab.set({ layer: 1 }); G.mini.set({ layer: 1 }); G.thumb.set({ layer: 2, useOverlay: true });
   G.setPrevBar.set({ layer: 1 }); G.setPrevThumb.set({ layer: 2, useOverlay: true });
-  for (let i = 0; i < 10; i++) G['setCtrl' + i].set({ layer: 2, useOverlay: false });
+  for (let i = 0; i < 24; i++) G['setCtrl' + i].set({ layer: 2, useOverlay: false });
   G.menu.set({ layer: 4, cornerRadius: 24 }); G.cm.set({ layer: 4, cornerRadius: 28 }); G.outDrawer.set({ layer: 4, cornerRadius: 28 }); G.prompt.set({ layer: 4, cornerRadius: 28 });
   BTNG.forEach(n => G[n].set({ interactive: true }));
   applyStyles();

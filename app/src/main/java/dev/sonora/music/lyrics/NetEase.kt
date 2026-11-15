@@ -14,15 +14,16 @@ import org.json.JSONObject
 object NetEase {
 
     private val http = OkHttpClient.Builder()
-        .connectTimeout(4, TimeUnit.SECONDS)
-        .readTimeout(4, TimeUnit.SECONDS)
-        .callTimeout(5, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .callTimeout(10, TimeUnit.SECONDS)
         .build()
 
     private const val SEARCH_URL = "https://music.163.com/api/search/pc"
     private const val LYRIC_URL = "https://music.163.com/api/song/lyric"
     private const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     private const val COOKIE = "os=pc; NMTID=00OAVK3xqDG726ITU6jopU6jF2yMk0AAAGCO8l1BA;"
+    private const val FALLBACK_DURATION_MS = 210_000L
 
     suspend fun lyrics(
         title: String,
@@ -32,11 +33,16 @@ object NetEase {
         val titles = title.titleVariants()
         if (titles.isEmpty()) return@withContext null
         val primary = artist.primaryArtist()
-        val searchArtists = listOf(artist.trim(), primary).filter { it.isNotBlank() }.distinct()
+        val searchArtists = listOf(artist.trim(), primary, primary.foldDiacritics())
+            .filter { it.isNotBlank() }
+            .distinct()
 
         for (candidateTitle in titles) {
             for (candidateArtist in searchArtists) {
                 query(candidateTitle, candidateArtist, artist, durationMs)?.let { return@withContext it }
+            }
+            if (artist.allArtists().size > 1) {
+                query(candidateTitle, "", artist, durationMs)?.let { return@withContext it }
             }
         }
 
@@ -52,7 +58,7 @@ object NetEase {
         val q = if (searchArtist.isBlank()) title else "$title $searchArtist"
         val searchEncoded = runCatching { URLEncoder.encode(q, "UTF-8") }.getOrNull() ?: return null
         val searchReq = Request.Builder()
-            .url("$SEARCH_URL?s=$searchEncoded&type=1&offset=0&limit=5")
+            .url("$SEARCH_URL?s=$searchEncoded&type=1&offset=0&limit=10")
             .header("User-Agent", USER_AGENT)
             .header("Referer", "https://music.163.com")
             .header("Cookie", COOKIE)
@@ -90,7 +96,7 @@ object NetEase {
 
             val songDur = song.optLong("duration", 0L)
             val diff = if (durationMs > 0 && songDur > 0) kotlin.math.abs(songDur - durationMs) else 0L
-            if (durationMs > 0 && songDur > 0 && diff > 8000L) continue
+            if (durationMs > 0 && durationMs != FALLBACK_DURATION_MS && songDur > 0 && diff > 8000L) continue
 
             val exactPenalty = if (songName.isBlank() || isExactTitleMatch(songName, title)) 0L else 100_000L
             val score = exactPenalty + diff
@@ -116,27 +122,62 @@ object NetEase {
         val lyricRoot = runCatching { JSONObject(lyricBody) }.getOrNull() ?: return null
         val rawLrc = lyricRoot.optJSONObject("lrc")?.optString("lyric")?.takeIf { it.isNotBlank() }
             ?: return null
+        val rawTranslation = lyricRoot.optJSONObject("tlyric")?.optString("lyric")?.takeIf { it.isNotBlank() }
 
-        return parseLrc(rawLrc)
+        return parseLrc(rawLrc, rawTranslation)
     }
 
-    private fun parseLrc(raw: String): Lyrics? {
-        val lines = raw.lines().mapNotNull { line ->
-            val match = LRC_LINE.find(line) ?: return@mapNotNull null
+    private fun parseTimedLines(raw: String): MutableList<Pair<Long, String>> {
+        val result = mutableListOf<Pair<Long, String>>()
+        for (line in raw.lines()) {
+            val match = LRC_LINE.find(line) ?: continue
             val (minutes, seconds, fraction, text) = match.destructured
             val startMs = minutes.toLong() * 60_000 +
                 seconds.toLong() * 1_000 +
                 fraction.padEnd(3, '0').take(3).toLong()
 
             val cleanText = text.trim()
+            if (cleanText.isBlank()) continue
             // Filter out metadata lines like [00:00.00] 作曲 : ...
             if (cleanText.startsWith("作词") || cleanText.startsWith("作曲") || cleanText.startsWith("编曲")) {
-                return@mapNotNull null
+                continue
             }
-            LyricLine(startTimeMs = startMs, text = cleanText)
-        }.filter { it.text.isNotBlank() }
+            result += startMs to cleanText
+        }
+        return result
+    }
 
-        return lines.takeIf { it.isNotEmpty() }?.let { Lyrics(it, synced = true) }
+    private fun parseLrc(raw: String, rawTranslation: String? = null): Lyrics? {
+        val baseLines = parseTimedLines(raw)
+        if (baseLines.isEmpty()) return null
+
+        val lines = baseLines.map { (startMs, text) ->
+            LyricLine(startTimeMs = startMs, text = text)
+        }.toMutableList()
+
+        if (!rawTranslation.isNullOrBlank()) {
+            val transLines = parseTimedLines(rawTranslation)
+                .filter { (_, text) -> text != "//" }
+            val bestDiffPerLine = LongArray(lines.size) { Long.MAX_VALUE }
+            for ((transMs, transText) in transLines) {
+                var bestIdx = -1
+                var bestDiff = Long.MAX_VALUE
+                for (i in lines.indices) {
+                    val lineMs = lines[i].startTimeMs ?: continue
+                    val diff = kotlin.math.abs(lineMs - transMs)
+                    if (diff <= 600L && diff < bestDiff) {
+                        bestDiff = diff
+                        bestIdx = i
+                    }
+                }
+                if (bestIdx >= 0 && bestDiff < bestDiffPerLine[bestIdx]) {
+                    bestDiffPerLine[bestIdx] = bestDiff
+                    lines[bestIdx] = lines[bestIdx].copy(translation = transText)
+                }
+            }
+        }
+
+        return Lyrics(lines, synced = true)
     }
 
     private val LRC_LINE = Regex("\\[(\\d{1,2}):(\\d{2})[.:](\\d{2,3})\\](.*)")

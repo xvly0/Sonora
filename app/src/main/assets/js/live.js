@@ -93,9 +93,29 @@ function _preserveAppleHiRes(existingThumb, nextThumb) {
   }
   return nextThumb;
 }
+function _hasRealArt(k) {
+  return Boolean(k && typeof ARTC !== 'undefined' && ARTC[k] && ARTC[k]._real && !ARTC[k]._placeholder && ARTC[k].width > 0);
+}
 function ingestTrack(t) {
   if (!t || !t.id) return null;
   if (t.artist) t.artist = cleanArtistLive(t.artist);
+  if (!t.canonicalCover && t.title && t.artist && typeof _cleanTrackThumbKey === 'function') {
+    const ck = _cleanTrackThumbKey(t.title, t.artist);
+    const cached = ck && _trkThumbCache[ck];
+    if (cached && cached.thumb && (typeof isAppleArtistThumb !== 'function' || isAppleArtistThumb(cached.thumb))) {
+      t = Object.assign({}, t, {
+        thumb: _preserveAppleHiRes(t.thumb, _forceAppleListThumb(cached.thumb)),
+        canonicalCover: cached.canonicalCover !== false,
+        _appleUpgradeSettled: true
+      });
+      if (cached.album) {
+        t.albumTitle = cached.album;
+        if (t.album !== t.albumId && (!t.album || String(t.album).indexOf('s_') !== 0)) {
+          t.album = cached.album;
+        }
+      }
+    }
+  }
   const old = LIVE.known[t.id], oldEx = old && old.ex, prevArtId = old && old.artistId, o = old || (LIVE.known[t.id] = {});
   const inAlbName = (t.albumTitle !== undefined && (t.album === t.albumId || (typeof t.album === 'string' && t.album.indexOf('s_') === 0))) ? t.albumTitle : t.album;
   const inComp = _isCompilationAlbumName(inAlbName, t.title);
@@ -170,13 +190,13 @@ function ingestTrack(t) {
       }
       if (albThumbChanged) {
         if (!sameBaseAlb) {
-          delete ARTC[al.id];
+          if (!_hasRealArt(al.id)) delete ARTC[al.id];
           if (typeof PALC !== 'undefined') delete PALC[al.id];
           if (typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[al.id];
           if (typeof TINTC !== 'undefined') { delete TINTC[al.id + 'd']; delete TINTC[al.id + 'l']; }
         }
         if (!sameBaseTrack && !sameBaseAlb) {
-          delete ARTC[t.id];
+          if (!_hasRealArt(t.id)) delete ARTC[t.id];
           if (typeof PALC !== 'undefined') delete PALC[t.id];
           if (typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[t.id];
           if (typeof TINTC !== 'undefined') { delete TINTC[t.id + 'd']; delete TINTC[t.id + 'l']; }
@@ -185,7 +205,7 @@ function ingestTrack(t) {
             (old.album === 's_' + t.id || _isCompilationAlbumName(BYID[old.album].title, t.title))) {
           const oldAlbSameBase = Boolean(BYID[old.album].thumb && typeof isSameCoverBase === 'function' && isSameCoverBase(BYID[old.album].thumb, effThumb));
           if (!oldAlbSameBase) {
-            delete ARTC[old.album];
+            if (!_hasRealArt(old.album)) delete ARTC[old.album];
             if (typeof PALC !== 'undefined') delete PALC[old.album];
             if (typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[old.album];
             if (typeof TINTC !== 'undefined') { delete TINTC[old.album + 'd']; delete TINTC[old.album + 'l']; }
@@ -204,7 +224,7 @@ function ingestTrack(t) {
                  (sameBaseAlb ? (!/[?&]s=1200\b/.test(al.thumb) && (/[?&]s=1200\b/.test(effThumb) || (/[?&]s=288\b/.test(al.thumb) && /[?&]s=544\b/.test(effThumb))))
                               : (/[?&]s=1200\b/.test(effThumb) && al.thumb !== effThumb))))) {
       al.thumb = effThumb;
-      if (!sameBaseAlb) delete ARTC[al.id];
+      if (!sameBaseAlb && !_hasRealArt(al.id)) delete ARTC[al.id];
     }
   }
 
@@ -222,7 +242,20 @@ function ingestTrack(t) {
     ex: Boolean(oldEx || t.ex),
     canonicalCover: nextCanonical
   });
-  if (nextCanonical) o._appleUpgradeSettled = true;
+  if (nextCanonical) {
+    o._appleUpgradeSettled = true;
+    if (o.title && o.artist && o.thumb && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(o.thumb) &&
+        typeof _cleanTrackThumbKey === 'function') {
+      const ck = _cleanTrackThumbKey(o.title, o.artist);
+      if (ck && !_trkThumbCache[ck]) {
+        _trkThumbCache[ck] = {
+          thumb: _forceAppleListThumb(o.thumb),
+          album: (o.albumTitle || '').trim(),
+          canonicalCover: true
+        };
+      }
+    }
+  }
   delete o._lyricMatch;
   delete o.kind; o.dur = o.dur || 210; if (!old) TRACKS.push(o);
   _indexTrackArtist(o, prevArtId);
@@ -259,7 +292,7 @@ function _applyArtistThumb(t, rawName, thumb) {
   if (ar) {
     const sameBase = Boolean(arPrev && typeof isSameCoverBase === 'function' && isSameCoverBase(arPrev, effArThumb));
     ar.thumb = effArThumb;
-    if (!sameBase) delete ARTC[t.artistId];
+    if (!sameBase && !_hasRealArt(t.artistId)) delete ARTC[t.artistId];
   }
   if (typeof preloadArt === 'function') {
     preloadArt({ id: t.artistId || rawName, thumb: ar ? ar.thumb : t.artistThumb, kind: 'artist' }, false);
@@ -293,7 +326,7 @@ function fetchArtistThumb(name, id) {
         if (existingObj) {
           const sameBase = Boolean(prevThumb && typeof isSameCoverBase === 'function' && isSameCoverBase(prevThumb, effThumb));
           existingObj.thumb = effThumb;
-          if (!sameBase) delete ARTC[id];
+          if (!sameBase && !_hasRealArt(id)) delete ARTC[id];
         }
         return resolvedThumb;
       }
@@ -331,7 +364,7 @@ function isAppleAlbumThumbCold(title, artist) {
 if (typeof window !== 'undefined') window.isAppleAlbumThumbCold = isAppleAlbumThumbCold;
 function _invalidateCoverCaches(k, sameBase, keepRealArt) {
   if (!k || sameBase) return;
-  if (typeof ARTC !== 'undefined' && !(keepRealArt && ARTC[k] && ARTC[k]._real)) delete ARTC[k];
+  if (typeof ARTC !== 'undefined' && !(keepRealArt && _hasRealArt(k))) delete ARTC[k];
   if (typeof PALC !== 'undefined') delete PALC[k];
   if (typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[k];
   if (typeof TINTC !== 'undefined') { delete TINTC[k + 'd']; delete TINTC[k + 'l']; }
@@ -350,7 +383,7 @@ function _applyAlbumThumb(id, thumb, title, artist) {
       : (!sameApple || /[?&]s=1200\b/.test(effAlbThumb) || /[?&]s=288\b/.test(alb.thumb));
     if (alb.thumb !== effAlbThumb && canUpdateAlb) {
       alb.thumb = effAlbThumb;
-      _invalidateCoverCaches(id, sameBase, sameApple);
+      _invalidateCoverCaches(id, sameBase, true);
     }
   }
   if (typeof TRACKS !== 'undefined' && Array.isArray(TRACKS)) {
@@ -368,7 +401,7 @@ function _applyAlbumThumb(id, thumb, title, artist) {
           : (!t.canonicalCover && (!tSameApple || /[?&]s=1200\b/.test(effTrkThumb) || /[?&]s=288\b/.test(t.thumb)));
         if (t.thumb !== effTrkThumb && canUpdateTrk) {
           t.thumb = effTrkThumb;
-          _invalidateCoverCaches(t.id, tSameBase, tSameApple);
+          _invalidateCoverCaches(t.id, tSameBase, true);
           if (typeof preloadArt === 'function') preloadArt(t, false);
         }
       }
@@ -511,7 +544,7 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
       obj.thumb = eff;
       anyChanged = true;
       if (!sameBase && obj._sheetHiResUpgraded) delete obj._sheetHiResUpgraded;
-      _invalidateCoverCaches(obj.id, sameBase);
+      _invalidateCoverCaches(obj.id, sameBase, true);
     }
     if (canon && !obj.canonicalCover) { obj.canonicalCover = true; anyChanged = true; }
     obj._appleUpgradeSettled = true;
@@ -534,7 +567,7 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
         if (al.thumb !== alEff) {
           al.thumb = alEff;
           anyChanged = true;
-          _invalidateCoverCaches(al.id, alSame);
+          _invalidateCoverCaches(al.id, alSame, true);
         }
         if (isStub && resAlb) al.title = resAlb;
         al._appleUpgradeSettled = true;
@@ -550,7 +583,7 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
           stAlb.thumb = stEff;
           if (resAlb) stAlb.title = resAlb;
           stAlb._appleUpgradeSettled = true;
-          _invalidateCoverCaches(stubId, stSame);
+          _invalidateCoverCaches(stubId, stSame, true);
         }
       }
     } else if (!obj.album && obj.id && typeof stubAlbum === 'function') {
@@ -581,8 +614,12 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
   if (typeof preloadArt === 'function') preloadArt(track, false);
   if (anyChanged) {
     if (typeof liveSave === 'function') liveSave();
-    if (typeof savePlayerState === 'function') savePlayerState();
-    if (typeof redraw === 'function') redraw();
+    if (typeof savePlayerState === 'function' && typeof PL !== 'undefined' && Array.isArray(PL.queue) &&
+        PL.queue.some(x => x && x.id === track.id)) {
+      savePlayerState();
+    }
+    if (typeof redrawSheetContent === 'function') redrawSheetContent();
+    else if (typeof redraw === 'function') redraw();
   }
 }
 function fetchTrackThumb(track) {
@@ -742,7 +779,7 @@ function ingestItem(x) {
     const bothApple = prevThumb && e.thumb && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(prevThumb) && isAppleArtistThumb(e.thumb);
     const sameBase = Boolean(prevThumb && e.thumb && typeof isSameCoverBase === 'function' && isSameCoverBase(prevThumb, e.thumb));
     if (prevThumb !== e.thumb && x.id) {
-      _invalidateCoverCaches(x.id, sameBase, bothApple);
+      _invalidateCoverCaches(x.id, sameBase, true);
     }
     if (x.kind === 'album' && e.thumb && prevThumb !== e.thumb && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(e.thumb) && typeof _searchCacheAlbumUpgradeHook === 'function') {
       _searchCacheAlbumUpgradeHook(e.id, e.title, e.artist, _forceAppleListThumb(e.thumb));
@@ -871,7 +908,7 @@ function _isUiAnimatingOrBusy() {
   }
   if (typeof NAV !== 'undefined' && NAV && (NAV.popP > 0.01 || NAV.pushP > 0.01 || NAV.popT > 0.01)) return true;
   if (typeof _tabTrans !== 'undefined' && _tabTrans && _tabTrans.active) return true;
-  if (typeof SH !== 'undefined' && SH && (SH.drag || (SH.t > 0.01 && SH.t < 0.99))) return true;
+  if (typeof SH !== 'undefined' && SH && (SH.drag || (SH.t > 0.01 && SH.t < 0.99) || Math.abs(SH.qVel || 0) > 25 || Math.abs(SH.lVel || 0) > 25)) return true;
   return false;
 }
 function _isHeroOrActiveCoverUrl(u) {
@@ -928,14 +965,17 @@ function _disposeCover(cv, forceClearRefs) {
 }
 function _markCoverDirty(priority) {
   const shVis = typeof SH !== 'undefined' && SH && SH.t > 0.01;
+  const shFull = typeof SH !== 'undefined' && SH && SH.t >= 0.999;
   const cmVis = typeof CM !== 'undefined' && CM && CM.open;
+  const outVis = typeof OUT_DRAWER !== 'undefined' && OUT_DRAWER && OUT_DRAWER.open;
   const matchedCur = _covMatchedCur;
   _covMatchedCur = false;
-  if (priority === true && (shVis || cmVis || matchedCur)) {
+  if (priority === true && (cmVis || outVis || (!shFull && (shVis || matchedCur)))) {
     if (typeof redraw === 'function') redraw();
     else if (typeof D !== 'undefined') { D.scene = D.ov = D.gl = true; }
   } else {
-    if (typeof redrawSceneOnly === 'function') redrawSceneOnly();
+    if (typeof redrawSheetContent === 'function') redrawSheetContent();
+    else if (typeof redrawSceneOnly === 'function') redrawSceneOnly();
     else if (typeof D !== 'undefined') { D.scene = D.gl = true; }
   }
 }
@@ -948,8 +988,10 @@ function _coalesceCoverScene(needOv) {
     _markCoverDirty(true);
     return;
   }
-  const queueDrained = !_covRastQ.length && _covAct === 0 && !_covQ.length;
-  if (queueDrained || (now - _lastCovScenePaintAt >= COV_SCENE_COALESCE_MS)) {
+  const busy = _isUiAnimatingOrBusy();
+  const coalesceMs = busy ? 48 : COV_SCENE_COALESCE_MS;
+  const queueDrained = !busy && !_covRastQ.length && _covAct === 0 && !_covQ.length;
+  if (queueDrained || (now - _lastCovScenePaintAt >= coalesceMs)) {
     if (_covFlushTimer) { clearTimeout(_covFlushTimer); _covFlushTimer = 0; }
     _covScenePending = false;
     _lastCovScenePaintAt = now;
@@ -958,7 +1000,7 @@ function _coalesceCoverScene(needOv) {
   }
   _covScenePending = true;
   if (!_covFlushTimer) {
-    const waitMs = Math.max(16, Math.round(COV_SCENE_COALESCE_MS - (now - _lastCovScenePaintAt)));
+    const waitMs = Math.max(16, Math.round(coalesceMs - (now - _lastCovScenePaintAt)));
     _covFlushTimer = setTimeout(() => {
       _covFlushTimer = 0;
       if (_covScenePending) {
@@ -1045,19 +1087,47 @@ function _covStore(u, cv) {
     }
   }
 }
+function _hasWaiterRealArt(k) {
+  if (_hasRealArt(k)) return true;
+  if (typeof k === 'string' && k.indexOf('s_') === 0 && _hasRealArt(k.slice(2))) return true;
+  const obj = (typeof LIVE !== 'undefined' && LIVE && LIVE.known && LIVE.known[k]) || (typeof BYID !== 'undefined' && BYID[k]);
+  if (obj) {
+    if (obj.id && _hasRealArt(obj.id)) return true;
+    if (obj.album && _hasRealArt(obj.album)) return true;
+  }
+  return false;
+}
+function _isWaitingAppleTrack(obj) {
+  if (!obj || (typeof LIVE !== 'undefined' && !LIVE.on)) return false;
+  const isTrack = !obj.kind || obj.kind === 'track';
+  return Boolean(
+    isTrack && !obj._local && !obj.user &&
+    !obj.canonicalCover && !obj._appleUpgradeSettled &&
+    typeof fetchTrackThumb === 'function' &&
+    obj.title && obj.artist
+  );
+}
 function _covApply(k, cv) {
+  const cvIsApple = Boolean(cv && cv._url && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(cv._url));
   const curObj = (typeof LIVE !== 'undefined' && LIVE && LIVE.known && LIVE.known[k]) || (typeof BYID !== 'undefined' && BYID[k]);
+  const stubOwner = (!curObj || curObj.kind === 'album') && typeof k === 'string' && k.indexOf('s_') === 0
+    ? ((typeof LIVE !== 'undefined' && LIVE && LIVE.known && LIVE.known[k.slice(2)]) || (typeof BYID !== 'undefined' && BYID[k.slice(2)]))
+    : null;
+  if (!cvIsApple && (_isWaitingAppleTrack(curObj) || _isWaitingAppleTrack(stubOwner))) {
+    return false;
+  }
   if (curObj && curObj.thumb && cv && cv._url && typeof isSameCoverBase === 'function' && !isSameCoverBase(curObj.thumb, cv._url)) {
     return false;
   }
   const prev = ARTC[k];
-  const prevReal = Boolean(prev && prev._real && !prev._placeholder);
+  const prevReal = Boolean(prev && prev._real && !prev._placeholder && prev.width > 0);
+  const altPrevReal = !prevReal && _hasWaiterRealArt(k);
   const sameBase = Boolean(prevReal && prev._url && cv && cv._url && typeof isSameCoverBase === 'function' && isSameCoverBase(prev._url, cv._url));
   const isHiUrl = u => Boolean(u && /[?&]s=(?:1080|1200|1400)\b/.test(u));
   if (sameBase && isHiUrl(prev._url) && !isHiUrl(cv._url)) {
     return false;
   }
-  if (prevReal) {
+  if (prevReal || altPrevReal) {
     try { cv._fadePending = false; cv._t0 = 0; } catch (e) {}
   }
   ARTC[k] = cv;
@@ -1099,30 +1169,34 @@ function _covApply(k, cv) {
     const trkId = tr.id;
     const matches = (trkId === k) || (albId && albId === k) || (tr.thumb && tr.thumb === cv._url) || (alb && alb.thumb && alb.thumb === cv._url);
     if (matches) {
+      const trWaitingApple = !cvIsApple && _isWaitingAppleTrack(tr);
+      const trSameUrlBase = Boolean(!tr.thumb || typeof isSameCoverBase !== 'function' || isSameCoverBase(tr.thumb, cv._url));
+      const albSameUrlBase = Boolean(!alb || !alb.thumb || typeof isSameCoverBase !== 'function' || isSameCoverBase(alb.thumb, cv._url));
       const trPrev = trkId ? ARTC[trkId] : null;
       const albPrev = albId ? ARTC[albId] : null;
+      const trPrevReal = Boolean(trPrev && trPrev._real && !trPrev._placeholder && trPrev.width > 0);
+      const albPrevReal = Boolean(albPrev && albPrev._real && !albPrev._placeholder && albPrev.width > 0);
       const trSameBase = Boolean(trPrev && trPrev._real && trPrev._url && cv && cv._url && typeof isSameCoverBase === 'function' && isSameCoverBase(trPrev._url, cv._url));
       const albSameBase = Boolean(albPrev && albPrev._real && albPrev._url && cv && cv._url && typeof isSameCoverBase === 'function' && isSameCoverBase(albPrev._url, cv._url));
-      if (trSameBase || albSameBase || sameBase) {
+      if (prevReal || altPrevReal || trPrevReal || albPrevReal || trSameBase || albSameBase || sameBase) {
         try { cv._fadePending = false; cv._t0 = 0; } catch (e) {}
       }
       const keepTrkPal = trSameBase || (!trPrev && (albSameBase || sameBase));
       const keepAlbPal = albSameBase || (!albPrev && sameBase);
-      if (trkId) {
+      if (trkId && !trWaitingApple && trSameUrlBase) {
         if (!(trSameBase && isHiUrl(trPrev._url) && !isHiUrl(cv._url))) ARTC[trkId] = cv;
         if (!keepTrkPal) { delete SHAD_PALC[trkId]; delete PALC[trkId]; }
       }
-      if (albId) {
+      if (albId && !(trWaitingApple && albId === 's_' + trkId) && albSameUrlBase) {
         if (!(albSameBase && isHiUrl(albPrev._url) && !isHiUrl(cv._url))) ARTC[albId] = cv;
         if (!keepAlbPal) { delete SHAD_PALC[albId]; delete PALC[albId]; }
       }
-      if (idx === 0) {
-        _covMatchedCur = true; needOv = true;
+      if (idx === 0 && !trWaitingApple) {
+        _covMatchedCur = true;
+        if (typeof SH === 'undefined' || !SH || SH.t < 0.999) needOv = true;
         if (!keepTrkPal && !keepAlbPal && sheetVis && typeof shaderPalette === 'function') {
           setTimeout(() => { if (typeof shaderPalette === 'function') shaderPalette(tr); }, 24);
         }
-      } else if (sheetVis) {
-        needOv = true;
       }
     }
   });
@@ -1132,8 +1206,11 @@ function _covStepRast() {
   _covRastRaf = 0;
   if (!_covRastQ.length) return;
   const t0 = performance.now();
-  let n = 0, applied = false, needOv = false;
-  while (_covRastQ.length && (n === 0 || (n < 6 && (performance.now() - t0) < 3.0))) {
+  const busy = _isUiAnimatingOrBusy();
+  const maxN = busy ? 2 : 6;
+  const budgetMs = busy ? 1.0 : 3.0;
+  let n = 0, croppedN = 0, applied = false, needOv = false;
+  while (_covRastQ.length && (n === 0 || (n < maxN && (!busy || croppedN < 1) && (performance.now() - t0) < budgetMs))) {
     const item = _covRastQ.shift();
     const u = item.u, sz = item.sz;
     let cv = null;
@@ -1157,18 +1234,23 @@ function _covStepRast() {
           const im = item.im, sw = item.sw || Math.min(im.naturalWidth, im.naturalHeight);
           x.drawImage(im, (im.naturalWidth - sw) / 2, (im.naturalHeight - sw) / 2, sw, sw, 0, 0, sz, sz);
         }
+        croppedN++;
       } else if (item.bmp && typeof item.bmp.close === 'function') {
         try { item.bmp.close(); } catch (e) {}
       }
     }
     if (cv) {
+      const ks = _covWait[u] || []; delete _covWait[u];
+      let hasPrevReal = false;
+      for (let i = 0; i < ks.length; i++) {
+        if (_hasWaiterRealArt(ks[i])) { hasPrevReal = true; break; }
+      }
       try {
         cv._loadedAt = performance.now();
-        cv._fadePending = true;
+        cv._fadePending = !hasPrevReal;
         cv._t0 = 0;
       } catch (e) {}
       _covStore(u, cv);
-      const ks = _covWait[u] || []; delete _covWait[u];
       for (let i = 0; i < ks.length; i++) {
         if (_covApply(ks[i], cv)) needOv = true;
       }
@@ -1190,7 +1272,7 @@ function _covEnqueueRast(entry) {
 }
 function _covPump() {
   if (_covRastQ.length >= 48) return;
-  const maxConc = 6;
+  const maxConc = _isUiAnimatingOrBusy() ? 3 : 6;
   while (_covAct < maxConc && _covQ.length) {
     const u = _covQ.shift();
     _covQSet.delete(u);
@@ -1224,7 +1306,7 @@ function _covPump() {
           _covPump();
           return;
         }
-        const maxCovSz = _isHeroOrActiveCoverUrl(u) ? 1080 : 384;
+        const maxCovSz = _isHeroOrActiveCoverUrl(u) ? 1080 : 544;
         const sz = Math.min(maxCovSz, Math.max(192, sw));
         const needsCrop = Math.abs(w - h) > 2 || w > maxCovSz + 64;
         _covEnqueueRast({ u, bmp: rawBmp, sw, sz: needsCrop ? sz : w, needsCrop });
@@ -1241,10 +1323,29 @@ function _covPump() {
 function liveCover(item, k, pri) {
   if (!item || !item.thumb) return;
   const u = item.thumb;
+  const uIsApple = Boolean(u && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(u));
+  if (!uIsApple) {
+    const stubOwner = (item.kind === 'album' && typeof k === 'string' && k.indexOf('s_') === 0)
+      ? ((typeof LIVE !== 'undefined' && LIVE && LIVE.known && LIVE.known[k.slice(2)]) || (typeof BYID !== 'undefined' && BYID[k.slice(2)]))
+      : null;
+    const knownObj = (typeof LIVE !== 'undefined' && LIVE && LIVE.known && LIVE.known[k]) || (typeof BYID !== 'undefined' && BYID[k]);
+    const waitingTr = _isWaitingAppleTrack(item)
+      ? item
+      : (_isWaitingAppleTrack(stubOwner) ? stubOwner : (_isWaitingAppleTrack(knownObj) ? knownObj : null));
+    if (waitingTr) {
+      if (typeof window !== 'undefined' && typeof window._enqueueArtUp === 'function') {
+        window._enqueueArtUp(waitingTr, Boolean(pri));
+      }
+      return;
+    }
+  }
   const cached = _covUrl[u];
   if (cached && cached.width > 0) {
     _covLru.delete(u);
     _covLru.set(u, cached);
+    if (_hasWaiterRealArt(k) || (item.id && _hasRealArt(item.id)) || (item.album && _hasRealArt(item.album))) {
+      try { cached._fadePending = false; cached._t0 = 0; } catch (e) {}
+    }
     if (ARTC[k] !== cached) {
       const needOv = _covApply(k, cached);
       if (!(typeof window !== 'undefined' && window.__IN_DRAW_SCENE)) _scheduleCoverDirty(needOv);
@@ -1288,6 +1389,7 @@ function liveOnTrack(t, restoreOnly) {
   const shouldPrefetchExtras = !restoreOnly || (typeof PL !== 'undefined' && PL.playing);
   if (shouldPrefetchExtras) {
     if (_startupSecondaryReady && t.artist && !t.artistThumb && typeof prefetchArtistThumb === 'function') prefetchArtistThumb(t);
+    if (!t.canonicalCover && !t._appleUpgradeSettled && typeof preloadArt === 'function') preloadArt(t, true);
     liveLy(t); /* il testo parte a caricarsi appena scegli il brano, non quando apri la pagina testi */
     if (typeof prewarmLyrics === 'function' && cur() && cur().id === t.id) prewarmLyrics(t);
     for (let i = 1; i <= 2; i++) {
@@ -1321,10 +1423,12 @@ function liveOnTrack(t, restoreOnly) {
     }
     if (added.length) {
       PL.queue.push(...added);
-      added.slice(0, 4).forEach(x => {
-        if (window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') window.SonoraNative.prefetch(x.id);
-        else fetch('/api/prefetch/' + x.id).catch(() => {});
-        if (typeof preloadArt === 'function') preloadArt(x, false);
+      added.slice(0, 8).forEach((x, idx) => {
+        if (idx < 4) {
+          if (window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') window.SonoraNative.prefetch(x.id);
+          else fetch('/api/prefetch/' + x.id).catch(() => {});
+        }
+        if (typeof preloadArt === 'function') preloadArt(x, true);
       });
       if (typeof syncNativeNextTrack === 'function') syncNativeNextTrack();
       redraw();
@@ -1378,44 +1482,50 @@ if (typeof LIVE !== 'undefined' && !LIVE.offlineLy) LIVE.offlineLy = {};
 const _activeLyDlIds = new Set();
 const _lyDlInFlight = new Map();
 const _lyDlRev = Object.create(null);
+const _offlineLyDeletedIds = new Set();
+let _offlineLyHydrated = false;
+let _offlineLyHydrating = false;
+let _offlineLyDirty = false;
 
-function loadOfflineLyrics() {
-  try {
-    if (typeof localStorage === 'undefined' || typeof LIVE === 'undefined') return;
-    const raw = localStorage.getItem(OFFLINE_LYRICS_KEY);
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
-    if (!LIVE.offlineLy) LIVE.offlineLy = {};
-    if (!LIVE.ly) LIVE.ly = {};
-    const keys = Object.keys(parsed);
-    for (let i = 0; i < keys.length; i++) {
-      const id = keys[i];
-      const item = parsed[id];
-      if (!item || !Array.isArray(item.lines) || !item.lines.length) continue;
-      const norm = {
-        lines: item.lines,
-        synced: !!item.synced,
-        wordSync: !!item.wordSync,
-        kind: item.kind || null,
-        source: item.source || null,
-        best: item.best || null,
-        sources: Array.isArray(item.sources) ? item.sources : [],
-        pending: [],
-        v: item.v || ++LIVE.lyV
-      };
-      LIVE.offlineLy[id] = norm;
-      if (!LIVE.ly[id] || LIVE.ly[id].loading) {
-        LIVE.ly[id] = Object.assign({}, norm, { loading: false, v: ++LIVE.lyV });
-      }
-    }
-  } catch (e) {}
+function _normOfflineLyEntry(item) {
+  if (!item || !Array.isArray(item.lines) || !item.lines.length) return null;
+  return {
+    lines: item.lines,
+    synced: !!item.synced,
+    wordSync: !!item.wordSync,
+    kind: item.kind || null,
+    source: item.source || null,
+    best: item.best || null,
+    sources: Array.isArray(item.sources) ? item.sources : [],
+    pending: [],
+    v: item.v || ++LIVE.lyV
+  };
 }
 
-function saveOfflineLyrics() {
+function _applyOfflineLyricsMap(parsed, fromIdb) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || typeof LIVE === 'undefined') return false;
+  if (!LIVE.offlineLy) LIVE.offlineLy = {};
+  if (!LIVE.ly) LIVE.ly = {};
+  const keys = Object.keys(parsed);
+  let added = false;
+  for (let i = 0; i < keys.length; i++) {
+    const id = keys[i];
+    if (_offlineLyDeletedIds.has(id)) continue;
+    if (fromIdb && LIVE.offlineLy[id]) continue;
+    const norm = _normOfflineLyEntry(parsed[id]);
+    if (!norm) continue;
+    LIVE.offlineLy[id] = norm;
+    if (!LIVE.ly[id] || LIVE.ly[id].loading) {
+      LIVE.ly[id] = Object.assign({}, norm, { loading: false, v: ++LIVE.lyV });
+    }
+    added = true;
+  }
+  return added;
+}
+
+function _saveOfflineLyricsLocalFallback(map) {
   try {
-    if (typeof localStorage === 'undefined' || typeof LIVE === 'undefined') return;
-    const map = LIVE.offlineLy || (LIVE.offlineLy = {});
+    if (typeof localStorage === 'undefined') return;
     try {
       localStorage.setItem(OFFLINE_LYRICS_KEY, JSON.stringify(map));
     } catch (err) {
@@ -1439,6 +1549,74 @@ function saveOfflineLyrics() {
   } catch (e) {}
 }
 
+function loadOfflineLyrics() {
+  try {
+    if (typeof LIVE === 'undefined') return;
+    let raw = null;
+    if (typeof localStorage !== 'undefined') {
+      try { raw = localStorage.getItem(OFFLINE_LYRICS_KEY); } catch (e) {}
+    }
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      _applyOfflineLyricsMap(parsed, false);
+      _offlineLyHydrated = true;
+      if (typeof idbSet === 'function') {
+        idbSet(OFFLINE_LYRICS_KEY, Object.assign({}, LIVE.offlineLy || {})).then(ok => {
+          if (ok && typeof localStorage !== 'undefined') {
+            try { localStorage.removeItem(OFFLINE_LYRICS_KEY); } catch (e) {}
+          }
+        });
+      }
+      return;
+    }
+    if (_offlineLyHydrated || _offlineLyHydrating) return;
+    if (typeof idbGet !== 'function') {
+      _offlineLyHydrated = true;
+      return;
+    }
+    _offlineLyHydrating = true;
+    idbGet(OFFLINE_LYRICS_KEY).then(stored => {
+      _offlineLyHydrating = false;
+      _offlineLyHydrated = true;
+      const hadAdded = _applyOfflineLyricsMap(stored, true);
+      if (_offlineLyDirty) {
+        saveOfflineLyrics();
+      }
+      if (hadAdded) {
+        if (typeof cur === 'function' && cur() && LIVE.offlineLy && LIVE.offlineLy[cur().id] && typeof prewarmLyrics === 'function') {
+          prewarmLyrics(cur());
+        }
+        if (typeof redraw === 'function') redraw();
+      }
+    });
+  } catch (e) {}
+}
+
+function saveOfflineLyrics() {
+  try {
+    if (typeof LIVE === 'undefined') return;
+    if (!_offlineLyHydrated) {
+      _offlineLyDirty = true;
+      return;
+    }
+    _offlineLyDirty = false;
+    const map = LIVE.offlineLy || (LIVE.offlineLy = {});
+    if (typeof idbSet === 'function') {
+      idbSet(OFFLINE_LYRICS_KEY, Object.assign({}, map)).then(ok => {
+        if (ok) {
+          if (typeof localStorage !== 'undefined') {
+            try { localStorage.removeItem(OFFLINE_LYRICS_KEY); } catch (e) {}
+          }
+        } else {
+          _saveOfflineLyricsLocalFallback(map);
+        }
+      });
+    } else {
+      _saveOfflineLyricsLocalFallback(map);
+    }
+  } catch (e) {}
+}
+
 function _removeOfflineLyrics(ids) {
   if (!ids) return;
   let changed = false;
@@ -1447,6 +1625,7 @@ function _removeOfflineLyrics(ids) {
     const id = list[i];
     if (!id) continue;
     _lyDlRev[id] = (_lyDlRev[id] || 0) + 1;
+    _offlineLyDeletedIds.add(id);
     if (LIVE.offlineLy && Object.prototype.hasOwnProperty.call(LIVE.offlineLy, id)) {
       delete LIVE.offlineLy[id];
       changed = true;
@@ -1505,6 +1684,7 @@ async function downloadLyricsForTrack(t) {
         };
         if (!LIVE.ly) LIVE.ly = {};
         if (!LIVE.offlineLy) LIVE.offlineLy = {};
+        _offlineLyDeletedIds.delete(t.id);
         LIVE.ly[t.id] = Object.assign({}, norm, { loading: false });
         delete LIVE.offlineLy[t.id];
         LIVE.offlineLy[t.id] = norm;
@@ -1532,6 +1712,7 @@ async function downloadLyricsForTrack(t) {
           v: existing.v || ++LIVE.lyV
         };
         if (!LIVE.offlineLy) LIVE.offlineLy = {};
+        _offlineLyDeletedIds.delete(t.id);
         delete LIVE.offlineLy[t.id];
         LIVE.offlineLy[t.id] = norm;
         saveOfflineLyrics();
@@ -1684,9 +1865,17 @@ LIVE.userPlaylists = [];
 let USER_PLAYLISTS = LIVE.userPlaylists;
 window.USER_PLAYLISTS = USER_PLAYLISTS;
 
-function saveUserPlaylists() {
-  try {
-    const raw = (LIVE.userPlaylists || []).map(pl => ({
+const _plCoverHydrating = new Set();
+function _plCoverKey(plId) {
+  return 'pl-cover-' + plId;
+}
+function _writeUserPlaylistsLs(forceInlineIds) {
+  const canIdb = typeof idbSet === 'function' && typeof indexedDB !== 'undefined';
+  const raw = (LIVE.userPlaylists || []).map(pl => {
+    const isData = Boolean(pl.thumb && typeof pl.thumb === 'string' && pl.thumb.indexOf('data:') === 0);
+    const forceInline = Boolean(forceInlineIds && forceInlineIds.has(pl.id));
+    const keepPendingIdb = Boolean(pl._idbCoverPending);
+    const out = {
       kind: 'playlist',
       id: pl.id,
       title: pl.title,
@@ -1694,13 +1883,71 @@ function saveUserPlaylists() {
       tracks: (pl.tracks || []).map(slimT),
       hue: pl.hue != null ? pl.hue : Math.floor(Math.random() * 360),
       style: pl.style != null ? pl.style : Math.floor(Math.random() * 6),
-      thumb: pl.thumb || null,
+      thumb: (isData && canIdb && !forceInline) ? null : (pl.thumb || null),
       user: true,
       loaded: true,
       created: pl.created || Date.now()
-    }));
-    localStorage.setItem('sonora-user-playlists', JSON.stringify(raw));
+    };
+    if ((isData && canIdb && !forceInline) || keepPendingIdb) {
+      out._idbCover = true;
+    }
+    return out;
+  });
+  localStorage.setItem('sonora-user-playlists', JSON.stringify(raw));
+}
+function saveUserPlaylists() {
+  try {
+    const canIdb = typeof idbSet === 'function' && typeof indexedDB !== 'undefined';
+    const inlineFallbackIds = new Set();
+    if (canIdb) {
+      (LIVE.userPlaylists || []).forEach(pl => {
+        if (!pl || !pl.id) return;
+        const isData = Boolean(pl.thumb && typeof pl.thumb === 'string' && pl.thumb.indexOf('data:') === 0);
+        if (isData) {
+          pl._idbCover = true;
+          delete pl._idbCoverPending;
+          const coverData = pl.thumb;
+          idbSet(_plCoverKey(pl.id), coverData).then(ok => {
+            if (!ok) {
+              inlineFallbackIds.add(pl.id);
+              try { _writeUserPlaylistsLs(inlineFallbackIds); } catch (e) {}
+            }
+          });
+        } else if (!pl._idbCoverPending && pl._idbCover) {
+          delete pl._idbCover;
+          if (typeof idbDel === 'function') idbDel(_plCoverKey(pl.id));
+        }
+      });
+    }
+    _writeUserPlaylistsLs(null);
   } catch (e) {}
+}
+
+function _hydratePlaylistIdbCover(plId) {
+  if (!plId || _plCoverHydrating.has(plId) || typeof idbGet !== 'function') return;
+  _plCoverHydrating.add(plId);
+  idbGet(_plCoverKey(plId)).then(dataUrl => {
+    _plCoverHydrating.delete(plId);
+    const curPl = typeof getUserPlaylist === 'function' ? getUserPlaylist(plId) : null;
+    if (!curPl) return;
+    delete curPl._idbCoverPending;
+    if (dataUrl && typeof dataUrl === 'string') {
+      if (!curPl.thumb || curPl.thumb.indexOf('data:') !== 0) {
+        curPl.thumb = dataUrl;
+        curPl._idbCover = true;
+        if (typeof BYID !== 'undefined' && BYID[plId]) {
+          BYID[plId].thumb = dataUrl;
+          BYID[plId]._idbCover = true;
+          delete BYID[plId]._idbCoverPending;
+        }
+        if (typeof ARTC !== 'undefined' && ARTC[plId] && (ARTC[plId]._placeholder || !ARTC[plId]._real)) {
+          delete ARTC[plId];
+        }
+        if (typeof preloadArt === 'function') preloadArt(curPl, true);
+        if (typeof redraw === 'function') redraw();
+      }
+    }
+  });
 }
 
 function restoreUserPlaylists() {
@@ -1714,7 +1961,15 @@ function restoreUserPlaylists() {
       if (st && st.userPlaylists) raw = st.userPlaylists;
     }
     if (Array.isArray(raw)) {
+      const prevById = new Map();
+      (LIVE.userPlaylists || []).forEach(p => { if (p && p.id) prevById.set(p.id, p); });
+      let needsMigration = !stored;
+      const toHydrate = [];
       LIVE.userPlaylists = raw.map(pl => {
+        const prevPl = prevById.get(pl.id);
+        const prevHasData = Boolean(prevPl && prevPl.thumb && typeof prevPl.thumb === 'string' && prevPl.thumb.indexOf('data:') === 0);
+        const storedIsData = Boolean(pl.thumb && typeof pl.thumb === 'string' && pl.thumb.indexOf('data:') === 0);
+        if (storedIsData) needsMigration = true;
         const item = {
           kind: 'playlist',
           id: pl.id,
@@ -1723,20 +1978,31 @@ function restoreUserPlaylists() {
           tracks: (pl.tracks || []).map(ingestTrack).filter(Boolean),
           hue: pl.hue != null ? pl.hue : Math.floor(Math.random() * 360),
           style: pl.style != null ? pl.style : Math.floor(Math.random() * 6),
-          thumb: pl.thumb || null,
+          thumb: pl.thumb || (prevHasData ? prevPl.thumb : null),
           user: true,
           loaded: true,
           created: pl.created || Date.now()
         };
+        if (pl._idbCover || storedIsData) {
+          item._idbCover = true;
+          if (!item.thumb && pl._idbCover) {
+            item._idbCoverPending = true;
+            toHydrate.push(item.id);
+          }
+        }
         BYID[item.id] = item;
         return item;
       });
       USER_PLAYLISTS = LIVE.userPlaylists;
       window.USER_PLAYLISTS = USER_PLAYLISTS;
-      if (!stored) saveUserPlaylists();
+      if (needsMigration) saveUserPlaylists();
+      for (let i = 0; i < toHydrate.length; i++) {
+        _hydratePlaylistIdbCover(toHydrate[i]);
+      }
     }
   } catch (e) {}
 }
+window.loadUserPlaylists = restoreUserPlaylists;
 
 function createUserPlaylist(title) {
   const plTitle = (title && typeof title === 'string' && title.trim()) || window.t('prompt.new_playlist_title');
@@ -2400,6 +2666,7 @@ function deleteUserPlaylist(plId) {
     window.USER_PLAYLISTS = USER_PLAYLISTS;
   }
   if (BYID[plId]) delete BYID[plId];
+  if (typeof idbDel === 'function') idbDel(_plCoverKey(plId));
   saveUserPlaylists();
   liveSave();
   if (typeof redraw === 'function') redraw();
@@ -2690,18 +2957,22 @@ function _writeLiveStorage() {
     }));
   } catch (e) {}
 }
-function flushLiveSave() {
+function flushLiveSave(force) {
   if (_liveSaveTimer) { clearTimeout(_liveSaveTimer); _liveSaveTimer = 0; }
   if (!_liveSaveDirty) return;
+  if (!force && _isUiAnimatingOrBusy()) {
+    _liveSaveTimer = setTimeout(() => flushLiveSave(false), 500);
+    return;
+  }
   _liveSaveDirty = false;
   _writeLiveStorage();
 }
 function liveSave(immediate) {
   _liveSaveDirty = true;
   _libVersion++;
-  if (immediate) { flushLiveSave(); return; }
+  if (immediate) { flushLiveSave(true); return; }
   if (_liveSaveTimer) clearTimeout(_liveSaveTimer);
-  _liveSaveTimer = setTimeout(flushLiveSave, 600);
+  _liveSaveTimer = setTimeout(() => flushLiveSave(false), 600);
 }
 const PLAYER_CACHE_KEY = 'sonora-player-v1';
 let _playerSaveTimer = 0, _playerSaveDirty = false;
@@ -2746,18 +3017,22 @@ function _writePlayerStorage() {
     }));
   } catch (e) {}
 }
-function flushPlayerState() {
+function flushPlayerState(force) {
   if (_playerSaveTimer) { clearTimeout(_playerSaveTimer); _playerSaveTimer = 0; }
   if (!_playerSaveDirty) return;
+  if (!force && _isUiAnimatingOrBusy()) {
+    _playerSaveTimer = setTimeout(() => flushPlayerState(false), 500);
+    return;
+  }
   _playerSaveDirty = false;
   _writePlayerStorage();
 }
 function savePlayerState(immediate) {
   _playerSaveDirty = true;
   if (typeof syncNativeRepeat === 'function') syncNativeRepeat();
-  if (immediate) { flushPlayerState(); return; }
+  if (immediate) { flushPlayerState(true); return; }
   if (_playerSaveTimer) clearTimeout(_playerSaveTimer);
-  _playerSaveTimer = setTimeout(flushPlayerState, _startupSecondaryReady ? 400 : 1200);
+  _playerSaveTimer = setTimeout(() => flushPlayerState(false), _startupSecondaryReady ? 400 : 1200);
 }
 if (typeof window !== 'undefined') window.savePlayerState = savePlayerState;
 function _restorePlayerSnapshot() {
@@ -2889,9 +3164,9 @@ function _scheduleSaveHomeSnapshot(rows) {
 }
 if (typeof window !== 'undefined') {
   window.reconcileNativePlayback = reconcileNativePlayback;
-  window.addEventListener('pagehide', () => { flushLiveSave(); flushPlayerState(); flushHomeSnapshot(); });
+  window.addEventListener('pagehide', () => { flushLiveSave(true); flushPlayerState(true); flushHomeSnapshot(); });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') { flushLiveSave(); flushPlayerState(); flushHomeSnapshot(); }
+    if (document.visibilityState === 'hidden') { flushLiveSave(true); flushPlayerState(true); flushHomeSnapshot(); }
   });
 }
 function _restoreHomeSnapshot() {
@@ -3151,9 +3426,9 @@ function _tryUpgradeSongEntry(existing, tr) {
   );
   if (!hasDiff) return null;
   if (!sameBase && typeof ARTC !== 'undefined') {
-    if (existing.id) delete ARTC[existing.id];
-    if (tr.id) delete ARTC[tr.id];
-    if (tr.album && (tr.album === 's_' + tr.id || tr.album === existing.album)) delete ARTC[tr.album];
+    if (existing.id && !_hasRealArt(existing.id)) delete ARTC[existing.id];
+    if (tr.id && !_hasRealArt(tr.id)) delete ARTC[tr.id];
+    if (tr.album && (tr.album === 's_' + tr.id || tr.album === existing.album) && !_hasRealArt(tr.album)) delete ARTC[tr.album];
   }
   if (existing.album && typeof BYID !== 'undefined' && BYID[existing.album]) {
     const isSameOrStubAlb = existing.album === tr.album || existing.album === 's_' + existing.id;
@@ -3163,7 +3438,7 @@ function _tryUpgradeSongEntry(existing, tr) {
     const albSameBase = Boolean(BYID[existing.album].thumb && typeof isSameCoverBase === 'function' && isSameCoverBase(BYID[existing.album].thumb, nextThumb));
     if (isSameOrStubAlb || (!sharedOther && tr.album === existing.album)) {
       BYID[existing.album].thumb = _preserveAppleHiRes(BYID[existing.album].thumb, nextThumb);
-      if (!albSameBase && !sameBase && typeof ARTC !== 'undefined') delete ARTC[existing.album];
+      if (!albSameBase && !sameBase && typeof ARTC !== 'undefined' && !_hasRealArt(existing.album)) delete ARTC[existing.album];
     }
   }
   return {
@@ -3297,8 +3572,8 @@ function _propagateCanonicalTrack(tr, skipBridgeSync) {
     if (src._appleUpgradeSettled || src.canonicalCover) obj._appleUpgradeSettled = true;
     if (!sameBase) {
       if (obj._sheetHiResUpgraded) delete obj._sheetHiResUpgraded;
-      _invalidateCoverCaches(obj.id, false);
-      if (oldAlb && oldAlb === 's_' + obj.id && oldAlb !== src.album) _invalidateCoverCaches(oldAlb, false);
+      _invalidateCoverCaches(obj.id, false, true);
+      if (oldAlb && oldAlb === 's_' + obj.id && oldAlb !== src.album) _invalidateCoverCaches(oldAlb, false, true);
     }
     return true;
   };
@@ -4076,12 +4351,17 @@ LIVEPAGES.mood = (c, P) => {
     y,
     typeof drawAlbumsSkeleton === 'function' ? (sc, PP, sy) => drawAlbumsSkeleton(sc, PP, sy, 6) : null,
     (dc) => {
-      const s = Math.floor((W - 40 - 16) / 2);
-      items.forEach((it, i) => {
-        const x = 20 + (i % 2) * (s + 16), yy = y + Math.floor(i / 2) * (s + 64);
-        if (vis(P, yy, s + 62)) radioCard(dc, it, x, yy, s);
-      });
-      return y + Math.ceil(items.length / 2) * (s + 64);
+      const s = Math.floor((W - 40 - 16) / 2), rowH = s + 64, rows = Math.ceil(items.length / 2);
+      if (rows > 0) {
+        const rowLo = Math.max(0, Math.floor((P.scroll - 30 - y) / rowH) - 1);
+        const rowHi = Math.min(rows - 1, Math.ceil((P.scroll + H + 30 - y) / rowH) + 1);
+        const iLo = rowLo * 2, iHi = Math.min(items.length, (rowHi + 1) * 2);
+        for (let i = iLo; i < iHi; i++) {
+          const it = items[i], x = 20 + (i % 2) * (s + 16), yy = y + Math.floor(i / 2) * rowH;
+          if (vis(P, yy, s + 62)) radioCard(dc, it, x, yy, s);
+        }
+      }
+      return y + rows * rowH;
     }
   );
 };

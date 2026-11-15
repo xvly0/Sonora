@@ -56,8 +56,13 @@ object AppleCatalog {
     @Volatile
     private var token: String? = null
     private val tokenLock = Mutex()
+    private val scrapeJoinLock = Any()
+    @Volatile
+    private var inFlightScrape: Deferred<String?>? = null
 
     private const val MAX_MEMORY_ENTRIES = 400
+    private const val MAX_DISK_ENTRIES = 1500
+    private const val DISK_EVICT_BATCH = 150
     private const val MISS_SENTINEL = "__MISS__"
     private const val MISS_CACHE_MS = 24L * 60 * 60 * 1000
 
@@ -168,7 +173,26 @@ object AppleCatalog {
 
 
     private fun remember(key: String, value: String) {
-        store?.edit()?.putString(key, System.currentTimeMillis().toString() + "\n" + value)?.apply()
+        val prefs = store ?: return
+        val editor = prefs.edit()
+        val all = prefs.all
+        if (!all.containsKey(key) && all.size >= MAX_DISK_ENTRIES) {
+            val protected = setOf(KEY_TOKEN, KEY_TOKEN_UNTIL, LEGACY_KEY_TOKEN, LEGACY_KEY_TOKEN_UNTIL)
+            val candidates = all.entries
+                .asSequence()
+                .filter { it.key !in protected }
+                .map { entry ->
+                    val ts = (entry.value as? String)?.substringBefore('\n')?.toLongOrNull() ?: 0L
+                    entry.key to ts
+                }
+                .sortedBy { it.second }
+                .toList()
+            val removeCount = (all.size - MAX_DISK_ENTRIES + DISK_EVICT_BATCH).coerceAtMost(candidates.size)
+            for (i in 0 until removeCount) {
+                editor.remove(candidates[i].first)
+            }
+        }
+        editor.putString(key, System.currentTimeMillis().toString() + "\n" + value).apply()
     }
 
     @kotlinx.serialization.Serializable
@@ -830,6 +854,21 @@ object AppleCatalog {
     }
 
     private suspend fun scrapeToken(): String? {
+        val deferred = synchronized(scrapeJoinLock) {
+            inFlightScrape?.takeIf { !it.isCompleted } ?: lookupScope.async {
+                try {
+                    doScrapeToken()
+                } finally {
+                    synchronized(scrapeJoinLock) {
+                        inFlightScrape = null
+                    }
+                }
+            }.also { inFlightScrape = it }
+        }
+        return deferred.await()
+    }
+
+    private suspend fun doScrapeToken(): String? {
         for (site in listOf("https://beta.music.apple.com", "https://music.apple.com")) {
             val page = get(site, null) ?: continue
             val script = Regex("""/assets/[^"']*index[^"']*\.js""").find(page)?.value ?: continue

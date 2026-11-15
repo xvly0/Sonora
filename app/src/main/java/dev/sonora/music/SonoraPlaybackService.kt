@@ -38,6 +38,7 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
+import androidx.media3.datasource.cache.ContentMetadata
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.datasource.okhttp.OkHttpDataSource
@@ -66,6 +67,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
@@ -101,7 +103,8 @@ data class StreamEntry(
     val codec: String = "AAC",
     val bitrateKbps: Int = 128,
     val sampleRateHz: Int = 44100,
-    val loudnessDb: Float = 0f
+    val loudnessDb: Float = 0f,
+    val expiresAtMs: Long = Long.MAX_VALUE
 ) {
     fun formatLabel(): String {
         return if (sampleRateHz > 48000) "Hi-Res Lossless" else "Lossless"
@@ -110,16 +113,29 @@ data class StreamEntry(
 
 object StreamCache {
     private const val TTL_MS = 2 * 60 * 60 * 1000L // 2 hours
+    private const val EXPIRE_SAFETY_MARGIN_MS = 60_000L
     private val cache = ConcurrentHashMap<String, StreamEntry>()
+
+    private fun parseExpireAtMs(url: String, now: Long): Long {
+        val maxExpiresAt = now + TTL_MS
+        val expireSec = runCatching {
+            Uri.parse(url).getQueryParameter("expire")?.toLongOrNull()
+        }.getOrNull()
+        if (expireSec != null && expireSec > 0L) {
+            return minOf(maxExpiresAt, expireSec * 1000L - EXPIRE_SAFETY_MARGIN_MS)
+        }
+        return maxExpiresAt
+    }
 
     fun get(videoId: String): String? = getMeta(videoId)?.url
 
     fun getMeta(videoId: String): StreamEntry? {
         val entry = cache[videoId] ?: return null
-        if (System.currentTimeMillis() - entry.timestamp < TTL_MS) {
+        val now = System.currentTimeMillis()
+        if (now - entry.timestamp < TTL_MS && now < entry.expiresAtMs) {
             return entry
         }
-        cache.remove(videoId)
+        cache.remove(videoId, entry)
         return null
     }
 
@@ -131,7 +147,9 @@ object StreamCache {
         sampleRateHz: Int = 44100,
         loudnessDb: Float = 0f
     ) {
-        cache[videoId] = StreamEntry(System.currentTimeMillis(), url, codec, bitrateKbps, sampleRateHz, loudnessDb)
+        val now = System.currentTimeMillis()
+        val expiresAtMs = parseExpireAtMs(url, now)
+        cache[videoId] = StreamEntry(now, url, codec, bitrateKbps, sampleRateHz, loudnessDb, expiresAtMs)
         if (cache.size > 128) {
             val oldest = cache.entries.minByOrNull { it.value.timestamp }
             oldest?.let { cache.remove(it.key) }
@@ -258,8 +276,8 @@ object SonoraAudioResolver {
     /**
      * Resolves the given YouTube videoId to a playable audio stream URL.
      * Deduplicates concurrent resolutions for the same videoId.
-     * Uses NewPipe Extractor as PRIMARY: verified immune to YouTube PO token 403 blocks past 1MB.
-     * Falls back to InnerTube parallel API resolution if needed.
+     * Uses InnerTube parallel API resolution as PRIMARY (fast TTFA + single-call loudnessDb),
+     * falling back to NewPipe Extractor if InnerTube clients return no playable stream.
      */
     fun resolve(videoId: String): String? {
         if (videoId.isBlank()) return null
@@ -290,7 +308,68 @@ object SonoraAudioResolver {
     private fun resolveUncached(videoId: String): String? {
         StreamCache.get(videoId)?.let { return it }
 
-        // 1. Primary: NewPipe Extractor (reliable, full length, no PO token 403 block past 1MB)
+        // 1. Primary: InnerTube multi-client parallel API resolution (fast TTFA + loudnessDb in one call)
+        try {
+            val clients = listOf(
+                YouTubeClient.ANDROID_VR_1_65_10,
+                YouTubeClient.ANDROID_VR_1_61_48,
+                YouTubeClient.VISIONOS,
+                YouTubeClient.IOS
+            )
+            val resolvedPair = runBlocking {
+                val deferred = CompletableDeferred<Pair<com.metrolist.innertube.models.response.PlayerResponse.StreamingData.Format, Float?>?>()
+                val remaining = AtomicInteger(clients.size)
+                val jobs = clients.map { client ->
+                    launch(Dispatchers.IO) {
+                        try {
+                            val playerRes = YouTube.player(videoId, client = client).getOrNull()
+                            val formats = playerRes?.streamingData?.adaptiveFormats
+                            val audio = formats?.filter { it.isAudio && !it.url.isNullOrEmpty() }
+                                ?.sortedWith(
+                                    compareByDescending<com.metrolist.innertube.models.response.PlayerResponse.StreamingData.Format> {
+                                        it.mimeType.startsWith("audio/mp4")
+                                    }.thenByDescending { it.bitrate }
+                                )?.firstOrNull()
+                            if (audio != null && !audio.url.isNullOrEmpty()) {
+                                val db = extractLoudnessDb(playerRes, audio)
+                                deferred.complete(audio to db)
+                            }
+                        } catch (_: Exception) {
+                        } finally {
+                            if (remaining.decrementAndGet() == 0) {
+                                deferred.complete(null)
+                            }
+                        }
+                    }
+                }
+                val result = withTimeoutOrNull(4000) { deferred.await() }
+                jobs.forEach { it.cancel() }
+                result
+            }
+
+            val resolvedFormat = resolvedPair?.first
+            val directUrl = resolvedFormat?.url
+            if (!directUrl.isNullOrEmpty()) {
+                val mime = resolvedFormat.mimeType.lowercase()
+                val codecName = when {
+                    mime.contains("opus") -> "Opus"
+                    mime.contains("mp4") || mime.contains("aac") -> "AAC"
+                    else -> mime.substringAfter("audio/").substringBefore(';').uppercase().ifEmpty { "Audio" }
+                }
+                val brKbps = (resolvedFormat.bitrate / 1000).coerceAtLeast(64)
+                val srHz = resolvedFormat.audioSampleRate ?: if (codecName == "Opus") 48000 else 44100
+                val resolvedLoudness = resolvedPair.second
+                if (resolvedLoudness != null) {
+                    rememberLoudnessDb(videoId, resolvedLoudness)
+                }
+                StreamCache.put(videoId, directUrl, codecName, brKbps, srHz, loudnessDb = resolvedLoudness ?: 0f)
+                return directUrl
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("SonoraAudioResolver", "InnerTube resolution failed for $videoId: ${e.message}")
+        }
+
+        // 2. Secondary Fallback: NewPipe Extractor
         try {
             ensureNewPipe()
             val watchUrl = "https://www.youtube.com/watch?v=$videoId"
@@ -323,67 +402,12 @@ object SonoraAudioResolver {
             android.util.Log.w("SonoraAudioResolver", "NewPipe extraction failed for $videoId: ${e.message}")
         }
 
-        // 2. Secondary Fallback: InnerTube multi-client parallel API resolution
-        try {
-            val clients = listOf(
-                YouTubeClient.ANDROID_VR_1_65_10,
-                YouTubeClient.ANDROID_VR_1_61_48,
-                YouTubeClient.VISIONOS,
-                YouTubeClient.IOS
-            )
-            val resolvedPair = runBlocking {
-                val deferred = CompletableDeferred<Pair<com.metrolist.innertube.models.response.PlayerResponse.StreamingData.Format, Float?>>()
-                val jobs = clients.map { client ->
-                    launch(Dispatchers.IO) {
-                        try {
-                            val playerRes = YouTube.player(videoId, client = client).getOrNull()
-                            val formats = playerRes?.streamingData?.adaptiveFormats
-                            val audio = formats?.filter { it.isAudio && !it.url.isNullOrEmpty() }
-                                ?.sortedWith(
-                                    compareByDescending<com.metrolist.innertube.models.response.PlayerResponse.StreamingData.Format> {
-                                        it.mimeType.startsWith("audio/mp4")
-                                    }.thenByDescending { it.bitrate }
-                                )?.firstOrNull()
-                            if (audio != null && !audio.url.isNullOrEmpty()) {
-                                val db = extractLoudnessDb(playerRes, audio)
-                                deferred.complete(audio to db)
-                            }
-                        } catch (_: Exception) {}
-                    }
-                }
-                val result = withTimeoutOrNull(4000) { deferred.await() }
-                jobs.forEach { it.cancel() }
-                result
-            }
-
-            val resolvedFormat = resolvedPair?.first
-            val directUrl = resolvedFormat?.url
-            if (!directUrl.isNullOrEmpty()) {
-                val mime = resolvedFormat.mimeType.lowercase()
-                val codecName = when {
-                    mime.contains("opus") -> "Opus"
-                    mime.contains("mp4") || mime.contains("aac") -> "AAC"
-                    else -> mime.substringAfter("audio/").substringBefore(';').uppercase().ifEmpty { "Audio" }
-                }
-                val brKbps = (resolvedFormat.bitrate / 1000).coerceAtLeast(64)
-                val srHz = resolvedFormat.audioSampleRate ?: if (codecName == "Opus") 48000 else 44100
-                val resolvedLoudness = resolvedPair.second
-                if (resolvedLoudness != null) {
-                    rememberLoudnessDb(videoId, resolvedLoudness)
-                }
-                StreamCache.put(videoId, directUrl, codecName, brKbps, srHz, loudnessDb = resolvedLoudness ?: 0f)
-                return directUrl
-            }
-        } catch (e: Exception) {
-            android.util.Log.w("SonoraAudioResolver", "InnerTube resolution failed for $videoId: ${e.message}")
-        }
-
         return null
     }
 }
 
 @UnstableApi
-private class SonoraStreamResolver : ResolvingDataSource.Resolver {
+internal class SonoraStreamResolver : ResolvingDataSource.Resolver {
     override fun resolveDataSpec(dataSpec: DataSpec): DataSpec {
         val uri = dataSpec.uri.toString()
         val videoId = when {
@@ -416,6 +440,8 @@ class SonoraPlaybackService : MediaSessionService() {
     private lateinit var resolvingDataSourceFactory: ResolvingDataSource.Factory
     @Volatile
     private var lazyCacheDataSourceFactory: CacheDataSource.Factory? = null
+    @Volatile
+    private var lazyPlaybackDataSourceFactory: CacheDataSource.Factory? = null
     private val cacheFactoryLock = Any()
     private val prewarmedBytesIds = ConcurrentHashMap.newKeySet<String>()
     private val prewarmLock = Any()
@@ -510,7 +536,20 @@ class SonoraPlaybackService : MediaSessionService() {
         private var mediaCache: SimpleCache? = null
         private val mediaCacheLock = Any()
 
-        private val downloadOkHttp: OkHttpClient by lazy {
+        @Volatile
+        private var databaseProvider: StandaloneDatabaseProvider? = null
+        private val databaseProviderLock = Any()
+
+        internal fun getDatabaseProvider(context: Context): StandaloneDatabaseProvider {
+            databaseProvider?.let { return it }
+            val appCtx = context.applicationContext ?: context
+            synchronized(databaseProviderLock) {
+                databaseProvider?.let { return it }
+                return StandaloneDatabaseProvider(appCtx).also { databaseProvider = it }
+            }
+        }
+
+        internal val downloadOkHttp: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
                 .connectTimeout(15, TimeUnit.SECONDS)
@@ -521,49 +560,49 @@ class SonoraPlaybackService : MediaSessionService() {
                 .build()
         }
 
-        suspend fun cacheTrackAudio(context: Context, videoId: String): Boolean = withContext(Dispatchers.IO) {
-            val cleanId = videoId.trim()
-            if (cleanId.isEmpty()) return@withContext false
-            runCatching {
-                val appCtx = context.applicationContext
-                val cache = getMediaCache(appCtx)
-                val httpFactory = OkHttpDataSource.Factory(downloadOkHttp)
-                    .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-                val defaultFactory = DefaultDataSource.Factory(appCtx, httpFactory)
-                val chunkedFactory = ChunkedDataSource.Factory(defaultFactory)
-                val resolvingFactory = ResolvingDataSource.Factory(chunkedFactory, SonoraStreamResolver())
-                val cacheFactory = CacheDataSource.Factory()
-                    .setCache(cache)
-                    .setUpstreamDataSourceFactory(resolvingFactory)
-                    .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-                val dataSource = cacheFactory.createDataSourceForDownloading()
-                val spec = DataSpec(Uri.parse("youtube:track:$cleanId"))
-                CacheWriter(dataSource, spec, null, null).cache()
-                true
-            }.getOrElse { e ->
-                android.util.Log.w("SonoraDownload", "Failed caching audio for $cleanId: ${e.message}")
-                false
-            }
+        suspend fun cacheTrackAudio(context: Context, videoId: String): Boolean {
+            return SonoraDownloadManager.downloadAndAwait(context, videoId)
         }
 
         fun removeCachedTrackAudio(context: Context, videoId: String) {
-            val cleanId = videoId.trim()
-            if (cleanId.isEmpty()) return
-            instance?.prewarmedBytesIds?.remove(cleanId.removePrefix("yt:").trim())
-            runCatching {
-                val cache = getMediaCache(context.applicationContext)
-                cache.removeResource("youtube:track:$cleanId")
+            deleteDownloadedTrack(context, videoId)
+        }
+
+        fun deleteDownloadedTrack(context: Context, videoId: String): Boolean {
+            val cleanId = SonoraDownloadManager.normalizeTrackId(videoId)
+            if (cleanId.isEmpty()) return false
+            instance?.prewarmedBytesIds?.remove(cleanId)
+            return SonoraDownloadManager.deleteDownloadedTrack(context, cleanId)
+        }
+
+        fun isTrackCached(context: Context, videoId: String): Boolean {
+            val cleanId = SonoraDownloadManager.normalizeTrackId(videoId)
+            if (cleanId.isEmpty() || cleanId.startsWith("local_")) return false
+            val appCtx = context.applicationContext ?: context
+            if (SonoraDownloadManager.isTrackDownloaded(appCtx, cleanId)) {
+                return true
             }
+            val cacheKey = SonoraDownloadManager.cacheKeyFor(cleanId)
+            return runCatching {
+                val cache = getMediaCache(appCtx)
+                val len = ContentMetadata.getContentLength(cache.getContentMetadata(cacheKey))
+                len > 0L && cache.isCached(cacheKey, 0L, len)
+            }.getOrDefault(false)
+        }
+
+        fun getDownloadedTracksJson(context: Context): String {
+            return SonoraDownloadManager.getDownloadsStatusJson(context)
         }
 
         fun getMediaCache(context: Context): SimpleCache {
             mediaCache?.let { return it }
+            val appCtx = context.applicationContext ?: context
             synchronized(mediaCacheLock) {
                 mediaCache?.let { return it }
-                val dir = File(context.cacheDir, "sonora_media_cache")
+                val dir = File(appCtx.cacheDir, "sonora_media_cache")
                 val evictor = LeastRecentlyUsedCacheEvictor(600L * 1024L * 1024L) // 600 MB LRU disk cache
-                val databaseProvider = StandaloneDatabaseProvider(context.applicationContext)
-                return SimpleCache(dir, evictor, databaseProvider).also { mediaCache = it }
+                val dbProvider = getDatabaseProvider(appCtx)
+                return SimpleCache(dir, evictor, dbProvider).also { mediaCache = it }
             }
         }
 
@@ -652,12 +691,13 @@ class SonoraPlaybackService : MediaSessionService() {
         resolvingDataSourceFactory = ResolvingDataSource.Factory(chunkedDataSourceFactory, SonoraStreamResolver())
 
         mediaDataSourceFactory = DataSource.Factory {
-            getOrCreateCacheDataSourceFactory().createDataSource()
+            getOrCreatePlaybackDataSourceFactory().createDataSource()
         }
 
-        // Warm SimpleCache SQLite index and NewPipe extractor off the Main thread
+        // Warm SimpleCache SQLite indexes, download state, and NewPipe extractor off the Main thread
         scope.launch(Dispatchers.IO) {
             runCatching { getMediaCache(this@SonoraPlaybackService) }
+            runCatching { SonoraDownloadManager.ensureInitialized(this@SonoraPlaybackService) }
             runCatching { SonoraAudioResolver.ensureNewPipe() }
         }
 
@@ -819,7 +859,6 @@ class SonoraPlaybackService : MediaSessionService() {
                         player.seekTo(0L)
                         player.play()
                         notifyState()
-                        playbackListener?.onTrackEnded()
                         return
                     }
                     notifyState()
@@ -873,6 +912,10 @@ class SonoraPlaybackService : MediaSessionService() {
         })
     }
 
+    private fun buildMediaSourceFactory(): DefaultMediaSourceFactory {
+        return DefaultMediaSourceFactory(mediaDataSourceFactory)
+    }
+
     private fun buildExoPlayer(handleAudioFocus: Boolean, slot: MixerSlot = mainSlot): ExoPlayer {
         val renderersFactory = object : DefaultRenderersFactory(this) {
             override fun buildAudioSink(
@@ -888,7 +931,7 @@ class SonoraPlaybackService : MediaSessionService() {
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
         return ExoPlayer.Builder(this, renderersFactory)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(mediaDataSourceFactory))
+            .setMediaSourceFactory(buildMediaSourceFactory())
             .setLoadControl(loadControl)
             .setAudioAttributes(musicAudioAttributes, handleAudioFocus)
             .setHandleAudioBecomingNoisy(handleAudioFocus)
@@ -1073,6 +1116,7 @@ class SonoraPlaybackService : MediaSessionService() {
             .setTitle(title)
             .setArtist(cleanArtist)
             .setArtworkUri(artUri)
+            .setIsPlayable(true)
             .build()
         return MediaItem.Builder()
             .setMediaId(trackId)
@@ -1386,6 +1430,17 @@ class SonoraPlaybackService : MediaSessionService() {
         }
     }
 
+    private fun getOrCreatePlaybackDataSourceFactory(): CacheDataSource.Factory {
+        return lazyPlaybackDataSourceFactory ?: synchronized(cacheFactoryLock) {
+            lazyPlaybackDataSourceFactory ?: CacheDataSource.Factory()
+                .setCache(SonoraDownloadManager.getDownloadCache(this@SonoraPlaybackService))
+                .setCacheWriteDataSinkFactory(null)
+                .setUpstreamDataSourceFactory(getOrCreateCacheDataSourceFactory())
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+                .also { lazyPlaybackDataSourceFactory = it }
+        }
+    }
+
     private fun cancelPrewarmBytesJob() {
         synchronized(prewarmLock) {
             prewarmBytesJob?.cancel()
@@ -1399,6 +1454,10 @@ class SonoraPlaybackService : MediaSessionService() {
         if (cleanId.isEmpty() || cleanId.startsWith("local_")) return
         if (!::resolvingDataSourceFactory.isInitialized) return
         if (prewarmedBytesIds.contains(cleanId)) return
+        if (runCatching { SonoraDownloadManager.isTrackDownloaded(this@SonoraPlaybackService, cleanId) }.getOrDefault(false)) {
+            prewarmedBytesIds.add(cleanId)
+            return
+        }
         val cacheKey = "youtube:track:$cleanId"
         val mediaCache = runCatching { getMediaCache(this@SonoraPlaybackService) }.getOrNull() ?: return
         if (runCatching { mediaCache.isCached(cacheKey, 0L, 128L * 1024L) }.getOrDefault(false)) {
@@ -2082,6 +2141,9 @@ class SonoraPlaybackService : MediaSessionService() {
         }
         scope.launch(Dispatchers.IO) {
             try {
+                if (SonoraDownloadManager.isTrackDownloaded(this@SonoraPlaybackService, cleanId)) {
+                    return@launch
+                }
                 val url = SonoraAudioResolver.resolve(videoId)
                 if (!url.isNullOrEmpty() && !SonoraAudioResolver.hasLoudnessDb(cleanId)) {
                     runCatching { SonoraAudioResolver.fetchLoudnessDb(cleanId) }

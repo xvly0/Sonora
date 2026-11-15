@@ -47,6 +47,7 @@ class InnerTube {
 
     private companion object {
         const val PLAYBACK_TELEMETRY_VER = "2"
+        val RETRYABLE_HTTP_CODES = setOf(429, 502, 503, 504)
     }
 
     @Volatile
@@ -59,6 +60,7 @@ class InnerTube {
             val cleanHl = value.hl.trim().lowercase(Locale.ROOT).ifEmpty { "en" }
             field = YouTubeLocale(gl = cleanGl, hl = cleanHl)
         }
+    @Volatile
     var visitorData: String? = null
     var dataSyncId: String? = null
     /**
@@ -277,6 +279,12 @@ class InnerTube {
             try {
                 return block()
             } catch (e: IOException) {
+                attempt++
+                if (attempt >= maxAttempts) throw e
+                delay(currentDelay)
+                currentDelay = (currentDelay * factor).toLong()
+            } catch (e: ResponseException) {
+                if (e.response.status.value !in RETRYABLE_HTTP_CODES) throw e
                 attempt++
                 if (attempt >= maxAttempts) throw e
                 delay(currentDelay)

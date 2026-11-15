@@ -192,5 +192,5 @@ object LrcLib {
 
     private val LRC_LINE = Regex("\\[(\\d{1,2}):(\\d{2})[.:](\\d{2,3})\\](.*)")
 
-    private const val USER_AGENT = "Square (https://github.com/lelonio/square)"
+    private const val USER_AGENT = "Sonora/1.0"
 }

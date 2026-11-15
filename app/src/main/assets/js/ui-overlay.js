@@ -1317,7 +1317,7 @@ function drawOverlay() {
       if (tb._rgb0 !== rgb0) { tb._rgb0 = rgb0; tb.style.setProperty('--rgb0', rgb0); }
       if (tb._rgb1 !== rgb1) { tb._rgb1 = rgb1; tb.style.setProperty('--rgb1', rgb1); }
       const emptyHoleMask = tb._emptyMask || (tb._emptyMask = 'url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27/%3E")');
-      const holeMask = (Ppage, dx, wBox) => {
+      const holeMask = (Ppage, dx, wBox, cacheBox) => {
         if (wBox <= 0) return 'none';
         if (sheetCov) return emptyHoleMask;
         const holes = [];
@@ -1343,9 +1343,26 @@ function drawOverlay() {
         const svgW = Math.max(1, Math.round(wBox * mDpr));
         const svgH = Math.max(1, Math.round(barH * mDpr));
         const vbW = +wBox.toFixed(2);
+        const hasCut = hasSheetCut && shTop < barH;
+        const sy = hasCut ? +Math.max(0, shTop).toFixed(2) : -1;
+        const sr = hasCut ? +Math.min(46 * (1 - clamp((SH.t - .9) / .1, 0, 1)), vbW / 2).toFixed(2) : -1;
+        const inset = 0.65;
+        let maskKey = svgW + 'x' + svgH + '|' + vbW + '|' + barH + '|' + sy + ',' + sr;
+        const holeGeom = [];
+        for (let i = 0; i < holes.length; i++) {
+          const h = holes[i];
+          if (h.y >= shTop + 46) continue;
+          const hx = h.x + inset, hy = h.y + inset;
+          const hw = h.w - inset * 2, hh = h.h - inset * 2;
+          if (hw <= 0 || hh <= 0) continue;
+          const hr = Math.max(0, Math.min(22 - inset, hw / 2, hh / 2));
+          const x = +hx.toFixed(2), y = +hy.toFixed(2), w = +hw.toFixed(2), hh2 = +hh.toFixed(2), rr = +hr.toFixed(2);
+          maskKey += '|' + x + ',' + y + ',' + w + ',' + hh2 + ',' + rr;
+          holeGeom.push([x, y, w, hh2, rr]);
+        }
+        if (cacheBox && cacheBox._mKey === maskKey && cacheBox._mVal) return cacheBox._mVal;
         let clipDef = '', clipAttr = '';
-        if (hasSheetCut && shTop < barH) {
-          const sy = +Math.max(0, shTop).toFixed(2), sr = +Math.min(46 * (1 - clamp((SH.t - .9) / .1, 0, 1)), vbW / 2).toFixed(2);
+        if (hasCut) {
           const cd = sr > .5
             ? 'M0,0H' + vbW + 'V' + +(sy + sr).toFixed(2) + 'A' + sr + ',' + sr + ' 0 0 0 ' + +(vbW - sr).toFixed(2) + ',' + sy + 'H' + sr + 'A' + sr + ',' + sr + ' 0 0 0 0,' + +(sy + sr).toFixed(2) + 'Z'
             : 'M0,0H' + vbW + 'V' + sy + 'H0Z';
@@ -1353,14 +1370,7 @@ function drawOverlay() {
           clipAttr = ' clip-path="url(#sc)"';
         }
         let d = 'M0,0H' + vbW + 'V' + barH + 'H0Z';
-        const inset = 0.65;
-        holes.forEach(h => {
-          if (h.y >= shTop + 46) return;
-          const hx = h.x + inset, hy = h.y + inset;
-          const hw = h.w - inset * 2, hh = h.h - inset * 2;
-          if (hw <= 0 || hh <= 0) return;
-          const hr = Math.max(0, Math.min(22 - inset, hw / 2, hh / 2));
-          const x = +hx.toFixed(2), y = +hy.toFixed(2), w = +hw.toFixed(2), hh2 = +hh.toFixed(2), rr = +hr.toFixed(2);
+        holeGeom.forEach(([x, y, w, hh2, rr]) => {
           const lineW = +(w - 2 * rr).toFixed(2), lineH = +(hh2 - 2 * rr).toFixed(2);
           if (lineW <= 0.01 && lineH <= 0.01 && rr > 0) {
             const cx = +(x + w / 2).toFixed(2), dRx = +(w / 2).toFixed(2), dRy = +(hh2 / 2).toFixed(2);
@@ -1379,10 +1389,12 @@ function drawOverlay() {
             d += 'Z';
           }
         });
-        return 'url("data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="' + svgW + '" height="' + svgH + '" viewBox="0 0 ' + vbW + ' ' + barH + '" preserveAspectRatio="none" shape-rendering="geometricPrecision">' + clipDef + '<path' + clipAttr + ' fill="black" fill-rule="evenodd" d="' + d + '"/></svg>') + '")';
+        const url = 'url("data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="' + svgW + '" height="' + svgH + '" viewBox="0 0 ' + vbW + ' ' + barH + '" preserveAspectRatio="none" shape-rendering="geometricPrecision">' + clipDef + '<path' + clipAttr + ' fill="black" fill-rule="evenodd" d="' + d + '"/></svg>') + '")';
+        if (cacheBox) { cacheBox._mKey = maskKey; cacheBox._mVal = url; }
+        return url;
       };
-      const m0 = vis0 ? holeMask(Pprev, -W * .28 * (1 - pp), splitNum) : 'none';
-      const m1 = vis1 ? holeMask(P, -splitNum, W - splitNum) : 'none';
+      const m0 = vis0 ? holeMask(Pprev, -W * .28 * (1 - pp), splitNum, tbPrev) : 'none';
+      const m1 = vis1 ? holeMask(P, -splitNum, W - splitNum, tbCurr) : 'none';
       const applySpanMask = (spans, m, key, box) => {
         if (box[key] === m) return;
         box[key] = m;
@@ -2145,7 +2157,7 @@ function updateGlass(dt) {
     const rAmtS = PREFS.glassProfile === 'light' ? 0 : (PREFS.glassRefraction != null ? PREFS.glassRefraction : 24);
     const rH12S = PREFS.glassProfile === 'light' ? 0 : Math.round(rAmtS * (12 / 24));
     const chromS = PREFS.glassChromatic ? (PREFS.glassProfile === 'vivid' ? 1.0 : .8) : 0;
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 24; i++) {
       const g = G['setCtrl' + i], it = ctrls[i];
       if (!g) continue;
       if (!it) { g.set({ visible: false }); continue; }
@@ -2603,6 +2615,22 @@ function physics(dt) {
     }
     if (qCh) redraw();
   }
+  if (SH.qRemoving && SH.qRemoving.length) {
+    if (SH.t < 0.02 || SH.mode !== 'queue') {
+      SH.qRemoving.length = 0;
+    } else {
+      for (let i = SH.qRemoving.length - 1; i >= 0; i--) {
+        const rm = SH.qRemoving[i];
+        rm.hP = ease(rm.hP, 0, 22, dt);
+        rm.x = ease(rm.x, -W, 18, dt);
+        if (rm.hP < 0.008) SH.qRemoving.splice(i, 1);
+      }
+      redraw();
+    }
+  }
+  if (SWQ.key && String(SWQ.key).indexOf('q:') === 0 && (SH.t < 0.05 || SH.mode !== 'queue') && SWQ.state !== 'idle') {
+    swqReset();
+  }
   if (INP.rel && !INP.down) { const el = performance.now() - INP.rel, st = Math.abs(SP.tab.x - SP.tab.t) < .05 && Math.abs(SP.tab.v) < .7; if ((st && el > 120) || el > 2200) { SP.tabP.t = 0; INP.rel = 0; } }
   { const pt = hasPill(P) ? clamp((P.scroll - 30) / 110, 0, 1) : 0; if (Math.abs(NAV.pk - pt) > .001) { NAV.pk = ease(NAV.pk, pt, 14, dt); if (Math.abs(NAV.pk - pt) <= .001) NAV.pk = pt; redraw(); } else if (NAV.pk !== pt) { NAV.pk = pt; redraw(); } }
   { const qt = hasPill(P) && P.qOpen ? 1 : 0; P.qT = P.qT || 0; if (Math.abs(P.qT - qt) > .001) { P.qT = ease(P.qT, qt, 16, dt); if (Math.abs(P.qT - qt) <= .001) P.qT = qt; redraw(); } else if (P.qT !== qt) { P.qT = qt; redraw(); } }
@@ -2744,9 +2772,36 @@ function physics(dt) {
     if (botCh && SH.t > 0.01) { D.scene = D.ov = D.gl = true; }
   }
   if (SH.t > .01) {
-    SH.phase += dt * (PL.playing ? .3 : .12); const tg = shaderPalette(cur());
-    if (!SH.cols || SH.cols.length !== tg.length) SH.cols = tg.map(q => q.slice()); else SH.cols.forEach((q, i) => { for (let k = 0; k < 3; k++) q[k] = ease(q[k], tg[i][k], 2.6, dt); });
-    if (frameNo & 1) { D.scene = D.gl = true; if (SH.t < .99) D.ov = true; }
+    const tg = shaderPalette(cur());
+    let colsSettling = false;
+    if (!SH.cols || SH.cols.length !== tg.length) {
+      SH.cols = tg.map(q => q.slice());
+      colsSettling = true;
+    } else {
+      SH.cols.forEach((q, i) => {
+        for (let k = 0; k < 3; k++) {
+          const nv = ease(q[k], tg[i][k], 2.6, dt);
+          if (Math.abs(nv - tg[i][k]) > 0.15) colsSettling = true;
+          q[k] = nv;
+        }
+      });
+    }
+    const shAnim = PL.playing || colsSettling || SH.t <= .999 || SH.target < 1 || !!SH.drag || !!INP.down ||
+      SP.art.busy || SP.shMode.busy || SP.shText.busy || SP.qMode.busy ||
+      Math.abs(SH.lVel || 0) > 8 || Math.abs(SH.qVel || 0) > 8 ||
+      !!SH.dragQueue || !!SH.qSettle || !!(SH.qOff && SH.qOff.size > 0) || !!(SH.qRemoving && SH.qRemoving.length > 0);
+    if (shAnim) {
+      SH.phase += dt * (PL.playing ? .3 : .12);
+      if (frameNo & 1) {
+        if (SH.t > .999) {
+          if (typeof redrawSceneOnly === 'function') redrawSceneOnly();
+          else { D.scene = D.gl = true; }
+        } else {
+          D.scene = D.gl = true;
+          if (SH.t < .99) D.ov = true;
+        }
+      }
+    }
   }
   if (SH.t > .5 && SH.mode === 'lyrics' && !(INP.down && INP.mode === 'list')) {
     if (SH.lHold > 0) {
@@ -2765,11 +2820,12 @@ function physics(dt) {
           SH.lVel *= Math.exp(-3.6 * dt);
           if (Math.abs(SH.lVel) < 8) SH.lVel = 0;
         }
-        redraw();
+        if (typeof redrawSheetContent === 'function') redrawSheetContent();
+        else redraw();
       }
     }
-    else if (Math.abs(SH.lScroll - SH.lTarget) > .15) { SH.lVel = 0; SH.lScroll = ease(SH.lScroll, SH.lTarget, 6.2, dt); if (Math.abs(SH.lScroll - SH.lTarget) <= .15) SH.lScroll = SH.lTarget; redraw(); }
-    else if (SH.lScroll !== SH.lTarget) { SH.lScroll = SH.lTarget; redraw(); }
+    else if (Math.abs(SH.lScroll - SH.lTarget) > .15) { SH.lVel = 0; SH.lScroll = ease(SH.lScroll, SH.lTarget, 6.2, dt); if (Math.abs(SH.lScroll - SH.lTarget) <= .15) SH.lScroll = SH.lTarget; if (typeof redrawSheetContent === 'function') redrawSheetContent(); else redraw(); }
+    else if (SH.lScroll !== SH.lTarget) { SH.lScroll = SH.lTarget; if (typeof redrawSheetContent === 'function') redrawSheetContent(); else redraw(); }
   }
   if (SH.mode === 'queue' && !(INP.down && INP.mode === 'list') && (Math.abs(SH.qVel) > 8 || SH.qScroll < 0 || SH.qScroll > SH.qMax)) {
     if (SH.qScroll < 0 || SH.qScroll > SH.qMax) {
@@ -2785,7 +2841,8 @@ function physics(dt) {
       SH.qVel *= Math.exp(-3.4 * dt);
       if (Math.abs(SH.qVel) < 8) SH.qVel = 0;
     }
-    redraw();
+    if (typeof redrawSheetContent === 'function') redrawSheetContent();
+    else redraw();
   }
   { const sStack = NAV.stacks && NAV.stacks.search ? NAV.stacks.search : [];
     const st = NAV.tab !== 'search' ? 0
@@ -2964,6 +3021,7 @@ $out.addEventListener('pointerdown', e => {
     if (h && h.tag === 'scrub') { SH.lastTouch = now; INP.mode = 'scrub'; SH.scrub = clamp((p.x - 28) / (W - 56), 0, 1); redraw(); }
     else if (h && h.tag === 'vol') { SH.lastTouch = now; INP.mode = 'vol'; setVol(p.x); }
     else if (h && h.tag === 'queueGrip') {
+      if (SWQ.key && String(SWQ.key).indexOf('q:') === 0 && SWQ.state !== 'idle') swqClose();
       SH.lastTouch = now;
       INP.mode = 'queueGrip';
       const rowIdx = (h.rowIdx != null) ? h.rowIdx : (h.extra && h.extra.rowIdx != null ? h.extra.rowIdx : 0);
@@ -2978,8 +3036,24 @@ $out.addEventListener('pointerdown', e => {
       if (typeof window.haptic === 'function') window.haptic('pickup');
       D.ov = true;
       redraw();
-    } else if (h && h.pressKey && typeof pressDown === 'function') {
-      pressDown(h.pressKey);
+    } else {
+      if (h && h.tag === 'queue' && h.qRowKey) {
+        const qSw = (SWQ.key === h.qRowKey) ? SWQ : ((typeof SWQ_ROWS !== 'undefined' && SWQ_ROWS.get(h.qRowKey)) || null);
+        if (qSw && qSw.state === 'returning') {
+          if (qSw !== SWQ) {
+            swqDetachToBg();
+            swqAdoptFromBg(h.qRowKey);
+          }
+          SWQ.state = 'paused';
+          SWQ.v = 0;
+          SWQ.done = false;
+          SWQ.tr = h.qRowTrack;
+          SWQ.qIdx = h.qRowIdx;
+          SWQ.baseX = SWQ.x;
+          SWQ.startX = p.x;
+        }
+      }
+      if (h && h.pressKey && typeof pressDown === 'function') pressDown(h.pressKey);
     }
     return;
   }
@@ -3160,9 +3234,29 @@ $out.addEventListener('pointermove', e => {
         INP.mode = !horiz ? 'scroll' : 'none';
       }
     }
+    else if (tg.type === 'sheet') {
+      const tag = tg.hit && tg.hit.tag;
+      if (tag === 'queue' && tg.hit.qRowTrack && SH.mode === 'queue' && swqHoriz && !SH.dragQueue &&
+          (dx < 0 || (SWQ.key === tg.hit.qRowKey && SWQ.baseX < 0))) {
+        INP.mode = 'swipeQueueRow';
+        if (SWQ.key !== tg.hit.qRowKey) {
+          swqDetachToBg();
+          swqAdoptFromBg(tg.hit.qRowKey);
+        }
+        SWQ.tr = tg.hit.qRowTrack;
+        SWQ.key = tg.hit.qRowKey;
+        SWQ.qIdx = tg.hit.qRowIdx;
+        if (SWQ.state !== 'paused') { SWQ.baseX = SWQ.x || 0; SWQ.crossed = -SWQ.baseX >= SWQ_THRESHOLD - 0.5; SWQ.done = false; if (SWQ.baseX === 0) SWQ.crossP = 0; }
+        SWQ.v = 0;
+        SWQ.state = 'dragging';
+        SWQ.startX = INP.x0;
+      } else if (Math.abs(dx) > 8 || Math.abs(dy) > 8) {
+        if (SWQ.state === 'paused') { swqClose(); redraw(); }
+        INP.mode = (tag === 'lyrics' || tag === 'queue') && !horiz ? 'list' : (!horiz && (dy > 0 || SH.drag > 0 || (SH.target === 1 && dy < -8)) ? 'dismiss' : 'none');
+      }
+    }
     else if (Math.abs(dx) > 8 || Math.abs(dy) > 8) {
       if (tg.type === 'edge') INP.mode = horiz && dx > 0 ? 'edge' : (!horiz ? 'scroll' : 'none');
-      else if (tg.type === 'sheet') { const tag = tg.hit && tg.hit.tag; INP.mode = (tag === 'lyrics' || tag === 'queue') && !horiz ? 'list' : (!horiz && (dy > 0 || SH.drag > 0 || (SH.target === 1 && dy < -8)) ? 'dismiss' : 'none'); }
       else if (tg.type === 'mini') {
         if (Math.abs(dx) > Math.abs(dy) * .65) INP.mode = 'miniSwipe';
         else if (dy > 8) { INP.mode = 'miniDismiss'; _miniDismissHaptic = false; }
@@ -3180,7 +3274,8 @@ $out.addEventListener('pointermove', e => {
       SH.lastTouch = now;
       let nextD = SH.drag + (SH.drag < 0 || (SH.drag + ddy < 0) ? ddy * .18 : ddy);
       SH.drag = Math.max(-16, nextD);
-      redraw(); break;
+      redraw();
+      break;
     }
     case 'miniSwipe': NAV.miniDx = clamp(dx, -160, 160); D.ov = true; break;
     case 'miniDismiss': {
@@ -3196,7 +3291,8 @@ $out.addEventListener('pointermove', e => {
       D.ov = D.gl = true;
       break;
     }
-    case 'swipeRow': {
+    case 'swipeRow':
+    case 'swipeQueueRow': {
       const nx = swqLimit(SWQ.baseX + (p.x - SWQ.startX));
       SWQ.x = nx;
       const c = -nx >= SWQ_THRESHOLD - 0.5;
@@ -3204,7 +3300,9 @@ $out.addEventListener('pointermove', e => {
         SWQ.crossed = c;
         if (c) swqFireThreshold();
       }
-      redraw(); break;
+      if (typeof redrawSheetContent === 'function') redrawSheetContent();
+      else redraw();
+      break;
     }
     case 'list': {
       if (SH.mode === 'lyrics') {
@@ -3217,7 +3315,9 @@ $out.addEventListener('pointermove', e => {
         SH.qScroll = clamp(SH.qScroll - d, -56, SH.qMax + 56);
         SH.qVel = 0;
       }
-      redraw(); break;
+      if (typeof redrawSheetContent === 'function') redrawSheetContent();
+      else redraw();
+      break;
     }
   }
 });
@@ -3232,7 +3332,7 @@ function endPointer(e, cancel) {
     if (mode === 'miniDismiss') { NAV.miniDy = 0; _miniDismissHaptic = false; }
     if (mode === 'queueGrip') { SH.dragQueue = null; }
     if (mode === 'outDrawerDrag') { OUT_DRAWER.drag = 0; }
-    if (mode === 'swipeRow' || SWQ.state === 'paused') { swqClose(); }
+    if (mode === 'swipeRow' || mode === 'swipeQueueRow' || SWQ.state === 'paused') { swqClose(); }
     SH.scrub = null;
     SH.volDrag = false;
     redraw();
@@ -3271,9 +3371,32 @@ function endPointer(e, cancel) {
   }
   if (mode === 'scrub') { seek(SH.scrub * cur().dur); SH.scrub = null; redraw(); return; }
   if (mode === 'vol') { SH.volDrag = false; redraw(); return; }
-  if (mode === 'setDrag') { redraw(); return; }
+  if (mode === 'setDrag') { if (typeof flushPrefsSave === 'function') flushPrefsSave(); redraw(); return; }
   if (mode === 'lqDrag') {
     if (tg && tg.hit && tg.hit.lqCommit) tg.hit.lqCommit();
+    redraw(); return;
+  }
+  if (mode === 'swipeQueueRow') {
+    const nowMs = performance.now();
+    const lastS = INP.samples.length ? INP.samples[INP.samples.length - 1] : null;
+    const vx = (lastS && (nowMs - lastS.t) > 90) ? 0 : clamp(v.x, -3000, 3000);
+    const flick = vx < -900 && -SWQ.x > SWQ_THRESHOLD * 0.55;
+    if ((SWQ.crossed || flick) && SWQ.tr) {
+      if (!SWQ.crossed) {
+        SWQ.crossed = true;
+        swqFireThreshold();
+      }
+      const snapSw = { x: SWQ.x, v: vx, crossP: SWQ.crossP, hitT: SWQ.hitT };
+      const remIdx = SWQ.qIdx;
+      const remTr = SWQ.tr;
+      swqReset();
+      if (typeof window.removeFromQueue === 'function') window.removeFromQueue(remIdx, remTr, snapSw);
+      else if (typeof removeFromQueue === 'function') removeFromQueue(remIdx, remTr, snapSw);
+    } else {
+      SWQ.target = 0;
+      SWQ.v = vx;
+      SWQ.state = 'returning';
+    }
     redraw(); return;
   }
   if (mode === 'swipeRow') {

@@ -12,16 +12,17 @@ import org.json.JSONObject
 object BetterLyrics {
 
     private val http = OkHttpClient.Builder()
-        .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-        .callTimeout(6, java.util.concurrent.TimeUnit.SECONDS)
+        .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .callTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
     suspend fun lyrics(title: String, artist: String, durationMs: Long): Lyrics? =
         withContext(Dispatchers.IO) {
             val titles = title.titleVariants()
             if (titles.isEmpty()) return@withContext null
-            val artists = listOf(artist.primaryArtist(), artist.trim())
+            val primary = artist.primaryArtist()
+            val artists = listOf(primary, artist.trim(), primary.foldDiacritics())
                 .filter { it.isNotBlank() }
                 .distinct()
             if (artists.isEmpty()) return@withContext null

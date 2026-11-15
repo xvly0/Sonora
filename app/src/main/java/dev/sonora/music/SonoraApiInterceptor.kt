@@ -800,6 +800,7 @@ object SonoraApiInterceptor {
         val appCtx = context.applicationContext ?: context
         appContext = appCtx
         SonoraLocaleManager.attach(appCtx)
+        SonoraDownloadManager.attach(appCtx)
         SnapshotDiskCache.attach(appCtx)
         CoverDiskCache.attach(appCtx.cacheDir)
         try {
@@ -1160,6 +1161,19 @@ object SonoraApiInterceptor {
     )
 
     private val canonicalSongMetaCache = ConcurrentHashMap<String, CanonicalSongMeta>()
+
+    private fun putCanonicalSongMeta(key: String, meta: CanonicalSongMeta) {
+        if (canonicalSongMetaCache.size >= MAX_CANONICAL_CACHE_ENTRIES && !canonicalSongMetaCache.containsKey(key)) {
+            var toRemove = (MAX_CANONICAL_CACHE_ENTRIES / 4).coerceAtLeast(1)
+            val it = canonicalSongMetaCache.keys.iterator()
+            while (it.hasNext() && toRemove > 0) {
+                it.next()
+                it.remove()
+                toRemove--
+            }
+        }
+        canonicalSongMetaCache[key] = meta
+    }
     private val canonicalSongMissUntil = ConcurrentHashMap<String, Long>()
     private const val CANONICAL_META_TTL_MS = 7L * 24 * 60 * 60 * 1000L
     private const val CANONICAL_MISS_TTL_MS = 15L * 60 * 1000L
@@ -1182,6 +1196,14 @@ object SonoraApiInterceptor {
         return true
     }
 
+    private fun parseCanonicalMetaSnapshot(rawJson: String): CanonicalSongMeta? =
+        runCatching {
+            val obj = JSONObject(rawJson)
+            val coverUrl = obj.optString("coverUrl", "").trim()
+            val albumName = obj.optString("albumName", "").trim()
+            if (coverUrl.isNotBlank()) CanonicalSongMeta(coverUrl, albumName) else null
+        }.getOrNull()
+
     internal fun peekCachedCanonicalSongMeta(
         title: String,
         artist: String,
@@ -1199,10 +1221,20 @@ object SonoraApiInterceptor {
             ""
         }
         val gl = SonoraLocaleManager.resolvedCountry
-        if (effectiveHint.isNotEmpty()) {
-            canonicalSongMetaCache["$gl|$targetTitleCore|$artistCompact|$effectiveHint"]?.let { return it }
+        val hintKey = if (effectiveHint.isNotEmpty()) "$gl|$targetTitleCore|$artistCompact|$effectiveHint" else null
+        val baseKey = "$gl|$targetTitleCore|$artistCompact|"
+        hintKey?.let { canonicalSongMetaCache[it] }?.let { return it }
+        canonicalSongMetaCache[baseKey]?.let { return it }
+        val keysToCheck = if (hintKey != null) listOf(hintKey, baseKey) else listOf(baseKey)
+        for (k in keysToCheck) {
+            val snap = SnapshotDiskCache.get("canonsong_v4:$k", freshTtlMs = CANONICAL_META_TTL_MS) ?: continue
+            val parsed = parseCanonicalMetaSnapshot(snap.data)
+            if (parsed != null) {
+                putCanonicalSongMeta(k, parsed)
+                return parsed
+            }
         }
-        return canonicalSongMetaCache["$gl|$targetTitleCore|$artistCompact|"]
+        return null
     }
 
     private suspend fun fetchItunesSearchJson(url: String): Pair<String?, Boolean> =
@@ -1497,14 +1529,9 @@ object SonoraApiInterceptor {
 
         val diskKey = "canonsong_v4:$key"
         SnapshotDiskCache.get(diskKey, freshTtlMs = CANONICAL_META_TTL_MS)?.let { snap ->
-            val parsed = runCatching {
-                val obj = JSONObject(snap.data)
-                val coverUrl = obj.optString("coverUrl", "").trim()
-                val albumName = obj.optString("albumName", "").trim()
-                if (coverUrl.isNotBlank()) CanonicalSongMeta(coverUrl, albumName) else null
-            }.getOrNull()
+            val parsed = parseCanonicalMetaSnapshot(snap.data)
             if (parsed != null) {
-                canonicalSongMetaCache[key] = parsed
+                putCanonicalSongMeta(key, parsed)
                 return parsed
             }
         }
@@ -1514,7 +1541,7 @@ object SonoraApiInterceptor {
             .orEmpty().ifBlank { cleanArtist }
 
         suspend fun queryAppleCatalog(): CanonicalSongMeta? {
-            val appleSongMatch = withTimeoutOrNull(1400L) {
+            val appleSongMatch = withTimeoutOrNull(1500L) {
                 AppleCatalog.songMatch(cleanTitle, leadArtist, effectiveHint)
             }
             return appleSongMatch?.takeIf { it.coverUrl.isNotBlank() }?.let { match ->
@@ -1600,10 +1627,7 @@ object SonoraApiInterceptor {
         ) {
             rememberResolvedAlbumThumb(resolvedMeta.albumName, leadArtist, resolvedMeta.coverUrl)
         }
-        if (canonicalSongMetaCache.size >= MAX_CANONICAL_CACHE_ENTRIES) {
-            canonicalSongMetaCache.clear()
-        }
-        canonicalSongMetaCache[key] = resolvedMeta
+        putCanonicalSongMeta(key, resolvedMeta)
         canonicalSongMissUntil.remove(key)
         SnapshotDiskCache.putAsync(
             diskKey,
@@ -1953,8 +1977,11 @@ object SonoraApiInterceptor {
                     uri.getQueryParameter("id").orEmpty(),
                 )
                 path.startsWith("/api/prefetch/") -> handlePrefetch(path.removePrefix("/api/prefetch/"))
-                path.startsWith("/api/download_track/") -> handleDownloadTrack(path.removePrefix("/api/download_track/"))
+                path.startsWith("/api/download_track/") -> handleDownloadTrack(path.removePrefix("/api/download_track/"), uri)
                 path.startsWith("/api/remove_download/") -> handleRemoveDownload(path.removePrefix("/api/remove_download/"))
+                path.startsWith("/api/delete_download/") -> handleRemoveDownload(path.removePrefix("/api/delete_download/"))
+                path == "/api/downloads/status" -> handleDownloadsStatus(uri)
+                path.startsWith("/api/downloads/status/") -> handleDownloadTrackStatus(path.removePrefix("/api/downloads/status/"))
                 path.startsWith("/api/stream/") -> handleStream(path.removePrefix("/api/stream/"), requestHeaders)
                 else -> errorResponse(404, localizedMsg("Endpoint non trovato: $path", "Endpoint not found: $path"))
             }
@@ -3229,8 +3256,9 @@ object SonoraApiInterceptor {
             val firstArtist = primaryArtistName(song)
             val albName = song.album?.name?.trim().orEmpty()
             val isComp = albName.isEmpty() || isLikelyCompilationAlbum(albName, song.title, firstArtist)
-            if (firstArtist.isNotBlank()) {
-                idx to Triple(song, firstArtist, if (isComp) "" else albName)
+            val hintAlb = if (isComp) "" else albName
+            if (firstArtist.isNotBlank() && peekCachedCanonicalSongMeta(song.title, firstArtist, hintAlb) == null) {
+                idx to Triple(song, firstArtist, hintAlb)
             } else {
                 null
             }
@@ -3248,12 +3276,12 @@ object SonoraApiInterceptor {
                 Triple(emptyMap<Int, CanonicalSongMeta>(), emptyMap<String, String>(), emptyMap<String, String>())
             } else {
                 coroutineScope {
-                    val songSem = Semaphore(5)
+                    val songSem = Semaphore(8)
                     val songDefs = canonicalTargets.map { (idx, triple) ->
                         async(Dispatchers.IO) {
                             val (song, firstArtist, hintAlb) = triple
                             val meta = songSem.withPermit {
-                                withTimeoutOrNull(2400L) {
+                                withTimeoutOrNull(3000L) {
                                     resolveCanonicalSongMeta(song.title, firstArtist, hintAlb)
                                 }
                             }
@@ -3833,22 +3861,29 @@ object SonoraApiInterceptor {
         artistThumbFor: ((SongItem) -> String?)? = null,
     ): JSONArray = coroutineScope {
         if (songs.isEmpty()) return@coroutineScope JSONArray()
-        val scopeSongs = songs.take(maxResolve)
-        val sem = Semaphore(5)
+        val resolveLimit = maxResolve.coerceIn(0, songs.size)
+        val sem = Semaphore(8)
 
         val canonicalMap = HashMap<Int, CanonicalSongMeta>()
-        val needCanonical = scopeSongs.mapIndexedNotNull { idx, s ->
+        val needCanonical = ArrayList<Pair<Int, Triple<SongItem, String, String>>>()
+        songs.forEachIndexed { idx, s ->
             val firstArt = primaryArtistName(s)
-            if (firstArt.isNotEmpty()) idx to (s to firstArt) else null
+            if (firstArt.isEmpty()) return@forEachIndexed
+            val rawAlb = s.album?.name?.trim().orEmpty()
+            val hintAlb = if (rawAlb.isNotEmpty() && !isLikelyCompilationAlbum(rawAlb, s.title, firstArt)) rawAlb else ""
+            val cached = peekCachedCanonicalSongMeta(s.title, firstArt, hintAlb)
+            if (cached != null) {
+                canonicalMap[idx] = cached
+            } else if (idx < resolveLimit) {
+                needCanonical.add(idx to Triple(s, firstArt, hintAlb))
+            }
         }
         if (needCanonical.isNotEmpty()) {
-            needCanonical.map { (idx, pair) ->
+            needCanonical.map { (idx, target) ->
                 async(Dispatchers.IO) {
-                    val (song, firstArt) = pair
-                    val rawAlb = song.album?.name?.trim().orEmpty()
-                    val hintAlb = if (rawAlb.isNotEmpty() && !isLikelyCompilationAlbum(rawAlb, song.title, firstArt)) rawAlb else ""
+                    val (song, firstArt, hintAlb) = target
                     val meta = sem.withPermit {
-                        withTimeoutOrNull(2400L) {
+                        withTimeoutOrNull(3000L) {
                             resolveCanonicalSongMeta(song.title, firstArt, hintAlb)
                         }
                     }
@@ -3858,8 +3893,9 @@ object SonoraApiInterceptor {
         }
 
         val fallbackAlbums = LinkedHashMap<String, Pair<String, String>>()
-        for ((idx, s) in scopeSongs.withIndex()) {
+        for (idx in 0 until resolveLimit) {
             if (idx in canonicalMap) continue
+            val s = songs[idx]
             val albName = s.album?.name?.trim().orEmpty()
             val firstArt = primaryArtistName(s)
             if (albName.isNotEmpty() && firstArt.isNotEmpty() && !isLikelyCompilationAlbum(albName, s.title, firstArt)) {
@@ -3873,7 +3909,7 @@ object SonoraApiInterceptor {
             fallbackAlbums.values.map { (albName, firstArt) ->
                 async(Dispatchers.IO) {
                     sem.withPermit {
-                        withTimeoutOrNull(1400L) {
+                        withTimeoutOrNull(1800L) {
                             resolveAlbumThumb(albName, firstArt, thumbSize)
                         }
                     }
@@ -3917,7 +3953,7 @@ object SonoraApiInterceptor {
         ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
         val playlistResult = YouTube.playlist(id).getOrNull()
         if (playlistResult != null) {
-            val tracksArr = enrichSongsToJson(playlistResult.songs, maxResolve = 24, withTrackNo = true)
+            val tracksArr = enrichSongsToJson(playlistResult.songs, maxResolve = 40, withTrackNo = true)
             val totalDur = playlistResult.songs.sumOf { it.duration ?: 0 }
             val json = playlistResult.playlist.toJson(withTracks = false).apply {
                 put("tracks", tracksArr)
@@ -3949,10 +3985,10 @@ object SonoraApiInterceptor {
         )
         val audioOnly = deduped.filter { !it.isVideoSong }
         val radioSongs = if (audioOnly.size >= 5) audioOnly else deduped
-        val tracksArr = enrichSongsToJson(radioSongs, maxResolve = 20)
+        val tracksArr = enrichSongsToJson(radioSongs, maxResolve = 40)
         val root = JSONObject().apply { put("tracks", tracksArr) }
         val rootStr = root.toString()
-        ApiCache.put(cacheKey, rootStr, 600)
+        ApiCache.put(cacheKey, rootStr, if (AppleCatalog.hasReadyToken()) 600 else 15)
         jsonResponse(rootStr)
     }
 
@@ -4785,7 +4821,7 @@ object SonoraApiInterceptor {
             refreshSalt = req.refreshSalt
         )
 
-        val tracksArr = enrichSongsToJson(ranked, maxResolve = 15)
+        val tracksArr = enrichSongsToJson(ranked, maxResolve = 30)
         return@coroutineScope JSONObject().apply {
             put("tracks", tracksArr)
             put("seedCount", selectedSeeds.size)
@@ -5747,15 +5783,47 @@ object SonoraApiInterceptor {
         return jsonResponse("{\"ok\":true}")
     }
 
-    private fun handleDownloadTrack(rawId: String): WebResourceResponse = runBlocking {
-        val ctx = appContext ?: return@runBlocking errorResponse(503, "App context not ready")
-        val id = try { URLDecoder.decode(rawId, "UTF-8") } catch (_: Exception) { rawId }.trim()
-        if (id.isBlank()) return@runBlocking errorResponse(400, "Missing track id")
-        val ok = withTimeoutOrNull(35_000L) {
-            SonoraPlaybackService.cacheTrackAudio(ctx, id)
-        } ?: false
-        if (ok) {
-            jsonResponse(JSONObject().apply { put("ok", true); put("id", id) }.toString())
+    private fun handleDownloadTrack(rawId: String, uri: Uri): WebResourceResponse {
+        val ctx = appContext ?: return errorResponse(503, "App context not ready")
+        val decoded = try { URLDecoder.decode(rawId, "UTF-8") } catch (_: Exception) { rawId }
+        val id = SonoraDownloadManager.normalizeTrackId(decoded)
+        if (id.isBlank()) return errorResponse(400, "Missing track id")
+
+        val asyncMode = uri.getQueryParameter("async") == "1" || uri.getQueryParameter("mode") == "queue"
+        if (asyncMode) {
+            SonoraDownloadManager.enqueue(ctx, id)
+            val entry = SonoraDownloadManager.getDownloadEntry(ctx, id)
+            return jsonResponse(
+                JSONObject().apply {
+                    put("ok", true)
+                    put("id", id)
+                    put("queued", true)
+                    put("status", entry?.status ?: SonoraDownloadManager.STATUS_QUEUED)
+                }.toString()
+            )
+        }
+
+        if (SonoraDownloadManager.isTrackDownloaded(ctx, id)) {
+            return jsonResponse(
+                JSONObject().apply {
+                    put("ok", true)
+                    put("id", id)
+                    put("status", SonoraDownloadManager.STATUS_COMPLETED)
+                }.toString()
+            )
+        }
+
+        val ok = runBlocking {
+            SonoraDownloadManager.downloadAndAwait(ctx, id, timeoutMs = 90_000L)
+        }
+        return if (ok) {
+            jsonResponse(
+                JSONObject().apply {
+                    put("ok", true)
+                    put("id", id)
+                    put("status", SonoraDownloadManager.STATUS_COMPLETED)
+                }.toString()
+            )
         } else {
             errorResponse(502, localizedMsg("Download audio non riuscito per $id", "Audio download failed for $id"))
         }
@@ -5763,11 +5831,30 @@ object SonoraApiInterceptor {
 
     private fun handleRemoveDownload(rawId: String): WebResourceResponse {
         val ctx = appContext
-        val id = try { URLDecoder.decode(rawId, "UTF-8") } catch (_: Exception) { rawId }.trim()
+        val decoded = try { URLDecoder.decode(rawId, "UTF-8") } catch (_: Exception) { rawId }
+        val id = SonoraDownloadManager.normalizeTrackId(decoded)
         if (ctx != null && id.isNotBlank()) {
-            SonoraPlaybackService.removeCachedTrackAudio(ctx, id)
+            SonoraDownloadManager.deleteDownloadedTrack(ctx, id)
         }
-        return jsonResponse("{\"ok\":true}")
+        return jsonResponse(JSONObject().apply { put("ok", true); put("id", id) }.toString())
+    }
+
+    private fun handleDownloadsStatus(uri: Uri): WebResourceResponse {
+        val ctx = appContext ?: return errorResponse(503, "App context not ready")
+        val rawId = uri.getQueryParameter("id")?.trim().orEmpty()
+        return if (rawId.isNotEmpty()) {
+            jsonResponse(SonoraDownloadManager.getTrackStatusJson(ctx, rawId))
+        } else {
+            jsonResponse(SonoraDownloadManager.getDownloadsStatusJson(ctx))
+        }
+    }
+
+    private fun handleDownloadTrackStatus(rawId: String): WebResourceResponse {
+        val ctx = appContext ?: return errorResponse(503, "App context not ready")
+        val decoded = try { URLDecoder.decode(rawId, "UTF-8") } catch (_: Exception) { rawId }
+        val id = SonoraDownloadManager.normalizeTrackId(decoded)
+        if (id.isBlank()) return errorResponse(400, "Missing track id")
+        return jsonResponse(SonoraDownloadManager.getTrackStatusJson(ctx, id))
     }
 
     private fun fetchStreamResponse(streamUrl: String, rangeHeader: String?): okhttp3.Response {
