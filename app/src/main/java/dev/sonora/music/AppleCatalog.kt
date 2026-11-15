@@ -319,7 +319,7 @@ object AppleCatalog {
         val effectiveAlbum = if (album.isNotBlank() &&
             !SonoraApiInterceptor.isLikelyCompilationAlbum(album, name, lead(artist))
         ) album.trim() else ""
-        val key = "song_meta_v2 $storefront/${artist.lowercase()}/${name.lowercase()}/${effectiveAlbum.lowercase()}"
+        val key = "song_meta_v3 $storefront/${artist.lowercase()}/${name.lowercase()}/${effectiveAlbum.lowercase()}"
         synchronized(cache) { if (cache.containsKey(key)) return cache[key] as SongCover? }
 
         when (val disk = remembered(key)) {
@@ -373,8 +373,12 @@ object AppleCatalog {
         storefront: String,
         lang: String = SonoraLocaleManager.resolvedLang,
     ): LookupOutcome<SongCover> {
-        val plain = plain(name)
-        val results = search("${lead(artist)} $plain", "songs", storefront, lang)
+        val searchTitle = if (SonoraApiInterceptor.hasTrackVariantTag(name)) {
+            SonoraApiInterceptor.stripTitleDecorations(name).ifBlank { plain(name) }
+        } else {
+            plain(name)
+        }
+        val results = search("${lead(artist)} $searchTitle", "songs", storefront, lang)
             ?: return LookupOutcome(null, authoritative = false)
         return LookupOutcome(selectCanonicalSongMatch(results, name, artist, album), authoritative = true)
     }
@@ -386,11 +390,14 @@ object AppleCatalog {
         album: String = "",
     ): SongCover? {
         val plain = plain(name)
+        val plainCompact = SonoraApiInterceptor.normCompactKey(plain)
+        val nameCompact = SonoraApiInterceptor.normCompactKey(name)
+        val hasRequestedVariant = SonoraApiInterceptor.hasTrackVariantTag(name)
         val nameLow = name.lowercase()
         val credited = credited(artist)
         val leadArtist = lead(artist)
         val effectiveAlbum = if (album.isNotBlank() &&
-            !SonoraApiInterceptor.isLikelyCompilationAlbum(album, plain, leadArtist)
+            !SonoraApiInterceptor.isLikelyCompilationAlbum(album, name, leadArtist)
         ) album.trim() else ""
 
         val matches = results.mapNotNull { it.jsonObject["attributes"]?.jsonObject }
@@ -419,11 +426,12 @@ object AppleCatalog {
             val albumName: String,
             val cleanAlbum: String,
             val trackName: String,
+            val requestedVariantMatch: Boolean,
+            val fullDecoratedTitleMatch: Boolean,
             val isCompTitle: Boolean,
             val isCompGenre: Boolean,
             val isSoundtrackGenre: Boolean,
             val isSingleOrEp: Boolean,
-            val isUnrequestedVariant: Boolean,
             val isReissue: Boolean,
             val releaseDayNum: Int?,
         )
@@ -434,12 +442,20 @@ object AppleCatalog {
                 ?: return@mapNotNull null
             val trackName = row["name"]?.jsonPrimitive?.content.orEmpty().trim()
             val albumName = row["albumName"]?.jsonPrimitive?.content.orEmpty().trim()
+            // Never overwrite a track's cover with an unrequested remix/live/acoustic/etc. variant.
+            if (SonoraApiInterceptor.isUnrequestedTrackVariant(trackName, name)) {
+                return@mapNotNull null
+            }
             val cleanAlbum = albumName.replace(singleSuffixRe, "").trim().ifBlank { albumName }
             val genres = row["genreNames"]?.jsonArray
                 ?.mapNotNull { runCatching { it.jsonPrimitive.content }.getOrNull() }
                 .orEmpty()
+            val requestedVariantMatch = SonoraApiInterceptor.isRequestedTrackVariantMatch(trackName, name)
+            val fullDecoratedTitleMatch = nameCompact.isNotEmpty() &&
+                nameCompact != plainCompact &&
+                SonoraApiInterceptor.normCompactKey(trackName) == nameCompact
             val isCompTitle = albumName.isBlank() ||
-                SonoraApiInterceptor.isLikelyCompilationAlbum(albumName, plain, leadArtist)
+                SonoraApiInterceptor.isLikelyCompilationAlbum(albumName, name, leadArtist)
             val isCompGenre = genres.any {
                 it.equals("Compilation", ignoreCase = true) ||
                     it.equals("Fitness & Workout", ignoreCase = true)
@@ -450,7 +466,6 @@ object AppleCatalog {
             } && !SonoraApiInterceptor.hasSoundtrackHint(name, effectiveAlbum)
             val isSingleOrEp = sameTitle(albumName, name) ||
                 singleSuffixRe.containsMatchIn(albumName)
-            val isUnrequestedVariant = SonoraApiInterceptor.isUnrequestedTrackVariant(trackName, name)
             val isReissue = SonoraApiInterceptor.isReissueAlbumTitle(albumName) ||
                 SonoraApiInterceptor.isReissueAlbumTitle(trackName)
             val releaseDayNum = SonoraApiInterceptor.parseReleaseDayNum(
@@ -461,30 +476,39 @@ object AppleCatalog {
                 albumName = albumName,
                 cleanAlbum = cleanAlbum,
                 trackName = trackName,
+                requestedVariantMatch = requestedVariantMatch,
+                fullDecoratedTitleMatch = fullDecoratedTitleMatch,
                 isCompTitle = isCompTitle,
                 isCompGenre = isCompGenre,
                 isSoundtrackGenre = isSoundtrackGenre,
                 isSingleOrEp = isSingleOrEp,
-                isUnrequestedVariant = isUnrequestedVariant,
                 isReissue = isReissue,
                 releaseDayNum = releaseDayNum,
             ) to coverUrl
         }
         if (parsed.isEmpty()) return null
 
-        val cleanStudioPool = parsed.map { it.first }.filter {
+        val variantScoped = if (hasRequestedVariant &&
+            parsed.any { it.first.requestedVariantMatch && it.first.releaseDayNum != null }
+        ) {
+            parsed.filter { it.first.requestedVariantMatch }
+        } else {
+            parsed
+        }
+
+        val cleanStudioPool = variantScoped.map { it.first }.filter {
             !it.isCompTitle && !it.isCompGenre && !it.isSingleOrEp &&
-                !it.isUnrequestedVariant && !it.isSoundtrackGenre && it.releaseDayNum != null
+                !it.isSoundtrackGenre && it.releaseDayNum != null
         }
         val anchorPool = cleanStudioPool.ifEmpty {
-            parsed.map { it.first }.filter {
-                !it.isCompTitle && !it.isCompGenre && !it.isUnrequestedVariant && it.releaseDayNum != null
+            variantScoped.map { it.first }.filter {
+                !it.isCompTitle && !it.isCompGenre && it.releaseDayNum != null
             }
         }
         val anchorDay = anchorPool.minOfOrNull { it.releaseDayNum!! }
-        val hasStudioAnchor = cleanStudioPool.isNotEmpty() || parsed.any {
+        val hasStudioAnchor = cleanStudioPool.isNotEmpty() || variantScoped.any {
             val r = it.first
-            !r.isCompTitle && !r.isCompGenre && !r.isSingleOrEp && !r.isUnrequestedVariant && !r.isSoundtrackGenre
+            !r.isCompTitle && !r.isCompGenre && !r.isSingleOrEp && !r.isSoundtrackGenre
         }
 
         var best: Pair<ScoredRow, String>? = null
@@ -492,15 +516,16 @@ object AppleCatalog {
         for (entry in parsed) {
             val r = entry.first
             var score = 0
-            score += if (!r.isCompTitle && !r.isCompGenre) 30 else -30
-            if (r.isSoundtrackGenre) score -= 10
+            score += if (!r.isCompTitle && !r.isCompGenre) 30 else -52
+            if (r.isSoundtrackGenre) score -= 12
             if (!r.isSingleOrEp) {
                 score += 16
             } else if (hasStudioAnchor) {
                 score -= 8
             }
-            if (r.isUnrequestedVariant) score -= 32
-            if (SonoraApiInterceptor.isRequestedTrackVariantMatch(r.trackName, name)) score += 14
+            if (hasRequestedVariant && !r.requestedVariantMatch) score -= 48
+            if (r.requestedVariantMatch) score += 14
+            if (r.fullDecoratedTitleMatch) score += 16
             if (r.trackName.equals(name, ignoreCase = true)) score += 8
 
             val hintMatch = effectiveAlbum.isNotBlank() && sameTitle(r.albumName, effectiveAlbum)

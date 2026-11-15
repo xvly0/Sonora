@@ -1158,7 +1158,8 @@ class SonoraPlaybackService : MediaSessionService() {
         if (player.mediaItemCount == nextIdx) {
             player.addMediaItem(nextItem)
         } else if (player.mediaItemCount > nextIdx) {
-            if (player.getMediaItemAt(nextIdx).mediaId != nextItem.mediaId) {
+            val existingNext = player.getMediaItemAt(nextIdx)
+            if (existingNext.mediaId != nextItem.mediaId || existingNext.mediaMetadata != nextItem.mediaMetadata) {
                 player.replaceMediaItem(nextIdx, nextItem)
             }
             if (player.mediaItemCount > nextIdx + 1) {
@@ -1187,6 +1188,59 @@ class SonoraPlaybackService : MediaSessionService() {
             val nextItem = buildMediaItem(trackId, title, artist, thumbUrl)
             syncNextMediaItemOnMain(nextItem)
             prewarmNextAudioBytes(trackId)
+        }
+    }
+
+    /**
+     * Updates the artwork URL for the currently active or queued next track in-place
+     * without recreating or re-preparing the underlying audio source.
+     */
+    fun updateTrackArtwork(trackId: String, thumbUrl: String?) {
+        val cleanId = trackId.trim()
+        val newThumb = thumbUrl?.trim().orEmpty()
+        if (cleanId.isEmpty() || newThumb.isEmpty()) return
+        scope.launch(Dispatchers.Main) {
+            val newArtUri = resolveArtworkUri(newThumb, cleanId) ?: return@launch
+            if (cleanId == currentTrackId) {
+                val thumbChanged = currentThumb != newThumb
+                currentThumb = newThumb
+                if (::player.isInitialized && player.mediaItemCount > 0) {
+                    val curIdx = player.currentMediaItemIndex
+                    if (curIdx in 0 until player.mediaItemCount) {
+                        val item = player.getMediaItemAt(curIdx)
+                        if (item.mediaId == cleanId && item.mediaMetadata.artworkUri != newArtUri) {
+                            val updatedMeta = item.mediaMetadata.buildUpon()
+                                .setArtworkUri(newArtUri)
+                                .build()
+                            val updatedItem = item.buildUpon()
+                                .setMediaMetadata(updatedMeta)
+                                .build()
+                            player.replaceMediaItem(curIdx, updatedItem)
+                        }
+                    }
+                }
+                if (thumbChanged) {
+                    notifyState()
+                }
+            }
+            if (cleanId == nextTrackId) {
+                nextThumb = newThumb
+                if (::player.isInitialized) {
+                    val nextIdx = player.currentMediaItemIndex.coerceAtLeast(0) + 1
+                    if (nextIdx in 1 until player.mediaItemCount) {
+                        val item = player.getMediaItemAt(nextIdx)
+                        if (item.mediaId == cleanId && item.mediaMetadata.artworkUri != newArtUri) {
+                            val updatedMeta = item.mediaMetadata.buildUpon()
+                                .setArtworkUri(newArtUri)
+                                .build()
+                            val updatedItem = item.buildUpon()
+                                .setMediaMetadata(updatedMeta)
+                                .build()
+                            player.replaceMediaItem(nextIdx, updatedItem)
+                        }
+                    }
+                }
+            }
         }
     }
 

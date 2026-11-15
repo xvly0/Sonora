@@ -47,14 +47,15 @@ function _syncSavedIndex() {
     if (x && x.id) _savedIdSet.add(x.id);
   }
 }
-const _COMPILATION_ALBUM_RE = /\b(mi\s+manchi|rap\s+italiano|hit\s+mania|hits|top\s+hits|top\s+\d+|compilation|best\s+of|the\s+best|greatest\s+hits|antologia|anthology|raccolta|collezione|collection|essentials?|le\s+pi[uù]\s+belle|artisti\s+vari|various\s+artists|estate\s+\d*|summer\s+hits|mix\s+\d*|mega\s+mix|party\s+hits|workout|chill\s+hits|love\s+songs|canzoni\s+d'amore|100%\s+|successi|classifica|sanremo\s+\d*|anni\s+(?:60|70|80|90|2000)|radio\s+hits|italia\s+hits)\b/gi;
-function _isCompilationAlbumName(alb, title) {
+const _COMPILATION_ALBUM_RE = /\b(mi\s+manchi|rap\s+italiano|hit\s+mania|hits|top\s+hits|top\s+\d+|compilation|best\s+of|the\s+best|greatest\s+hits|antologia|anthology|raccolta|collezione|collection|essentials?|le\s+pi[uù]\s+belle|artisti\s+vari|various\s+artists|estate\s+\d*|summer\s+hits|mix\s+\d*|mega\s+mix|party\s+hits|workout|chill\s+hits|love\s+songs|canzoni\s+d'amore|100%\s+|successi|classifica|sanremo\s+\d*|anni\s+(?:60|70|80|90|2000)|radio\s+hits|italia\s+hits|remix(?:es)?|reworked|club\s+mix|dj\s+mix|extended\s+mix|mashup)\b/gi;
+const _NON_STUDIO_ALBUM_HINT_RE = /\b(soundtrack|ost|motion\s+picture|(?:super\s+)?deluxe|edition|reissue|anniversary)\b/gi;
+function _albumMatchesNonCanonicalRe(alb, title, re) {
   if (!alb || typeof alb !== 'string') return false;
   const normAlb = _normSearch(alb);
   if (!normAlb) return false;
   const normTitle = _normSearch(title);
   if (normTitle && normAlb === normTitle) return false;
-  const matches = alb.match(_COMPILATION_ALBUM_RE);
+  const matches = alb.match(re);
   if (!matches || !matches.length) return false;
   if (!normTitle) return true;
   for (let i = 0; i < matches.length; i++) {
@@ -62,6 +63,12 @@ function _isCompilationAlbumName(alb, title) {
     if (!kw || normTitle.indexOf(kw) < 0) return true;
   }
   return false;
+}
+function _isCompilationAlbumName(alb, title) {
+  return _albumMatchesNonCanonicalRe(alb, title, _COMPILATION_ALBUM_RE);
+}
+function _isNonStudioAlbumHint(alb, title) {
+  return _isCompilationAlbumName(alb, title) || _albumMatchesNonCanonicalRe(alb, title, _NON_STUDIO_ALBUM_HINT_RE);
 }
 var _searchCacheUpgradeHook = null;
 var _searchCacheAlbumUpgradeHook = null;
@@ -322,10 +329,9 @@ function isAppleAlbumThumbCold(title, artist) {
   return (_albThumbCold[ck] || 0) > Date.now();
 }
 if (typeof window !== 'undefined') window.isAppleAlbumThumbCold = isAppleAlbumThumbCold;
-function _invalidateCoverCaches(k, sameBase) {
+function _invalidateCoverCaches(k, sameBase, keepRealArt) {
   if (!k || sameBase) return;
-  if (typeof ARTC !== 'undefined' && ARTC[k] && ARTC[k]._real) return;
-  if (typeof ARTC !== 'undefined') delete ARTC[k];
+  if (typeof ARTC !== 'undefined' && !(keepRealArt && ARTC[k] && ARTC[k]._real)) delete ARTC[k];
   if (typeof PALC !== 'undefined') delete PALC[k];
   if (typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[k];
   if (typeof TINTC !== 'undefined') { delete TINTC[k + 'd']; delete TINTC[k + 'l']; }
@@ -344,7 +350,7 @@ function _applyAlbumThumb(id, thumb, title, artist) {
       : (!sameApple || /[?&]s=1200\b/.test(effAlbThumb) || /[?&]s=288\b/.test(alb.thumb));
     if (alb.thumb !== effAlbThumb && canUpdateAlb) {
       alb.thumb = effAlbThumb;
-      _invalidateCoverCaches(id, sameApple || sameBase);
+      _invalidateCoverCaches(id, sameBase, sameApple);
     }
   }
   if (typeof TRACKS !== 'undefined' && Array.isArray(TRACKS)) {
@@ -362,7 +368,7 @@ function _applyAlbumThumb(id, thumb, title, artist) {
           : (!t.canonicalCover && (!tSameApple || /[?&]s=1200\b/.test(effTrkThumb) || /[?&]s=288\b/.test(t.thumb)));
         if (t.thumb !== effTrkThumb && canUpdateTrk) {
           t.thumb = effTrkThumb;
-          _invalidateCoverCaches(t.id, tSameApple || tSameBase);
+          _invalidateCoverCaches(t.id, tSameBase, tSameApple);
           if (typeof preloadArt === 'function') preloadArt(t, false);
         }
       }
@@ -432,8 +438,63 @@ function _cleanTrackThumbKey(title, artist) {
   const leadArtist = _cleanArtistThumbName(artist || '').replace(/\u2019/g, "'").toLowerCase();
   return cleanTitle + '|' + leadArtist;
 }
+function _resolveMediaArtUrl(u) {
+  if (!u || typeof u !== 'string') return '';
+  if (/^(?:https?:|data:|blob:)/i.test(u)) return u;
+  return (typeof location !== 'undefined' && location.origin ? location.origin : '') + u;
+}
+function _pushNativeTrackArtwork(tr) {
+  if (!tr || !tr.id || !tr.thumb) return;
+  try {
+    if (typeof window !== 'undefined' && window.SonoraNative && typeof window.SonoraNative.updateTrackArtwork === 'function') {
+      window.SonoraNative.updateTrackArtwork(String(tr.id), String(tr.thumb));
+    }
+  } catch (e) {}
+}
+function _syncCurrentTrackArtwork(tr, alsoNative) {
+  if (!tr) return;
+  try {
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator && typeof MediaMetadata === 'function') {
+      const src = _resolveMediaArtUrl(tr.thumb);
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: tr.title || '',
+        artist: tr.artist || '',
+        album: tr.albumTitle || '',
+        artwork: src ? [{ src, sizes: '600x600', type: 'image/jpeg' }] : []
+      });
+    }
+  } catch (e) {}
+  if (alsoNative !== false) _pushNativeTrackArtwork(tr);
+}
+function _snapshotPlaybackArtwork() {
+  const curTr = typeof cur === 'function' ? cur() : null;
+  let nextIdx = -1;
+  if (typeof PL !== 'undefined' && PL && Array.isArray(PL.queue) && PL.repeat !== 2) {
+    if (PL.qi + 1 < PL.queue.length) nextIdx = PL.qi + 1;
+    else if (PL.repeat === 1 && PL.queue.length > 0) nextIdx = 0;
+  }
+  const nextTr = nextIdx >= 0 ? PL.queue[nextIdx] : null;
+  return {
+    curTr,
+    curThumb: curTr ? curTr.thumb : null,
+    curAlbumTitle: curTr ? curTr.albumTitle : null,
+    nextTr,
+    nextThumb: nextTr ? nextTr.thumb : null
+  };
+}
+function _syncPlaybackArtworkIfChanged(snap) {
+  if (!snap) return;
+  if (snap.curTr && (snap.curTr.thumb !== snap.curThumb || snap.curTr.albumTitle !== snap.curAlbumTitle)) {
+    _syncCurrentTrackArtwork(snap.curTr);
+  }
+  if (snap.nextTr && snap.nextTr.thumb !== snap.nextThumb) {
+    if (typeof syncNativeNextTrack === 'function') syncNativeNextTrack(true);
+    _pushNativeTrackArtwork(snap.nextTr);
+  }
+}
 function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
   if (!track || !thumb) return;
+  const artSnap = _snapshotPlaybackArtwork();
   const listThumb = _forceAppleListThumb(thumb);
   const resAlb = (resolvedAlbum || '').trim();
   const canon = isCanonical !== false;
@@ -449,6 +510,7 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
     if (obj.thumb !== eff) {
       obj.thumb = eff;
       anyChanged = true;
+      if (!sameBase && obj._sheetHiResUpgraded) delete obj._sheetHiResUpgraded;
       _invalidateCoverCaches(obj.id, sameBase);
     }
     if (canon && !obj.canonicalCover) { obj.canonicalCover = true; anyChanged = true; }
@@ -503,13 +565,19 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
     if (obj.album !== prevAlb || obj.albumTitle !== prevAlbTitle) anyChanged = true;
   };
   applyTo(track);
-  if (track.id && typeof LIVE !== 'undefined' && LIVE.known && LIVE.known[track.id] && LIVE.known[track.id] !== track) {
-    applyTo(LIVE.known[track.id]);
+  const knownTrack = track.id && typeof LIVE !== 'undefined' && LIVE.known && LIVE.known[track.id];
+  if (knownTrack && knownTrack !== track) {
+    applyTo(knownTrack);
   }
-  const canonicalSrc = (track.id && typeof LIVE !== 'undefined' && LIVE.known && LIVE.known[track.id]) || track;
-  if (typeof _propagateCanonicalTrack === 'function' && _propagateCanonicalTrack(canonicalSrc)) {
+  const byIdTrack = track.id && typeof BYID !== 'undefined' && BYID[track.id];
+  if (byIdTrack && byIdTrack !== track && byIdTrack !== knownTrack && (!byIdTrack.kind || byIdTrack.kind === 'track')) {
+    applyTo(byIdTrack);
+  }
+  const canonicalSrc = knownTrack || track;
+  if (typeof _propagateCanonicalTrack === 'function' && _propagateCanonicalTrack(canonicalSrc, true)) {
     anyChanged = true;
   }
+  _syncPlaybackArtworkIfChanged(artSnap);
   if (typeof preloadArt === 'function') preloadArt(track, false);
   if (anyChanged) {
     if (typeof liveSave === 'function') liveSave();
@@ -536,7 +604,7 @@ function fetchTrackThumb(track) {
       return null;
     });
   }
-  const albHint = (track.albumTitle && !(typeof _isCompilationAlbumName === 'function' && _isCompilationAlbumName(track.albumTitle, track.title)))
+  const albHint = (track.albumTitle && !(typeof _isNonStudioAlbumHint === 'function' && _isNonStudioAlbumHint(track.albumTitle, track.title)))
     ? track.albumTitle : '';
   const qs = 'title=' + encodeURIComponent(track.title) +
     '&artist=' + encodeURIComponent(track.artist) +
@@ -674,7 +742,7 @@ function ingestItem(x) {
     const bothApple = prevThumb && e.thumb && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(prevThumb) && isAppleArtistThumb(e.thumb);
     const sameBase = Boolean(prevThumb && e.thumb && typeof isSameCoverBase === 'function' && isSameCoverBase(prevThumb, e.thumb));
     if (prevThumb !== e.thumb && x.id) {
-      _invalidateCoverCaches(x.id, bothApple || sameBase);
+      _invalidateCoverCaches(x.id, sameBase, bothApple);
     }
     if (x.kind === 'album' && e.thumb && prevThumb !== e.thumb && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(e.thumb) && typeof _searchCacheAlbumUpgradeHook === 'function') {
       _searchCacheAlbumUpgradeHook(e.id, e.title, e.artist, _forceAppleListThumb(e.thumb));
@@ -978,6 +1046,10 @@ function _covStore(u, cv) {
   }
 }
 function _covApply(k, cv) {
+  const curObj = (typeof LIVE !== 'undefined' && LIVE && LIVE.known && LIVE.known[k]) || (typeof BYID !== 'undefined' && BYID[k]);
+  if (curObj && curObj.thumb && cv && cv._url && typeof isSameCoverBase === 'function' && !isSameCoverBase(curObj.thumb, cv._url)) {
+    return false;
+  }
   const prev = ARTC[k];
   const prevReal = Boolean(prev && prev._real && !prev._placeholder);
   const sameBase = Boolean(prevReal && prev._url && cv && cv._url && typeof isSameCoverBase === 'function' && isSameCoverBase(prev._url, cv._url));
@@ -1289,7 +1361,8 @@ function liveOnTrack(t, restoreOnly) {
   }
   try {
     if ('mediaSession' in navigator) {
-      navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: t.artist, album: t.albumTitle || '', artwork: t.thumb ? [{ src: location.origin + t.thumb, sizes: '600x600', type: 'image/jpeg' }] : [] });
+      const artSrc = _resolveMediaArtUrl(t.thumb);
+      navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: t.artist, album: t.albumTitle || '', artwork: artSrc ? [{ src: artSrc, sizes: '600x600', type: 'image/jpeg' }] : [] });
       if (!liveOnTrack.ms) { liveOnTrack.ms = 1; const ms = navigator.mediaSession; ms.setActionHandler('play', togglePlay); ms.setActionHandler('pause', togglePlay); ms.setActionHandler('nexttrack', () => next(false)); ms.setActionHandler('previoustrack', prev); }
     }
   } catch (e) {}
@@ -2774,7 +2847,7 @@ function reconcileNativePlayback() {
     syncNativeRepeat();
   }
 }
-const HOME_CACHE_KEY = 'sonora-home-v9';
+const HOME_CACHE_KEY = 'sonora-home-v11';
 let _localeCountrySwitched = false;
 let _homeSnapPending = null;
 let _homeSnapTimer = 0;
@@ -3197,8 +3270,9 @@ function _syncResCoversFromKnown(targetRes) {
   }
   return changed;
 }
-function _propagateCanonicalTrack(tr) {
+function _propagateCanonicalTrack(tr, skipBridgeSync) {
   if (!tr || !tr.id) return false;
+  const artSnap = skipBridgeSync ? null : _snapshotPlaybackArtwork();
   const src = (typeof LIVE !== 'undefined' && LIVE && LIVE.known && LIVE.known[tr.id]) || tr;
   let changed = false;
   const syncCopy = obj => {
@@ -3221,9 +3295,10 @@ function _propagateCanonicalTrack(tr) {
     obj.albumId = src.albumId != null ? src.albumId : null;
     obj.canonicalCover = Boolean(src.canonicalCover);
     if (src._appleUpgradeSettled || src.canonicalCover) obj._appleUpgradeSettled = true;
-    if (!sameBase && typeof ARTC !== 'undefined') {
-      delete ARTC[obj.id];
-      if (oldAlb && oldAlb === 's_' + obj.id && oldAlb !== src.album) delete ARTC[oldAlb];
+    if (!sameBase) {
+      if (obj._sheetHiResUpgraded) delete obj._sheetHiResUpgraded;
+      _invalidateCoverCaches(obj.id, false);
+      if (oldAlb && oldAlb === 's_' + obj.id && oldAlb !== src.album) _invalidateCoverCaches(oldAlb, false);
     }
     return true;
   };
@@ -3251,6 +3326,8 @@ function _propagateCanonicalTrack(tr) {
     }
   }
   if (typeof BYID !== 'undefined') {
+    const byIdSelf = BYID[src.id];
+    if (byIdSelf && (!byIdSelf.kind || byIdSelf.kind === 'track') && syncCopy(byIdSelf)) changed = true;
     for (const k in BYID) {
       const it = BYID[k];
       if (!it || typeof it !== 'object') continue;
@@ -3261,6 +3338,7 @@ function _propagateCanonicalTrack(tr) {
   if (typeof _searchCacheUpgradeHook === 'function') {
     _searchCacheUpgradeHook(src);
   }
+  if (artSnap) _syncPlaybackArtworkIfChanged(artSnap);
   return changed;
 }
 _searchCacheUpgradeHook = function(tr) {

@@ -171,6 +171,23 @@ data class HomePage(
                     ?.splitBySeparator()
                     ?: return null
 
+                val albumRun = secondaryLine.getOrNull(1)?.firstOrNull()
+                    ?.takeIf { it.navigationEndpoint?.browseEndpoint != null }
+                    ?: renderer.flexColumns
+                        .drop(1)
+                        .flatMap { it.musicResponsiveListItemFlexColumnRenderer.text?.runs.orEmpty() }
+                        .firstOrNull {
+                            val ep = it.navigationEndpoint?.browseEndpoint
+                            ep != null && (ep.isAlbumEndpoint || ep.browseId.startsWith("MPREb_"))
+                        }
+                    ?: renderer.flexColumns
+                        .getOrNull(2)
+                        ?.musicResponsiveListItemFlexColumnRenderer
+                        ?.text
+                        ?.runs
+                        ?.firstOrNull()
+                        ?.takeIf { it.navigationEndpoint?.browseEndpoint != null }
+
                 return SongItem(
                     id = renderer.videoId ?: return null,
                     title = renderer.flexColumns
@@ -186,14 +203,12 @@ data class HomePage(
                             id = it.navigationEndpoint?.browseEndpoint?.browseId
                         )
                     } ?: return null,
-                    album = secondaryLine.getOrNull(1)?.firstOrNull()
-                        ?.takeIf { it.navigationEndpoint?.browseEndpoint != null }
-                        ?.let {
-                            Album(
-                                name = it.text,
-                                id = it.navigationEndpoint?.browseEndpoint?.browseId!!
-                            )
-                        },
+                    album = albumRun?.let {
+                        Album(
+                            name = it.text,
+                            id = it.navigationEndpoint?.browseEndpoint?.browseId!!
+                        )
+                    },
                     duration = secondaryLine.lastOrNull()?.firstOrNull()?.text?.parseTime(),
                     thumbnail = renderer.thumbnail?.getThumbnailUrl() ?: return null,
                     explicit = renderer.badges?.find {

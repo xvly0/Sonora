@@ -826,6 +826,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun updateTrackArtwork(id: String, thumb: String) {
+            runOnUiThread {
+                ensureService { service ->
+                    service.updateTrackArtwork(id, thumb)
+                }
+            }
+        }
+
+        @JavascriptInterface
         fun setVolume(vol: Double) {
             val v = vol.toFloat().coerceIn(0f, 1f)
             runOnUiThread {

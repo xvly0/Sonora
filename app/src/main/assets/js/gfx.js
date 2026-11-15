@@ -143,9 +143,10 @@ function _pumpArtUpQ() {
               delete ARTC[it.album];
             }
           }
-          if (it.id && !bothApple && !sameBase && !(ARTC[it.id] && ARTC[it.id]._real)) delete ARTC[it.id];
+          if (it.id && !sameBase && (isTrack || !bothApple || !(ARTC[it.id] && ARTC[it.id]._real))) delete ARTC[it.id];
           if (it.id && !sameBase) {
             if (typeof PALC !== 'undefined') delete PALC[it.id];
+            if (typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[it.id];
             if (typeof TINTC !== 'undefined') { delete TINTC[it.id + 'd']; delete TINTC[it.id + 'l']; }
           }
           if (typeof preloadArt === 'function') preloadArt(it, true);
