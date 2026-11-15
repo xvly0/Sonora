@@ -774,6 +774,77 @@ object AppleCatalog {
             ?.toList()
     }
 
+    /**
+     * Fetches the regional Apple Music storefront charts (albums + songs) with release dates and artwork.
+     */
+    suspend fun fetchStorefrontCharts(
+        storefront: String,
+        lang: String = SonoraLocaleManager.resolvedLang,
+        limit: Int = 35,
+    ): StorefrontChartsResult? {
+        val bearer = token() ?: return null
+        val sf = storefront.trim().lowercase().takeIf { it.length == 2 } ?: "us"
+        val langTag = SonoraLocaleManager.appleLanguageTag(lang, sf)
+        val clampedLimit = limit.coerceIn(10, 50)
+        val url = "$API/$sf/charts?types=albums,songs&limit=$clampedLimit&l=$langTag"
+        val body = get(url, bearer) ?: return null
+        val root = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return null
+        val results = root["results"]?.jsonObject ?: return null
+
+        val blockedGenres = setOf(
+            "children's music", "musica per bambini", "ninne nanne", "lullabies",
+            "soundtrack", "colonne sonore", "fitness & workout", "spoken word",
+            "comedy", "holiday", "natale", "christmas",
+        )
+
+        fun parseChartItems(key: String): List<StorefrontChartItem> {
+            val out = ArrayList<StorefrontChartItem>()
+            val rawEl = results[key] ?: return out
+            val blocks = when (rawEl) {
+                is JsonObject -> listOf(rawEl)
+                is kotlinx.serialization.json.JsonArray -> rawEl.mapNotNull { it as? JsonObject }
+                else -> emptyList()
+            }
+            for (block in blocks) {
+                val dataArr = block["data"] as? kotlinx.serialization.json.JsonArray ?: continue
+                for (el in dataArr) {
+                    val att = (el as? JsonObject)?.get("attributes") as? JsonObject ?: continue
+                    val name = (att["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim().orEmpty()
+                    val artistName = (att["artistName"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim().orEmpty()
+                    if (name.isEmpty() || artistName.isEmpty()) continue
+                    val genres = (att["genreNames"] as? kotlinx.serialization.json.JsonArray)
+                        ?.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()?.lowercase() }
+                        .orEmpty()
+                    if (genres.any { it in blockedGenres }) continue
+                    val releaseDate = (att["releaseDate"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()
+                    val isSingle = (att["isSingle"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toBooleanStrictOrNull() ?: false
+                    val template = (att["artwork"] as? JsonObject)?.template()
+                    val artUrl = template?.let { size(it, COVER_PX, COVER_PX) }
+                    out.add(StorefrontChartItem(name, artistName, artUrl, releaseDate, isSingle))
+                }
+            }
+            return out
+        }
+
+        return StorefrontChartsResult(
+            albums = parseChartItems("albums"),
+            songs = parseChartItems("songs"),
+        )
+    }
+
+    data class StorefrontChartItem(
+        val title: String,
+        val artist: String,
+        val artUrl: String?,
+        val releaseDate: String?,
+        val isSingle: Boolean = false,
+    )
+
+    data class StorefrontChartsResult(
+        val albums: List<StorefrontChartItem>,
+        val songs: List<StorefrontChartItem>,
+    )
+
     private fun plain(title: String): String = title
         .replace(Regex("\\([^)]*\\)"), " ")
         .replace(Regex("\\[[^]]*]"), " ")

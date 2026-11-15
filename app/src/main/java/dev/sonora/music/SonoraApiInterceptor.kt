@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.webkit.WebResourceResponse
 import com.metrolist.innertube.YouTube
+import com.metrolist.innertube.models.Album
 import com.metrolist.innertube.models.AlbumItem
 import com.metrolist.innertube.models.Artist
 import com.metrolist.innertube.models.ArtistItem
@@ -855,16 +856,7 @@ object SonoraApiInterceptor {
         }
     }
 
-    private val NON_LATIN_SCRIPT_REGEX = Regex(
-        """[\p{InCyrillic}\p{InArabic}\p{InHebrew}\p{InDevanagari}\p{InThai}\p{InKhmer}\p{IsHan}\p{IsHiragana}\p{IsKatakana}\p{IsHangul}]"""
-    )
-    private val JP_ALLOWED_SCRIPT_REGEX = Regex("""[\p{IsHan}\p{IsHiragana}\p{IsKatakana}]""")
-    private val KR_ALLOWED_SCRIPT_REGEX = Regex("""[\p{IsHan}\p{IsHangul}]""")
-    private val CYRILLIC_REGEX = Regex("""\p{InCyrillic}""")
-    private val ARABIC_REGEX = Regex("""\p{InArabic}""")
-    private val HEBREW_REGEX = Regex("""\p{InHebrew}""")
-    private val DEVANAGARI_REGEX = Regex("""\p{InDevanagari}""")
-    private val THAI_REGEX = Regex("""\p{InThai}""")
+    private val ARCHIVE_YEAR_IN_TITLE_REGEX = Regex("""\b(19[5-9]\d|20[0-4]\d)\b""")
     private val ROMANIAN_DIACRITICS_REGEX = Regex("""[\u0102\u0103\u0218\u0219\u021A\u021B\u015E\u015F\u0162\u0163]""")
     private val COMBINING_MARKS_REGEX = Regex("""\p{InCombiningDiacriticalMarks}+""")
 
@@ -945,21 +937,63 @@ object SonoraApiInterceptor {
         return nfd.replace(COMBINING_MARKS_REGEX, "").lowercase()
     }
 
+    private fun allowedNonLatinScriptsForCountry(gl: String): Set<Character.UnicodeScript> = when (gl.uppercase()) {
+        "JP" -> setOf(Character.UnicodeScript.HAN, Character.UnicodeScript.HIRAGANA, Character.UnicodeScript.KATAKANA)
+        "TW", "HK", "CN", "MO", "SG" -> setOf(Character.UnicodeScript.HAN)
+        "KR" -> setOf(Character.UnicodeScript.HAN, Character.UnicodeScript.HANGUL)
+        "RU", "UA", "BG", "RS", "BY", "KZ", "KG", "TJ", "MK", "MN" -> setOf(Character.UnicodeScript.CYRILLIC)
+        "EG", "SA", "AE", "MA", "DZ", "TN", "LB", "JO", "IQ", "SY", "KW", "QA", "OM", "BH", "YE", "PS", "LY", "SD" ->
+            setOf(Character.UnicodeScript.ARABIC)
+        "IL" -> setOf(Character.UnicodeScript.HEBREW)
+        "IN", "NP", "BD", "LK", "PK" -> setOf(
+            Character.UnicodeScript.DEVANAGARI,
+            Character.UnicodeScript.BENGALI,
+            Character.UnicodeScript.TAMIL,
+            Character.UnicodeScript.TELUGU,
+            Character.UnicodeScript.KANNADA,
+            Character.UnicodeScript.MALAYALAM,
+            Character.UnicodeScript.GUJARATI,
+            Character.UnicodeScript.GURMUKHI,
+            Character.UnicodeScript.ORIYA,
+            Character.UnicodeScript.SINHALA,
+            Character.UnicodeScript.ARABIC,
+        )
+        "TH" -> setOf(Character.UnicodeScript.THAI)
+        "KH" -> setOf(Character.UnicodeScript.KHMER)
+        "MM" -> setOf(Character.UnicodeScript.MYANMAR)
+        "GR", "CY" -> setOf(Character.UnicodeScript.GREEK)
+        "AM" -> setOf(Character.UnicodeScript.ARMENIAN)
+        "GE" -> setOf(Character.UnicodeScript.GEORGIAN)
+        "ET" -> setOf(Character.UnicodeScript.ETHIOPIC)
+        else -> emptySet()
+    }
+
     private fun shouldBlockForeignScriptForCountry(rawText: String, gl: String): Boolean {
-        val stripped = when (gl) {
-            "JP", "TW", "HK", "CN" -> rawText.replace(JP_ALLOWED_SCRIPT_REGEX, "")
-            "KR" -> rawText.replace(KR_ALLOWED_SCRIPT_REGEX, "")
-            "RU", "UA", "BG", "RS", "BY" -> rawText.replace(CYRILLIC_REGEX, "")
-            "EG", "SA", "AE", "MA", "DZ", "TN", "LB", "JO" -> rawText.replace(ARABIC_REGEX, "")
-            "IL" -> rawText.replace(HEBREW_REGEX, "")
-            "IN" -> rawText.replace(DEVANAGARI_REGEX, "")
-            "TH" -> rawText.replace(THAI_REGEX, "")
-            else -> rawText
+        val extraAllowed = allowedNonLatinScriptsForCountry(gl)
+        var i = 0
+        while (i < rawText.length) {
+            val cp = rawText.codePointAt(i)
+            i += Character.charCount(cp)
+            if (!Character.isLetter(cp)) continue
+            val script = Character.UnicodeScript.of(cp)
+            if (script != Character.UnicodeScript.LATIN &&
+                script != Character.UnicodeScript.COMMON &&
+                script != Character.UnicodeScript.INHERITED &&
+                script !in extraAllowed
+            ) {
+                return true
+            }
         }
-        if (NON_LATIN_SCRIPT_REGEX.containsMatchIn(stripped)) return true
-        if (gl != "RO" && gl != "MD" && ROMANIAN_DIACRITICS_REGEX.containsMatchIn(rawText)) return true
+        val cleanGl = gl.uppercase()
+        if (cleanGl != "RO" && cleanGl != "MD" && ROMANIAN_DIACRITICS_REGEX.containsMatchIn(rawText)) return true
         return false
     }
+
+    private fun hasArchivalYearInTitle(title: String, minRecentYear: Int): Boolean =
+        ARCHIVE_YEAR_IN_TITLE_REGEX.findAll(title).any { m ->
+            val yr = m.groupValues[1].toIntOrNull()
+            yr != null && yr in 1950 until minRecentYear
+        }
 
     private fun hasBlockedScriptOrSpam(rawText: String, queryLower: String = ""): Boolean {
         if (queryLower.isEmpty()) {
@@ -971,12 +1005,33 @@ object SonoraApiInterceptor {
             AI_STOCK_SPAM_TERMS.any { it in asciiLow && (qAscii.isEmpty() || it !in qAscii) }
     }
 
+    private val ALBUM_SOUNDTRACK_REGEX = Regex(
+        """\b(soundtrack|colonna\s+sonora|motion\s+picture|original\s+score|original\s+soundtrack)\b""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private fun shouldRejectNewReleaseMetadata(
+        title: String,
+        artistNames: String,
+        releaseYear: Int? = null,
+    ): Boolean {
+        if ('|' in title) return true
+        if (hasBlockedScriptOrSpam("$title $artistNames")) return true
+        if (VARIOUS_COLLECTION_ARTIST_REGEX.containsMatchIn(artistNames)) return true
+        if (isReissueAlbumTitle(title)) return true
+        if (ALBUM_SOUNDTRACK_REGEX.containsMatchIn(title)) return true
+        if (isLikelyCompilationAlbum(title, artistName = artistNames)) return true
+        val minRecentYear = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR) - 1
+        if (releaseYear != null && releaseYear in 1900 until minRecentYear) return true
+        if (hasArchivalYearInTitle(title, minRecentYear)) return true
+        return false
+    }
+
     internal fun shouldFilterReleaseAlbum(album: AlbumItem): Boolean {
         val validArtists = cleanArtistsList(album.artists)
         if (validArtists.isEmpty()) return true
-        if ('|' in album.title) return true
-        val combined = "${album.title} ${validArtists.joinToString(" ") { it.name }}"
-        return hasBlockedScriptOrSpam(combined)
+        val artistNames = validArtists.joinToString(" ") { it.name }
+        return shouldRejectNewReleaseMetadata(album.title, artistNames, album.year)
     }
 
     private fun shouldFilterTrack(item: SongItem, query: String = ""): Boolean {
@@ -999,8 +1054,19 @@ object SonoraApiInterceptor {
     )
     private val WORD_VIDEO_REGEX = Regex("""\bvideo\b""", RegexOption.IGNORE_CASE)
 
+    private val HOME_MIX_SPAM_REGEX = Regex(
+        """\b(top\s+\d+|top\s+hits|flash\s*back|mega\s*mix|dj\s+mix|extended\s+mix|full\s+album|playlist)\b""",
+        RegexOption.IGNORE_CASE
+    )
+
     internal fun isFeedVideoTrack(item: SongItem): Boolean =
         item.isVideoSong || isNoisyVideoTitle(item.title)
+
+    internal fun isHomeMixOrSpamTrack(item: SongItem): Boolean {
+        val dur = item.duration
+        if (dur != null && (dur > 480 || dur in 1..45)) return true
+        return HOME_MIX_SPAM_REGEX.containsMatchIn(item.title)
+    }
     private val COMPILATION_ALBUM_REGEX = Regex(
         """\b(mi\s+manchi|rap\s+italiano|hit\s+mania|hits|top\s+hits|top\s+\d+|greatest\s+hits|super\s+hits|classic\s+hits|all\s+time\s+hits|chart\s+hits|number\s+ones|compilation|best\s+of|the\s+(?:very\s+)?best(?:\s+of)?|anthology|antologia|raccolta|collezione|(?:gold|platinum|ultimate|definitive|complete|singles)\s+collection|essentials|le\s+pi[uù]\s+belle|i\s+grandi\s+successi|grandi\s+successi|tutti\s+i\s+successi|i\s+miei\s+successi|tutte\s+le\s+canzoni|il\s+meglio(?:\s+di)?|artisti\s+vari|various\s+artists|aa\.?\s*vv\.?|estate\s+\d*|summer\s+hits|mix\s+\d*|mega\s+mix|party\s+hits|workout|chill\s+hits|love\s+songs|canzoni\s+d'amore|100%\s+|successi|classifica|sanremo\s+\d*|festivalbar|power\s+hits|radio\s+italia|anni\s+(?:60|70|80|90|2000)|radio\s+hits|italia\s+hits|italian\s+hits|musica\s+italiana|canzoni\s+italiane|colonna\s+sonora|soundtrack|motion\s+picture|original\s+score|remix(?:es)?|reworked|club\s+mix|dj\s+mix|extended\s+mix|mashup|live\s+(?:at|in|from|on)|unplugged)\b""",
         RegexOption.IGNORE_CASE
@@ -2162,28 +2228,30 @@ object SonoraApiInterceptor {
         val chartArtistIds = HashSet<String>()
         val chartArtistNames = HashSet<String>()
         val skipItalianLeaks = SonoraLocaleManager.isExplicitForeignRegion() && !gl.equals("IT", ignoreCase = true)
-        chartsResult?.sections.orEmpty().flatMap { it.items }.forEach { item ->
-            when (item) {
-                is ArtistItem -> {
-                    chartArtistIds.add(item.id)
-                    val n = normSearchKey(item.title)
-                    if (n.isNotEmpty()) chartArtistNames.add(n)
-                }
-                is SongItem -> {
-                    cleanArtistsList(item.artists).forEach { art ->
-                        art.id?.let { chartArtistIds.add(it) }
-                        val n = normSearchKey(art.name)
+        if (!skipItalianLeaks) {
+            chartsResult?.sections.orEmpty().flatMap { it.items }.forEach { item ->
+                when (item) {
+                    is ArtistItem -> {
+                        chartArtistIds.add(item.id)
+                        val n = normSearchKey(item.title)
                         if (n.isNotEmpty()) chartArtistNames.add(n)
                     }
-                }
-                is AlbumItem -> {
-                    cleanArtistsList(item.artists).forEach { art ->
-                        art.id?.let { chartArtistIds.add(it) }
-                        val n = normSearchKey(art.name)
-                        if (n.isNotEmpty()) chartArtistNames.add(n)
+                    is SongItem -> {
+                        cleanArtistsList(item.artists).forEach { art ->
+                            art.id?.let { chartArtistIds.add(it) }
+                            val n = normSearchKey(art.name)
+                            if (n.isNotEmpty()) chartArtistNames.add(n)
+                        }
                     }
+                    is AlbumItem -> {
+                        cleanArtistsList(item.artists).forEach { art ->
+                            art.id?.let { chartArtistIds.add(it) }
+                            val n = normSearchKey(art.name)
+                            if (n.isNotEmpty()) chartArtistNames.add(n)
+                        }
+                    }
+                    else -> {}
                 }
-                else -> {}
             }
         }
 
@@ -2206,7 +2274,8 @@ object SonoraApiInterceptor {
                 if (shouldFilterReleaseAlbum(album)) continue
                 if (skipItalianLeaks && !isStorefront && isItalianLeakArtist(album.artists, gl)) continue
                 val validArtists = cleanArtistsList(album.artists)
-                val titleKey = normCompactKey(album.title)
+                val baseTitleKey = normCompactKey(normAlbumBaseTitle(album.title))
+                val titleKey = baseTitleKey.ifEmpty { normCompactKey(album.title) }
                 val firstArt = validArtists.firstOrNull()?.name ?: ""
                 val sig = if (titleKey.isNotEmpty()) "$titleKey|${normCompactKey(firstArt)}" else ""
                 val existing = seenIds[album.browseId] ?: if (sig.isNotEmpty()) seenSigs[sig] else null
@@ -2234,31 +2303,46 @@ object SonoraApiInterceptor {
         val scored = candidates.map { c ->
             val validArtists = cleanArtistsList(c.album.artists)
             val isUserOrChart = validArtists.any { art ->
-                (art.id != null && (art.id in userArtistIds || art.id in chartArtistIds)) ||
-                    normSearchKey(art.name) in chartArtistNames
+                (art.id != null && (art.id in userArtistIds || (!skipItalianLeaks && art.id in chartArtistIds))) ||
+                    (!skipItalianLeaks && normSearchKey(art.name) in chartArtistNames)
             }
             val isKnownPopular = validArtists.any { art ->
                 isPopularArtistForCountry(normSearchKey(art.name), gl)
             }
             val isPopularArtist = c.fromStorefront || isUserOrChart || isKnownPopular
-            var score = 0
-            if (c.fromStorefront) score += 140
-            if (isUserOrChart && (!skipItalianLeaks || c.fromStorefront)) score += 100
-            if (isKnownPopular) score += 80
-            if (c.fromHome) score += 40
+            var score = if (c.fromStorefront) {
+                maxOf(160, 300 - c.orderIdx * 3)
+            } else {
+                0
+            }
+            if (isUserOrChart && (!skipItalianLeaks || c.fromStorefront)) score += if (c.fromStorefront) 20 else 110
+            if (isKnownPopular) score += if (c.fromStorefront) 15 else 85
+            if (c.fromHome) score += if (c.fromStorefront) 15 else 40
             Scored(c, score, isPopularArtist)
         }.sortedWith(compareByDescending<Scored> { it.score }.thenBy { it.candidate.orderIdx })
 
-        val primary = scored.filter {
-            !(it.candidate.fromExplore && !it.candidate.fromHome && !it.isPopularArtist) &&
-                !(skipItalianLeaks && storefrontAlbums.size >= 6 && it.candidate.fromHome && !it.isPopularArtist)
+        val hasStrongStorefront = storefrontAlbums.size >= 4
+        val hasStrongRegionalSignal = hasStrongStorefront ||
+            chartArtistIds.isNotEmpty() ||
+            chartArtistNames.isNotEmpty()
+        val primary = scored.filter { s ->
+            when {
+                s.candidate.fromStorefront -> true
+                hasStrongRegionalSignal -> s.isPopularArtist
+                s.candidate.fromExplore && !s.candidate.fromHome -> s.isPopularArtist
+                s.candidate.fromFallback && !s.candidate.fromHome -> s.isPopularArtist
+                skipItalianLeaks -> s.isPopularArtist
+                else -> s.candidate.fromHome || s.isPopularArtist
+            }
         }
             .map { it.candidate.album }
             .toMutableList()
-        if (primary.size < 6) {
+        if (primary.size < 4) {
             val primaryIds = primary.map { it.browseId }.toHashSet()
             for (s in scored) {
                 if (primary.size >= limit) break
+                if (s.candidate.fromExplore && !s.candidate.fromHome && !s.isPopularArtist) continue
+                if (s.candidate.fromFallback && !s.isPopularArtist) continue
                 if (primaryIds.add(s.candidate.album.browseId)) {
                     primary.add(s.candidate.album)
                 }
@@ -2270,7 +2354,41 @@ object SonoraApiInterceptor {
     private const val HOME_THUMB_SIZE = 544
     private val homeWarmScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    private data class StorefrontRssEntry(val title: String, val artist: String, val artUrl: String?)
+    private data class StorefrontRssEntry(
+        val title: String,
+        val artist: String,
+        val artUrl: String?,
+        val releaseDate: String? = null,
+    )
+
+    private fun fetchAppleMarketingEntries(url: String, limit: Int): List<StorefrontRssEntry> {
+        return runCatching {
+            val req = Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .build()
+            okHttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use emptyList()
+                val body = resp.body?.string().orEmpty()
+                if (body.isBlank()) return@use emptyList()
+                val results = JSONObject(body).optJSONObject("feed")?.optJSONArray("results")
+                    ?: return@use emptyList()
+                val out = ArrayList<StorefrontRssEntry>(minOf(limit, results.length()))
+                for (i in 0 until minOf(limit, results.length())) {
+                    val e = results.optJSONObject(i) ?: continue
+                    val title = e.optString("name").trim()
+                    val artist = e.optString("artistName").trim()
+                    if (title.isEmpty() || artist.isEmpty()) continue
+                    val rawArt = e.optString("artworkUrl100").trim()
+                    val hqArt = rawArt.takeIf { it.isNotBlank() }
+                        ?.replace(Regex("""/\d+x\d+bb(-\d+)?\."""), "/544x544bb$1.")
+                    val releaseDate = e.optString("releaseDate").trim().takeIf { it.isNotEmpty() }
+                    out.add(StorefrontRssEntry(title, artist, hqArt, releaseDate))
+                }
+                out
+            }
+        }.getOrDefault(emptyList())
+    }
 
     private fun fetchItunesRssEntries(url: String, limit: Int): List<StorefrontRssEntry> {
         return runCatching {
@@ -2301,12 +2419,149 @@ object SonoraApiInterceptor {
                     } else null
                     val hqArt = rawArt?.takeIf { it.isNotBlank() }
                         ?.replace(Regex("""/\d+x\d+bb(-\d+)?\."""), "/544x544bb$1.")
-                    out.add(StorefrontRssEntry(title, artist, hqArt))
+                    val releaseDate = e.optJSONObject("im:releaseDate")?.optString("label")?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                    out.add(StorefrontRssEntry(title, artist, hqArt, releaseDate))
                 }
                 out
             }
         }.getOrDefault(emptyList())
     }
+
+    private fun filterRecentStorefrontAlbums(rawEntries: List<StorefrontRssEntry>, maxCount: Int = 14): List<StorefrontRssEntry> {
+        if (rawEntries.isEmpty()) return emptyList()
+        val todayDayNum = (System.currentTimeMillis() / 86_400_000L).toInt()
+        val seenBase = HashSet<String>()
+        val cleanEntries = rawEntries.filter { entry ->
+            val releaseYear = entry.releaseDate?.take(4)?.toIntOrNull()
+            if (shouldRejectNewReleaseMetadata(entry.title, entry.artist, releaseYear)) return@filter false
+            val baseTitle = normCompactKey(normAlbumBaseTitle(entry.title)).ifEmpty { normCompactKey(entry.title) }
+            val artKey = normCompactKey(entry.artist.substringBefore(',').substringBefore('&').trim())
+            seenBase.add("$baseTitle|$artKey")
+        }
+        val recent240 = cleanEntries.filter { entry ->
+            val day = parseReleaseDayNum(entry.releaseDate) ?: return@filter true
+            val age = todayDayNum - day
+            age in 0..240
+        }
+        if (recent240.size >= 8) return recent240.take(maxCount)
+        val recent365 = cleanEntries.filter { entry ->
+            val day = parseReleaseDayNum(entry.releaseDate) ?: return@filter true
+            val age = todayDayNum - day
+            age in 0..365
+        }
+        return recent365.ifEmpty { cleanEntries }.take(maxCount)
+    }
+
+    private fun serializeStorefrontFeed(feed: HomeSubCache.StorefrontFeed): String {
+        val obj = JSONObject()
+        val songsArr = JSONArray()
+        feed.songs.forEach { s ->
+            songsArr.put(JSONObject().apply {
+                put("id", s.id)
+                put("title", s.title)
+                put("thumbnail", s.thumbnail)
+                s.duration?.let { put("duration", it) }
+                s.album?.let { alb ->
+                    put("album", JSONObject().apply {
+                        put("id", alb.id)
+                        put("name", alb.name)
+                    })
+                }
+                val arts = JSONArray()
+                s.artists.forEach { a ->
+                    arts.put(JSONObject().apply {
+                        put("name", a.name)
+                        if (a.id != null) put("id", a.id)
+                    })
+                }
+                put("artists", arts)
+            })
+        }
+        val albumsArr = JSONArray()
+        feed.albums.forEach { a ->
+            albumsArr.put(JSONObject().apply {
+                put("browseId", a.browseId)
+                put("playlistId", a.playlistId)
+                put("title", a.title)
+                put("thumbnail", a.thumbnail)
+                a.year?.let { put("year", it) }
+                val arts = JSONArray()
+                a.artists.orEmpty().forEach { art ->
+                    arts.put(JSONObject().apply {
+                        put("name", art.name)
+                        if (art.id != null) put("id", art.id)
+                    })
+                }
+                put("artists", arts)
+            })
+        }
+        obj.put("songs", songsArr)
+        obj.put("albums", albumsArr)
+        return obj.toString()
+    }
+
+    private fun deserializeStorefrontFeed(raw: String): HomeSubCache.StorefrontFeed? = runCatching {
+        val obj = JSONObject(raw)
+        val songsArr = obj.optJSONArray("songs") ?: JSONArray()
+        val albumsArr = obj.optJSONArray("albums") ?: JSONArray()
+        val songs = ArrayList<SongItem>(songsArr.length())
+        for (i in 0 until songsArr.length()) {
+            val s = songsArr.optJSONObject(i) ?: continue
+            val id = s.optString("id").trim()
+            val title = s.optString("title").trim()
+            if (id.isEmpty() || title.isEmpty()) continue
+            val artsArr = s.optJSONArray("artists") ?: JSONArray()
+            val arts = (0 until artsArr.length()).mapNotNull { j ->
+                val ao = artsArr.optJSONObject(j) ?: return@mapNotNull null
+                val n = ao.optString("name").trim()
+                if (n.isEmpty()) null else Artist(name = n, id = ao.optString("id").takeIf { it.isNotBlank() })
+            }
+            val albObj = s.optJSONObject("album")
+            val alb = albObj?.let {
+                val aid = it.optString("id").trim()
+                val aname = it.optString("name").trim()
+                if (aid.isNotEmpty() && aname.isNotEmpty()) Album(name = aname, id = aid) else null
+            }
+            val dur = if (s.has("duration")) s.optInt("duration") else null
+            songs.add(
+                SongItem(
+                    id = id,
+                    title = title,
+                    artists = arts,
+                    album = alb,
+                    duration = dur,
+                    thumbnail = s.optString("thumbnail"),
+                )
+            )
+        }
+        val albums = ArrayList<AlbumItem>(albumsArr.length())
+        for (i in 0 until albumsArr.length()) {
+            val a = albumsArr.optJSONObject(i) ?: continue
+            val browseId = a.optString("browseId").trim()
+            val playlistId = a.optString("playlistId").trim()
+            val title = a.optString("title").trim()
+            if (browseId.isEmpty() || title.isEmpty()) continue
+            val artsArr = a.optJSONArray("artists") ?: JSONArray()
+            val arts = (0 until artsArr.length()).mapNotNull { j ->
+                val ao = artsArr.optJSONObject(j) ?: return@mapNotNull null
+                val n = ao.optString("name").trim()
+                if (n.isEmpty()) null else Artist(name = n, id = ao.optString("id").takeIf { it.isNotBlank() })
+            }
+            val yr = if (a.has("year")) a.optInt("year") else null
+            albums.add(
+                AlbumItem(
+                    browseId = browseId,
+                    playlistId = playlistId,
+                    title = title,
+                    artists = arts,
+                    year = yr,
+                    thumbnail = a.optString("thumbnail"),
+                )
+            )
+        }
+        if (songs.isEmpty() && albums.isEmpty()) null else HomeSubCache.StorefrontFeed(songs, albums)
+    }.getOrNull()
 
     private fun normAlbumBaseTitle(title: String): String =
         normAlbumCacheKey(title, "").substringBefore('|')
@@ -2330,39 +2585,62 @@ object SonoraApiInterceptor {
         return true
     }
 
-    private suspend fun fetchStorefrontRegionalFeed(gl: String): HomeSubCache.StorefrontFeed {
-        HomeSubCache.getStorefront(gl)?.let { return it }
+    private suspend fun buildStorefrontRegionalFeedNetwork(gl: String): HomeSubCache.StorefrontFeed {
         val sf = gl.trim().lowercase().takeIf { it.length == 2 } ?: "us"
         return coroutineScope {
-            val songsRssDef = async(Dispatchers.IO) {
+            val ampCharts = withTimeoutOrNull(3400L) {
+                AppleCatalog.fetchStorefrontCharts(sf, SonoraLocaleManager.resolvedLang, limit = 40)
+            }
+
+            val songEntries = if (ampCharts != null && ampCharts.songs.isNotEmpty()) {
+                ampCharts.songs
+                    .filter {
+                        !hasBlockedScriptOrSpam("${it.title} ${it.artist}") &&
+                            !HOME_MIX_SPAM_REGEX.containsMatchIn(it.title)
+                    }
+                    .take(16)
+                    .map { StorefrontRssEntry(it.title, it.artist, it.artUrl, it.releaseDate) }
+            } else {
                 withTimeoutOrNull(2400L) {
                     fetchItunesRssEntries("https://itunes.apple.com/$sf/rss/topsongs/limit=20/json", 16)
+                }.orEmpty().filter {
+                    !hasBlockedScriptOrSpam("${it.title} ${it.artist}") &&
+                        !HOME_MIX_SPAM_REGEX.containsMatchIn(it.title)
+                }
+            }
+
+            val rawAlbumEntries = if (ampCharts != null && ampCharts.albums.isNotEmpty()) {
+                ampCharts.albums.map { StorefrontRssEntry(it.title, it.artist, it.artUrl, it.releaseDate) }
+            } else {
+                val mkt = withTimeoutOrNull(2200L) {
+                    fetchAppleMarketingEntries("https://rss.applemarketingtools.com/api/v2/$sf/music/most-played/20/albums.json", 20)
+                }.orEmpty()
+                if (mkt.isNotEmpty()) mkt
+                else withTimeoutOrNull(2400L) {
+                    fetchItunesRssEntries("https://itunes.apple.com/$sf/rss/topalbums/limit=25/json", 25)
                 }.orEmpty()
             }
-            val albumsRssDef = async(Dispatchers.IO) {
-                withTimeoutOrNull(2400L) {
-                    fetchItunesRssEntries("https://itunes.apple.com/$sf/rss/topalbums/limit=12/json", 10)
-                }.orEmpty()
-            }
-            val songEntries = songsRssDef.await()
-            val albumEntries = albumsRssDef.await()
+            val albumEntries = filterRecentStorefrontAlbums(rawAlbumEntries, maxCount = 14)
+
             if (songEntries.isEmpty() && albumEntries.isEmpty()) {
                 return@coroutineScope HomeSubCache.StorefrontFeed(emptyList(), emptyList())
             }
 
-            val songSem = Semaphore(8)
-            val albumSem = Semaphore(4)
+            val songSem = Semaphore(6)
+            val albumSem = Semaphore(6)
             val resolvedSongsDef = async(Dispatchers.IO) {
-                withTimeoutOrNull(3600L) {
+                withTimeoutOrNull(4600L) {
                     songEntries.map { entry ->
                         async(Dispatchers.IO) {
                             songSem.withPermit {
-                                withTimeoutOrNull(1400L) {
+                                withTimeoutOrNull(2000L) {
                                     val res = YouTube.search("${entry.title} ${entry.artist}", YouTube.SearchFilter.FILTER_SONG).getOrNull()
                                     val targetCore = normTitleCore(entry.title)
                                     val item = res?.items?.filterIsInstance<SongItem>()
                                         ?.firstOrNull { cand ->
-                                            if (shouldFilterTrack(cand) || isFeedVideoTrack(cand)) return@firstOrNull false
+                                            if (shouldFilterTrack(cand) || isFeedVideoTrack(cand) || isHomeMixOrSpamTrack(cand)) {
+                                                return@firstOrNull false
+                                            }
                                             val candCore = normTitleCore(cand.title)
                                             val titleOk = candCore.isNotEmpty() && targetCore.isNotEmpty() &&
                                                 (candCore == targetCore ||
@@ -2389,11 +2667,11 @@ object SonoraApiInterceptor {
                 }.orEmpty()
             }
             val resolvedAlbumsDef = async(Dispatchers.IO) {
-                withTimeoutOrNull(3400L) {
+                withTimeoutOrNull(4800L) {
                     albumEntries.map { entry ->
                         async(Dispatchers.IO) {
                             albumSem.withPermit {
-                                withTimeoutOrNull(1400L) {
+                                withTimeoutOrNull(2200L) {
                                     val res = YouTube.search("${entry.title} ${entry.artist}", YouTube.SearchFilter.FILTER_ALBUM).getOrNull()
                                     val item = res?.items?.filterIsInstance<AlbumItem>()
                                         ?.firstOrNull { storefrontAlbumMatches(it, entry.title, entry.artist) }
@@ -2410,15 +2688,42 @@ object SonoraApiInterceptor {
                 }.orEmpty()
             }
 
-            val feed = HomeSubCache.StorefrontFeed(
+            HomeSubCache.StorefrontFeed(
                 songs = deduplicateAndPreferStudio(resolvedSongsDef.await()),
                 albums = resolvedAlbumsDef.await().distinctBy { it.browseId }
             )
-            if (feed.songs.isNotEmpty() || feed.albums.isNotEmpty()) {
-                HomeSubCache.putStorefront(feed, 1800, gl)
-            }
-            feed
         }
+    }
+
+    private suspend fun fetchStorefrontRegionalFeed(gl: String): HomeSubCache.StorefrontFeed {
+        HomeSubCache.getStorefront(gl)?.let { return it }
+        val cleanGl = gl.trim().uppercase().takeIf { it.length == 2 } ?: "US"
+        val diskKey = "storefront_v2:$cleanGl"
+        val disk = SnapshotDiskCache.get(diskKey, freshTtlMs = 1_800_000L)
+        if (disk != null) {
+            val parsed = deserializeStorefrontFeed(disk.data)
+            if (parsed != null && parsed.albums.size >= 4) {
+                HomeSubCache.putStorefront(parsed, 1800, cleanGl)
+                if (!disk.isFresh) {
+                    SnapshotDiskCache.revalidate(diskKey) {
+                        val fresh = buildStorefrontRegionalFeedNetwork(cleanGl)
+                        if (fresh.songs.isNotEmpty() || fresh.albums.isNotEmpty()) {
+                            HomeSubCache.putStorefront(fresh, 1800, cleanGl)
+                            SnapshotDiskCache.put(diskKey, serializeStorefrontFeed(fresh))
+                        }
+                    }
+                }
+                return parsed
+            }
+        }
+        val feed = buildStorefrontRegionalFeedNetwork(cleanGl)
+        if (feed.songs.isNotEmpty() || feed.albums.isNotEmpty()) {
+            HomeSubCache.putStorefront(feed, 1800, cleanGl)
+            if (feed.albums.size >= 4) {
+                SnapshotDiskCache.putAsync(diskKey, serializeStorefrontFeed(feed))
+            }
+        }
+        return feed
     }
 
     private fun scheduleHomeSecondaryWarm(
@@ -2435,7 +2740,7 @@ object SonoraApiInterceptor {
                 if (SonoraLocaleManager.cacheTag() != locKey) return@launch
                 ensureLocale()
                 val ytLocale = SonoraLocaleManager.effectiveRegionalYoutubeLocale(gl, hl)
-                if (explicitForeign && HomeSubCache.getStorefront(gl) == null) {
+                if (HomeSubCache.getStorefront(gl) == null) {
                     withTimeoutOrNull(4500L) { fetchStorefrontRegionalFeed(gl) }
                 }
                 if (explicitForeign && HomeSubCache.getHits(locKey) == null && SonoraLocaleManager.cacheTag() == locKey) {
@@ -2541,8 +2846,14 @@ object SonoraApiInterceptor {
                 page
             }
         }
-        val storefrontDeferred = if (explicitForeign) {
-            async(Dispatchers.IO) { fetchStorefrontRegionalFeed(gl) }
+        val storefrontDeferred = async(Dispatchers.IO) { fetchStorefrontRegionalFeed(gl) }
+        val useYtmChartsForRegion = !explicitForeign || gl.equals("IT", ignoreCase = true)
+        val chartsDeferred = if (useYtmChartsForRegion && HomeSubCache.getCharts(locKey) == null) {
+            async(Dispatchers.IO) {
+                YouTube.getChartsPage(localeOverride = ytLocale).getOrNull()?.also {
+                    if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putCharts(it, 1800, locKey)
+                }
+            }
         } else null
         val seedDeferred = if (!explicitForeign && seed.isNotBlank() && seed.matches(Regex("^[A-Za-z0-9_-]{11}$"))) {
             async(Dispatchers.IO) {
@@ -2551,16 +2862,15 @@ object SonoraApiInterceptor {
         } else null
 
         val homeResult = withTimeoutOrNull(3600L) { homeDeferred.await() }
-        val storefrontFeed = if (storefrontDeferred != null) {
-            withTimeoutOrNull(4600L) { storefrontDeferred.await() } ?: HomeSubCache.StorefrontFeed(emptyList(), emptyList())
-        } else {
-            HomeSubCache.StorefrontFeed(emptyList(), emptyList())
-        }
+        val storefrontFeed = withTimeoutOrNull(6500L) { storefrontDeferred.await() }
+            ?: HomeSubCache.StorefrontFeed(emptyList(), emptyList())
+        val chartsResult = if (useYtmChartsForRegion) {
+            HomeSubCache.getCharts(locKey) ?: chartsDeferred?.let { withTimeoutOrNull(2000L) { it.await() } }
+        } else null
         val seedResult = seedDeferred?.let { withTimeoutOrNull(1200L) { it.await() } }
 
         var exploreResult = HomeSubCache.getExplore(locKey)
         var hitsResult = if (explicitForeign) HomeSubCache.getHits(locKey) else null
-        val chartsResult = HomeSubCache.getCharts(locKey)
 
         if (homeResult == null) {
             val expFallback = if (exploreResult == null) {
@@ -2599,6 +2909,7 @@ object SonoraApiInterceptor {
                         .filterTo(ytHomeQuick) {
                             !shouldFilterTrack(it) &&
                                 !isFeedVideoTrack(it) &&
+                                !isHomeMixOrSpamTrack(it) &&
                                 !(explicitForeign && !gl.equals("IT", true) && isItalianLeakArtist(it.artists, gl))
                         }
                     continue
@@ -2609,7 +2920,7 @@ object SonoraApiInterceptor {
                 for (item in sec.items) {
                     when (item) {
                         is SongItem -> if ((meta.key == "recommended_songs" || meta.key == "todays_hits") &&
-                            !shouldFilterTrack(item) && !isFeedVideoTrack(item) &&
+                            !shouldFilterTrack(item) && !isFeedVideoTrack(item) && !isHomeMixOrSpamTrack(item) &&
                             !(explicitForeign && !gl.equals("IT", true) && isItalianLeakArtist(item.artists, gl))
                         ) {
                             ytRecommendedSongs.add(item)
@@ -2627,110 +2938,90 @@ object SonoraApiInterceptor {
 
         val cleanYtHomeQuick = deduplicateAndPreferStudio(ytHomeQuick)
         val finalQuickSongs = if (explicitForeign) {
-            if (storefrontFeed.songs.size < 6 && hitsResult == null) {
-                hitsResult = withTimeoutOrNull(1800L) {
-                    YouTube.search(
-                        regionalFallbackQuery(RegionalQueryKind.HITS_HOME, gl, hl),
-                        YouTube.SearchFilter.FILTER_SONG
-                    ).getOrNull()?.also {
-                        if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putHits(it, 1800, locKey)
+            val hitsSeen = mutableSetOf<String>()
+            val quickSongs = mutableListOf<SongItem>()
+            fun addQuick(song: SongItem) {
+                if (quickSongs.size >= 24) return
+                if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && !isHomeMixOrSpamTrack(song) &&
+                    !(explicitForeign && !gl.equals("IT", true) && isItalianLeakArtist(song.artists, gl)) &&
+                    hitsSeen.add(song.id)
+                ) {
+                    quickSongs.add(song)
+                }
+            }
+            storefrontFeed.songs.forEach(::addQuick)
+            if (quickSongs.size < 10) {
+                cleanYtHomeQuick.forEach(::addQuick)
+                if (useYtmChartsForRegion) {
+                    chartsResult?.sections?.flatMap { it.items }?.filterIsInstance<SongItem>()?.forEach(::addQuick)
+                }
+            }
+            if (quickSongs.size < 6) {
+                if (hitsResult == null) {
+                    hitsResult = withTimeoutOrNull(1800L) {
+                        YouTube.search(
+                            regionalFallbackQuery(RegionalQueryKind.HITS_HOME, gl, hl),
+                            YouTube.SearchFilter.FILTER_SONG
+                        ).getOrNull()?.also {
+                            if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putHits(it, 1800, locKey)
+                        }
                     }
                 }
+                hitsResult?.items?.filterIsInstance<SongItem>()?.forEach(::addQuick)
+                ytRecommendedSongs.forEach(::addQuick)
             }
-            val hitsSeen = mutableSetOf<String>()
-            val regionalHits = deduplicateAndPreferStudio(buildList {
-                storefrontFeed.songs.forEach { song ->
-                    if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && hitsSeen.add(song.id)) add(song)
-                }
-                hitsResult?.items?.filterIsInstance<SongItem>()?.forEach { song ->
-                    if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && hitsSeen.add(song.id)) add(song)
-                }
-                chartsResult?.sections?.flatMap { it.items }?.filterIsInstance<SongItem>()?.forEach { song ->
-                    if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && hitsSeen.add(song.id)) add(song)
-                }
-            })
-            val quickSongs = mutableListOf<SongItem>()
-            val seenQuickIds = mutableSetOf<String>()
-            fun addQuick(song: SongItem) {
-                if (quickSongs.size < 32 && seenQuickIds.add(song.id)) quickSongs.add(song)
-            }
-            regionalHits.forEach(::addQuick)
-            cleanYtHomeQuick.forEach(::addQuick)
-            if (quickSongs.isEmpty()) ytRecommendedSongs.forEach(::addQuick)
             deduplicateAndPreferStudio(quickSongs).take(20)
-        } else if (cleanYtHomeQuick.isNotEmpty()) {
-            // Local/auto region: match Square by using YouTube Music's curated Home Quick Picks directly.
+        } else if (cleanYtHomeQuick.size >= 8) {
             cleanYtHomeQuick.take(20)
         } else {
             val fallbackQuick = buildList {
+                addAll(cleanYtHomeQuick)
+                storefrontFeed.songs.forEach { song ->
+                    if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && !isHomeMixOrSpamTrack(song)) add(song)
+                }
                 addAll(ytRecommendedSongs)
                 chartsResult?.sections?.flatMap { it.items }?.filterIsInstance<SongItem>()?.forEach { song ->
-                    if (!shouldFilterTrack(song) && !isFeedVideoTrack(song)) add(song)
+                    if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && !isHomeMixOrSpamTrack(song)) add(song)
                 }
                 seedResult?.items?.filterIsInstance<SongItem>()?.forEach { song ->
-                    if (!shouldFilterTrack(song) && !isFeedVideoTrack(song)) add(song)
+                    if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && !isHomeMixOrSpamTrack(song)) add(song)
                 }
             }
             deduplicateAndPreferStudio(fallbackQuick).take(20)
         }
 
-        // Local/auto region: match Square (use FEmusic_home's curated New Releases shelf exclusively).
-        // Explicit foreign region: use previous regional feed (Apple storefront albums + charts + non-leaking home).
-        val popularNewReleases = if (explicitForeign) {
+        val initialNewReleases = selectPopularNewReleases(
+            homeAlbums = homeNewReleaseAlbums,
+            exploreAlbums = exploreResult?.newReleaseAlbums.orEmpty(),
+            fallbackAlbums = emptyList(),
+            userArtistIds = aids.toSet(),
+            chartsResult = chartsResult,
+            gl = gl,
+            storefrontAlbums = storefrontFeed.albums
+        )
+        val popularNewReleases = if (initialNewReleases.isNotEmpty() || storefrontFeed.albums.isNotEmpty()) {
+            initialNewReleases
+        } else {
+            val browseRes = HomeSubCache.getNewReleases(locKey) ?: withTimeoutOrNull(2200L) {
+                YouTube.browse("FEmusic_new_releases", null, localeOverride = ytLocale).getOrNull()?.also { fetched ->
+                    if (fetched.items.isNotEmpty() && SonoraLocaleManager.cacheTag() == locKey) {
+                        HomeSubCache.putNewReleases(fetched, 1800, locKey)
+                    }
+                }
+            }
+            val browseAlbums = browseRes?.items.orEmpty()
+                .flatMap { it.items }
+                .filterIsInstance<AlbumItem>()
+                .filter { !shouldFilterReleaseAlbum(it) }
             selectPopularNewReleases(
                 homeAlbums = homeNewReleaseAlbums,
                 exploreAlbums = exploreResult?.newReleaseAlbums.orEmpty(),
-                fallbackAlbums = emptyList(),
+                fallbackAlbums = browseAlbums,
                 userArtistIds = aids.toSet(),
                 chartsResult = chartsResult,
                 gl = gl,
                 storefrontAlbums = storefrontFeed.albums
             )
-        } else {
-            val fallbackBrowseAlbums = if (homeNewReleaseAlbums.isEmpty()) {
-                val res = HomeSubCache.getNewReleases(locKey) ?: withTimeoutOrNull(2800L) {
-                    var fetched = YouTube.browse("FEmusic_new_releases", null, localeOverride = ytLocale).getOrNull()
-                    if ((fetched == null || fetched.items.isEmpty()) && !ytLocale.gl.equals("US", ignoreCase = true)) {
-                        fetched = YouTube.browse("FEmusic_new_releases", null, localeOverride = ytLocale.copy(gl = "US")).getOrNull()
-                    }
-                    if (fetched != null && fetched.items.isNotEmpty() && SonoraLocaleManager.cacheTag() == locKey) {
-                        HomeSubCache.putNewReleases(fetched, 1800, locKey)
-                    }
-                    fetched
-                }
-                if (exploreResult == null) {
-                    exploreResult = withTimeoutOrNull(1800L) {
-                        YouTube.explore(localeOverride = ytLocale).getOrNull()?.also {
-                            if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putExplore(it, 900, locKey)
-                        }
-                    }
-                }
-                res?.items.orEmpty()
-                    .flatMap { it.items }
-                    .filterIsInstance<AlbumItem>()
-                    .filter { !shouldFilterReleaseAlbum(it) }
-            } else {
-                emptyList()
-            }
-            buildList {
-                val seenIds = HashSet<String>()
-                val seenSigs = HashSet<String>()
-                fun addRelease(alb: AlbumItem) {
-                    if (size >= 16) return
-                    if (shouldFilterReleaseAlbum(alb)) return
-                    val validArt = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
-                    val sig = "${normCompactKey(alb.title)}|${normCompactKey(validArt)}"
-                    if (seenIds.add(alb.browseId) && (normCompactKey(alb.title).isEmpty() || seenSigs.add(sig))) {
-                        add(alb)
-                    }
-                }
-                if (homeNewReleaseAlbums.isNotEmpty()) {
-                    homeNewReleaseAlbums.forEach { addRelease(it) }
-                } else {
-                    fallbackBrowseAlbums.forEach { addRelease(it) }
-                    exploreResult?.newReleaseAlbums.orEmpty().forEach { addRelease(it) }
-                }
-            }
         }
 
         run {
@@ -2858,14 +3149,14 @@ object SonoraApiInterceptor {
             })
         }
 
+        sectionsList.removeAll { sec ->
+            val sk = sec.optString("sectionKey")
+            val t = sec.optString("title").lowercase()
+            sk == "new_releases" || "nuove uscite" in t || "new releases" in t
+        }
         if (popularNewReleases.isNotEmpty()) {
             val itemsArr = JSONArray()
             popularNewReleases.forEach { album -> itemsArr.put(album.toJson(thumbSize = HOME_THUMB_SIZE)) }
-            sectionsList.removeAll { sec ->
-                val sk = sec.optString("sectionKey")
-                val t = sec.optString("title").lowercase()
-                sk == "new_releases" || "nuove uscite" in t || "new releases" in t
-            }
             sectionsList.add(JSONObject().apply {
                 put("title", if (hl == "it") "Nuove uscite" else "New releases")
                 put("sectionKey", "new_releases")
@@ -2977,7 +3268,7 @@ object SonoraApiInterceptor {
         val locKey = SonoraLocaleManager.cacheTag()
         val gl = SonoraLocaleManager.resolvedCountry
         val hl = SonoraLocaleManager.resolvedLang
-        val cacheKey = "home_v13:$locKey:$seed:$artistsParam"
+        val cacheKey = "home_v15:$locKey:$seed:$artistsParam"
 
         if (!forceRefresh) {
             ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
@@ -2990,14 +3281,14 @@ object SonoraApiInterceptor {
             .take(3)
             .sorted()
             .joinToString(",")
-        val snapshotKey = if (normalizedArtists.isEmpty()) "home_default_v13:$locKey" else "home_v13:$locKey:$normalizedArtists"
-        val lastGoodKey = "home_last_good_v13:$locKey"
+        val snapshotKey = if (normalizedArtists.isEmpty()) "home_default_v15:$locKey" else "home_v15:$locKey:$normalizedArtists"
+        val lastGoodKey = "home_last_good_v15:$locKey"
 
         if (!forceRefresh) {
             val disk = SnapshotDiskCache.get(snapshotKey, freshTtlMs = 600_000L)
             if (disk != null) {
                 val completeDisk = homeHasAppleNewReleases(disk.data)
-                val needsImmediateHeal = !completeDisk && AppleCatalog.hasReadyToken()
+                val needsImmediateHeal = !completeDisk
                 if (disk.isFresh && !needsImmediateHeal) {
                     ApiCache.put(cacheKey, disk.data, 300)
                 } else {
@@ -3007,7 +3298,7 @@ object SonoraApiInterceptor {
                         if (SonoraLocaleManager.cacheTag() != locKey) return@revalidate
                         ensureLocale()
                         val (fresh, valid) = buildHomeJson(seed, artistsParam, locKey, gl, hl)
-                        val completeFresh = valid && (AppleCatalog.hasReadyToken() || homeHasAppleNewReleases(fresh))
+                        val completeFresh = valid && homeHasAppleNewReleases(fresh)
                         if (valid && SonoraLocaleManager.cacheTag() == locKey) {
                             ApiCache.put(cacheKey, fresh, if (completeFresh) 600 else 20)
                             if (completeFresh) {
@@ -3023,7 +3314,7 @@ object SonoraApiInterceptor {
             val lastGood = SnapshotDiskCache.get(lastGoodKey, freshTtlMs = 600_000L)
             if (lastGood != null) {
                 val completeLast = homeHasAppleNewReleases(lastGood.data)
-                val needsImmediateHeal = !completeLast && AppleCatalog.hasReadyToken()
+                val needsImmediateHeal = !completeLast
                 ApiCache.put(cacheKey, lastGood.data, if (needsImmediateHeal) 15 else 60)
                 if (!lastGood.isFresh || normalizedArtists.isNotEmpty() || needsImmediateHeal) {
                     SnapshotDiskCache.revalidate(snapshotKey) {
@@ -3031,7 +3322,7 @@ object SonoraApiInterceptor {
                         if (SonoraLocaleManager.cacheTag() != locKey) return@revalidate
                         ensureLocale()
                         val (fresh, valid) = buildHomeJson(seed, artistsParam, locKey, gl, hl)
-                        val completeFresh = valid && (AppleCatalog.hasReadyToken() || homeHasAppleNewReleases(fresh))
+                        val completeFresh = valid && homeHasAppleNewReleases(fresh)
                         if (valid && SonoraLocaleManager.cacheTag() == locKey) {
                             ApiCache.put(cacheKey, fresh, if (completeFresh) 600 else 20)
                             if (completeFresh) {
@@ -3049,7 +3340,7 @@ object SonoraApiInterceptor {
 
         val (rootStr, valid) = buildHomeJson(seed, artistsParam, locKey, gl, hl)
         if (valid && SonoraLocaleManager.cacheTag() == locKey) {
-            val completeFresh = AppleCatalog.hasReadyToken() || homeHasAppleNewReleases(rootStr)
+            val completeFresh = homeHasAppleNewReleases(rootStr)
             ApiCache.put(cacheKey, rootStr, if (completeFresh) 600 else 20)
             if (completeFresh) {
                 SnapshotDiskCache.putAsync(snapshotKey, rootStr)
@@ -5147,11 +5438,13 @@ object SonoraApiInterceptor {
                 async(Dispatchers.IO) { YouTube.playlist(pl.id).getOrNull()?.songs.orEmpty() }
             }
 
-            val storefrontFeed = withTimeoutOrNull(4200L) { storefrontDeferred.await() } ?: HomeSubCache.StorefrontFeed(emptyList(), emptyList())
+            val storefrontFeed = withTimeoutOrNull(6500L) { storefrontDeferred.await() } ?: HomeSubCache.StorefrontFeed(emptyList(), emptyList())
             val exploreResult = exploreDeferred.await()
             val trendingFromPl = trendingPlDeferred?.await().orEmpty().ifEmpty { directTrendingSongs }
+                .filter { !shouldFilterTrack(it) && !isFeedVideoTrack(it) && !isHomeMixOrSpamTrack(it) }
                 .filterNot { explicitForeign && !gl.equals("IT", true) && isItalianLeakArtist(it.artists, gl) }
             val topFromPl = topPlDeferred?.await().orEmpty().ifEmpty { directTopSongs }
+                .filter { !shouldFilterTrack(it) && !isFeedVideoTrack(it) && !isHomeMixOrSpamTrack(it) }
                 .filterNot { explicitForeign && !gl.equals("IT", true) && isItalianLeakArtist(it.artists, gl) }
 
             val useChartArtists = chartArtists.isNotEmpty() && !explicitForeign
@@ -5195,7 +5488,7 @@ object SonoraApiInterceptor {
                 gl = gl,
                 storefrontAlbums = storefrontFeed.albums
             )
-            val fallbackAlbumsDeferred = if (preSelectedAlbums.size < 6) {
+            val fallbackAlbumsDeferred = if (preSelectedAlbums.isEmpty() && storefrontFeed.albums.isEmpty()) {
                 async(Dispatchers.IO) {
                     val query = regionalFallbackQuery(RegionalQueryKind.CHARTS_NEW_RELEASES, gl, hl)
                     YouTube.search(query, YouTube.SearchFilter.FILTER_ALBUM).getOrNull()
@@ -5203,11 +5496,14 @@ object SonoraApiInterceptor {
                 }
             } else null
 
+            val useForeignStorefrontOnly = explicitForeign && !gl.equals("IT", true) && storefrontFeed.songs.size >= 8
             val trendingSongs = deduplicateAndPreferStudio(
-                storefrontFeed.songs + trendingFromPl.ifEmpty { fallbackTrendingDeferred?.await().orEmpty() }
+                if (useForeignStorefrontOnly) storefrontFeed.songs
+                else storefrontFeed.songs + trendingFromPl.ifEmpty { fallbackTrendingDeferred?.await().orEmpty() }
             )
             val topSongs = deduplicateAndPreferStudio(
-                storefrontFeed.songs + topFromPl.ifEmpty {
+                if (useForeignStorefrontOnly) storefrontFeed.songs
+                else storefrontFeed.songs + topFromPl.ifEmpty {
                     trendingSongs.ifEmpty {
                         val query = regionalFallbackQuery(RegionalQueryKind.CHARTS_TOP_SONGS, gl, hl)
                         YouTube.search(query, YouTube.SearchFilter.FILTER_SONG).getOrNull()
@@ -5311,7 +5607,7 @@ object SonoraApiInterceptor {
         val locKey = SonoraLocaleManager.cacheTag()
         val gl = SonoraLocaleManager.resolvedCountry
         val hl = SonoraLocaleManager.resolvedLang
-        val cacheKey = "charts_v4:$locKey"
+        val cacheKey = "charts_v6:$locKey"
         ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
 
         val disk = SnapshotDiskCache.get(cacheKey, freshTtlMs = 900_000L)

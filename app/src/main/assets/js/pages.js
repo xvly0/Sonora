@@ -940,23 +940,38 @@ function heroBtnAlpha(P) {
 }
 function heroControls(c, P, y, list) {
   const g = heroGeom(y), tn = tintOf(P), pCol = tn ? tn.playCol : '#111';
+  const curIt = P && P.data ? P.data.item : null;
+  const pk = 'hPlay:' + (curIt && curIt.id ? curIt.id : 'x');
   P.heroY = y;
   const al = heroBtnAlpha(P);
   if (al > .01) {
+    const pf = typeof pressFactor === 'function' ? pressFactor(pk) : 0;
+    const sc = pf > 0.001 ? (1 - pf * 0.018) : 1;
+    const cx = g.px + g.pw / 2, cy = y + g.ph / 2;
     c.save(); c.globalAlpha *= al;
+    if (sc !== 1) { c.translate(cx, cy); c.scale(sc, sc); c.translate(-cx, -cy); }
     c.save();
-    if (!pal.dark) { c.shadowColor = 'rgba(0,0,0,' + (.12 * al).toFixed(3) + ')'; c.shadowBlur = 10; c.shadowOffsetY = 3; }
+    const shAlpha = (pal.dark ? .30 : .10) * al * (1 - pf * 0.12);
+    c.shadowColor = 'rgba(0,0,0,' + shAlpha.toFixed(3) + ')';
+    c.shadowBlur = 12 - pf * 2;
+    c.shadowOffsetY = 2 - pf * 0.5;
     rrPath(c, g.px, y, g.pw, g.ph, g.ph / 2); c.fillStyle = '#ffffff'; c.fill();
     c.restore();
+    if (pf > 0.001) {
+      c.save();
+      rrPath(c, g.px, y, g.pw, g.ph, g.ph / 2);
+      c.fillStyle = 'rgba(0,0,0,' + (0.045 * pf).toFixed(4) + ')';
+      c.fill();
+      c.restore();
+    }
     const playLbl = t('common.play');
     c.font = F(500, 16.5); const tw = c.measureText(playLbl).width, sx = g.px + (g.pw - (tw + 26)) / 2;
-    icon(c, 'play', sx + 7, y + g.ph / 2, 16, pCol); txt(c, playLbl, sx + 25, y + g.ph / 2 + 5.8, F(500, 16.5), pCol);
+    icon(c, 'play', sx + 7, cy, 16, pCol); txt(c, playLbl, sx + 25, cy + 5.8, F(500, 16.5), pCol);
     c.restore();
   }
   if (al > .2) {
-    const curIt = P && P.data ? P.data.item : null;
     hit(g.x0, g.cy, g.cd, g.cd, () => playShuffled(list), { pressKey: 'hShuf:' + (curIt && curIt.id ? curIt.id : 'x') });
-    hit(g.px, y, g.pw, g.ph, () => playList(list, 0), { pressKey: 'hPlay:' + (curIt && curIt.id ? curIt.id : 'x') });
+    hit(g.px, y, g.pw, g.ph, () => playList(list, 0), { pressKey: pk });
     hit(g.x1, g.cy, g.cd, g.cd, () => {
       if (typeof requestDownloadItem === 'function') {
         requestDownloadItem(curIt, curIt ? tracksOf(curIt) : list);
