@@ -14,6 +14,7 @@ import com.metrolist.innertube.models.WatchEndpoint
 import com.metrolist.innertube.models.YouTubeLocale
 import com.metrolist.innertube.models.YTItem
 import com.metrolist.innertube.pages.ArtistPage
+import com.metrolist.innertube.pages.BrowseResult
 import com.metrolist.innertube.pages.ChartsPage
 import com.metrolist.innertube.pages.ExplorePage
 import com.metrolist.innertube.pages.HomePage
@@ -305,6 +306,7 @@ object HomeSubCache {
     private val cachedExplore = ConcurrentHashMap<String, Entry<ExplorePage>>()
     private val cachedHits = ConcurrentHashMap<String, Entry<SearchResult>>()
     private val cachedCharts = ConcurrentHashMap<String, Entry<ChartsPage>>()
+    private val cachedNewReleases = ConcurrentHashMap<String, Entry<BrowseResult>>()
     private val cachedStorefront = ConcurrentHashMap<String, Entry<StorefrontFeed>>()
     private val artistCache = ConcurrentHashMap<String, Entry<ArtistPage>>()
     private val artistThumbCache = ConcurrentHashMap<String, Entry<String>>()
@@ -329,6 +331,7 @@ object HomeSubCache {
         cachedExplore.remove(locKey)
         cachedHits.remove(locKey)
         cachedCharts.remove(locKey)
+        cachedNewReleases.remove(locKey)
         cachedStorefront.remove(gl.trim().uppercase())
     }
 
@@ -382,6 +385,19 @@ object HomeSubCache {
 
     fun putCharts(res: ChartsPage, ttlSeconds: Long = 1800, locKey: String = SonoraLocaleManager.cacheTag()) {
         cachedCharts[locKey] = Entry(System.currentTimeMillis() + ttlSeconds * 1000L, res)
+    }
+
+    fun getNewReleases(locKey: String = SonoraLocaleManager.cacheTag()): BrowseResult? {
+        val e = cachedNewReleases[locKey] ?: return null
+        if (System.currentTimeMillis() > e.expiry) {
+            cachedNewReleases.remove(locKey, e)
+            return null
+        }
+        return e.value
+    }
+
+    fun putNewReleases(res: BrowseResult, ttlSeconds: Long = 1800, locKey: String = SonoraLocaleManager.cacheTag()) {
+        cachedNewReleases[locKey] = Entry(System.currentTimeMillis() + ttlSeconds * 1000L, res)
     }
 
     private const val MAX_ARTISTS = 200
@@ -476,6 +492,7 @@ object HomeSubCache {
         cachedExplore.clear()
         cachedHits.clear()
         cachedCharts.clear()
+        cachedNewReleases.clear()
         cachedStorefront.clear()
         artistCache.clear()
     }
@@ -1678,7 +1695,7 @@ object SonoraApiInterceptor {
         val keys = if (exactKey != primaryKey) listOf(exactKey, primaryKey) else listOf(primaryKey)
         for (k in keys) {
             HomeSubCache.getAlbumThumb(k)?.let { return resizeCoverApiUrl(it, effSize) }
-            val disk = SnapshotDiskCache.get("albthumb_v2:$k", freshTtlMs = 7L * 24 * 60 * 60 * 1000L)?.data?.takeIf { it.isNotBlank() }
+            val disk = SnapshotDiskCache.get("albthumb_v3:$k", freshTtlMs = 7L * 24 * 60 * 60 * 1000L)?.data?.takeIf { it.isNotBlank() }
             if (disk != null) {
                 val canonical = resizeCoverApiUrl(disk, 544)
                 HomeSubCache.putAlbumThumb(k, canonical)
@@ -1697,10 +1714,66 @@ object SonoraApiInterceptor {
         val exactKey = if (rawTitle.isNotEmpty()) "$rawTitle|$cleanArt" else primaryKey
         val normalized = resizeCoverApiUrl(thumbUrl, 544)
         HomeSubCache.putAlbumThumb(primaryKey, normalized)
-        SnapshotDiskCache.putAsync("albthumb_v2:$primaryKey", normalized)
+        SnapshotDiskCache.putAsync("albthumb_v3:$primaryKey", normalized)
         if (exactKey != primaryKey) {
             HomeSubCache.putAlbumThumb(exactKey, normalized)
-            SnapshotDiskCache.putAsync("albthumb_v2:$exactKey", normalized)
+            SnapshotDiskCache.putAsync("albthumb_v3:$exactKey", normalized)
+        }
+    }
+
+    private val albumThumbMissUntil = ConcurrentHashMap<String, Long>()
+    private const val ALBUM_THUMB_MISS_TTL_MS = 2L * 60L * 1000L
+
+    private suspend fun fetchItunesAlbumCover(title: String, artist: String): String? {
+        val cleanTitle = stripTitleDecorations(title).ifBlank { title.trim() }
+        if (cleanTitle.isEmpty()) return null
+        val targetCore = normTitleCore(title)
+        if (targetCore.isEmpty()) return null
+        val gl = SonoraLocaleManager.resolvedCountry.ifBlank { "IT" }.uppercase()
+        val firstArtist = artist.split(ALBUM_ARTIST_SPLIT_RE).firstOrNull()?.let { cleanArtistKey(it) }.orEmpty()
+        val queryText = if (firstArtist.isNotBlank()) "$firstArtist $cleanTitle" else cleanTitle
+        val encoded = URLEncoder.encode(queryText, "UTF-8")
+        val url = "https://itunes.apple.com/search?country=$gl&media=music&entity=album&limit=12&term=$encoded"
+        val (body, ok) = fetchItunesSearchJson(url)
+        if (!ok || body.isNullOrBlank()) return null
+        val results = runCatching { JSONObject(body).optJSONArray("results") }.getOrNull() ?: return null
+
+        var bestUrl: String? = null
+        var bestScore = Int.MIN_VALUE
+        for (i in 0 until results.length()) {
+            val row = results.optJSONObject(i) ?: continue
+            val art100 = row.optString("artworkUrl100").trim()
+            if (art100.isBlank()) continue
+            val colName = row.optString("collectionName").trim()
+            val rowArtist = row.optString("artistName").trim()
+            val colCore = normTitleCore(colName)
+            if (colCore.isEmpty()) continue
+            val exactCore = colCore == targetCore
+            val prefixCore = !exactCore && (colCore.startsWith(targetCore) || targetCore.startsWith(colCore))
+            if (!exactCore && !prefixCore) continue
+            if (firstArtist.isNotBlank()) {
+                val artistOk = artistSharesPrimaryToken(rowArtist, artist) ||
+                    artistSharesPrimaryToken(artist, rowArtist) ||
+                    artistSharesPrimaryToken(rowArtist, firstArtist)
+                if (!artistOk) continue
+            }
+            val trackCount = row.optInt("trackCount", 0)
+            val isSingleOrEp = SINGLE_OR_EP_SUFFIX_REGEX.containsMatchIn(colName) || trackCount == 1
+            var score = 0
+            score += if (exactCore) 20 else 6
+            if (!isSingleOrEp && trackCount >= 4) score += 10
+            else if (!isSingleOrEp) score += 4
+            if (colName.substringBefore(" - ").trim().equals(cleanTitle, ignoreCase = true)) score += 6
+            if (score > bestScore) {
+                bestScore = score
+                bestUrl = art100
+            }
+        }
+        val rawCover = bestUrl ?: return null
+        return if (MZSTATIC_DIM_REGEX.containsMatchIn(rawCover)) {
+            MZSTATIC_DIM_REGEX.replace(rawCover) { m -> "/1200x1200${m.groupValues[3]}" }
+        } else {
+            rawCover
         }
     }
 
@@ -1709,15 +1782,39 @@ object SonoraApiInterceptor {
         if (cleanTitle.isEmpty()) return null
         val effSize = size.coerceIn(120, 1400)
         peekCachedAlbumThumb(cleanTitle, artist, effSize)?.let { return it }
-        return runCatching {
+        val baseKey = normAlbumCacheKey(cleanTitle, artist)
+        val hasToken = AppleCatalog.hasReadyToken()
+        val scopedMissKey = if (baseKey.isNotEmpty()) "$baseKey|${if (hasToken) 1 else 0}" else ""
+        if (scopedMissKey.isNotEmpty()) {
+            val blockedUntil = albumThumbMissUntil[scopedMissKey]
+            if (blockedUntil != null && System.currentTimeMillis() < blockedUntil) return null
+        }
+        val resolved = runCatching {
             val cleanArtist = artist.split(ALBUM_ARTIST_SPLIT_RE).firstOrNull()?.let { cleanArtistKey(it) }.orEmpty()
-            val album = AppleCatalog.album(cleanTitle, cleanArtist)
-                ?: (if (cleanArtist != artist.trim()) AppleCatalog.album(cleanTitle, artist.trim()) else null)
-            val cover = album?.coverUrl?.takeIf { it.isNotBlank() } ?: return@runCatching null
-            val proxied = "/api/cover?u=${URLEncoder.encode(cover, "UTF-8")}&s=$effSize"
-            rememberResolvedAlbumThumb(cleanTitle, artist, proxied)
-            proxied
+            var cover: String? = null
+            if (hasToken) {
+                val album = AppleCatalog.album(cleanTitle, cleanArtist)
+                    ?: (if (cleanArtist != artist.trim()) AppleCatalog.album(cleanTitle, artist.trim()) else null)
+                cover = album?.coverUrl?.takeIf { it.isNotBlank() }
+            }
+            if (cover == null) {
+                cover = fetchItunesAlbumCover(cleanTitle, artist)
+            }
+            cover ?: return@runCatching null
         }.getOrNull()
+        if (resolved == null) {
+            if (scopedMissKey.isNotEmpty()) {
+                albumThumbMissUntil[scopedMissKey] = System.currentTimeMillis() + ALBUM_THUMB_MISS_TTL_MS
+            }
+            return null
+        }
+        if (baseKey.isNotEmpty()) {
+            albumThumbMissUntil.remove("$baseKey|0")
+            albumThumbMissUntil.remove("$baseKey|1")
+        }
+        val proxied = "/api/cover?u=${URLEncoder.encode(resolved, "UTF-8")}&s=$effSize"
+        rememberResolvedAlbumThumb(cleanTitle, artist, proxied)
+        return proxied
     }
 
     private const val VISITOR_DATA_KEY_PREFIX = "yt_visitor_data_v2_"
@@ -2136,6 +2233,28 @@ object SonoraApiInterceptor {
         }.getOrDefault(emptyList())
     }
 
+    private fun normAlbumBaseTitle(title: String): String =
+        normAlbumCacheKey(title, "").substringBefore('|')
+
+    private fun storefrontAlbumMatches(item: AlbumItem, entryTitle: String, entryArtist: String): Boolean {
+        if (shouldFilterReleaseAlbum(item)) return false
+        val itemBase = normAlbumBaseTitle(item.title)
+        val entryBase = normAlbumBaseTitle(entryTitle)
+        if (itemBase.isEmpty() || entryBase.isEmpty()) return false
+        val itemCore = normTitleCore(item.title)
+        val entryCore = normTitleCore(entryTitle)
+        val titleOk = itemBase == entryBase || (itemCore.isNotEmpty() && itemCore == entryCore)
+        if (!titleOk) return false
+        val validArtists = cleanArtistsList(item.artists)
+        if (validArtists.isNotEmpty()) {
+            val artistOk = validArtists.any {
+                artistSharesPrimaryToken(it.name, entryArtist) || artistSharesPrimaryToken(entryArtist, it.name)
+            }
+            if (!artistOk) return false
+        }
+        return true
+    }
+
     private suspend fun fetchStorefrontRegionalFeed(gl: String): HomeSubCache.StorefrontFeed {
         HomeSubCache.getStorefront(gl)?.let { return it }
         val sf = gl.trim().lowercase().takeIf { it.length == 2 } ?: "us"
@@ -2165,12 +2284,27 @@ object SonoraApiInterceptor {
                             songSem.withPermit {
                                 withTimeoutOrNull(1400L) {
                                     val res = YouTube.search("${entry.title} ${entry.artist}", YouTube.SearchFilter.FILTER_SONG).getOrNull()
+                                    val targetCore = normTitleCore(entry.title)
                                     val item = res?.items?.filterIsInstance<SongItem>()
-                                        ?.firstOrNull { !shouldFilterTrack(it) && !isFeedVideoTrack(it) }
+                                        ?.firstOrNull { cand ->
+                                            if (shouldFilterTrack(cand) || isFeedVideoTrack(cand)) return@firstOrNull false
+                                            val candCore = normTitleCore(cand.title)
+                                            val titleOk = candCore.isNotEmpty() && targetCore.isNotEmpty() &&
+                                                (candCore == targetCore ||
+                                                    (targetCore.length >= 5 && candCore.contains(targetCore)) ||
+                                                    (candCore.length >= 5 && targetCore.contains(candCore)))
+                                            if (!titleOk) return@firstOrNull false
+                                            val validArtists = cleanArtistsList(cand.artists)
+                                            validArtists.isEmpty() || validArtists.any {
+                                                artistSharesPrimaryToken(it.name, entry.artist) || artistSharesPrimaryToken(entry.artist, it.name)
+                                            }
+                                        }
                                     if (item != null && !entry.artUrl.isNullOrBlank()) {
-                                        val proxyCover = "/api/cover?u=${URLEncoder.encode(entry.artUrl, "UTF-8")}&s=544"
-                                        val alb = item.album?.name?.trim().orEmpty().ifEmpty { entry.title }
-                                        rememberResolvedAlbumThumb(alb, entry.artist, proxyCover)
+                                        val alb = item.album?.name?.trim().orEmpty()
+                                        if (alb.isNotEmpty() && normTitleCore(alb) == targetCore) {
+                                            val proxyCover = "/api/cover?u=${URLEncoder.encode(entry.artUrl, "UTF-8")}&s=544"
+                                            rememberResolvedAlbumThumb(alb, entry.artist, proxyCover)
+                                        }
                                     }
                                     item
                                 }
@@ -2187,7 +2321,7 @@ object SonoraApiInterceptor {
                                 withTimeoutOrNull(1400L) {
                                     val res = YouTube.search("${entry.title} ${entry.artist}", YouTube.SearchFilter.FILTER_ALBUM).getOrNull()
                                     val item = res?.items?.filterIsInstance<AlbumItem>()
-                                        ?.firstOrNull { !shouldFilterReleaseAlbum(it) }
+                                        ?.firstOrNull { storefrontAlbumMatches(it, entry.title, entry.artist) }
                                     if (item != null && !entry.artUrl.isNullOrBlank()) {
                                         val proxyCover = "/api/cover?u=${URLEncoder.encode(entry.artUrl, "UTF-8")}&s=544"
                                         val albArt = cleanArtistsList(item.artists).firstOrNull()?.name ?: entry.artist
@@ -2225,23 +2359,19 @@ object SonoraApiInterceptor {
                 if (SonoraLocaleManager.cacheTag() != locKey) return@launch
                 ensureLocale()
                 val ytLocale = SonoraLocaleManager.effectiveRegionalYoutubeLocale(gl, hl)
-                if (HomeSubCache.getStorefront(gl) == null) {
-                    withTimeoutOrNull(4500L) { fetchStorefrontRegionalFeed(gl) }
+                if (HomeSubCache.getNewReleases(locKey) == null && SonoraLocaleManager.cacheTag() == locKey) {
+                    withTimeoutOrNull(2500L) {
+                        YouTube.browse("FEmusic_new_releases", null, localeOverride = ytLocale).getOrNull()?.also {
+                            if (SonoraLocaleManager.cacheTag() == locKey && it.items.isNotEmpty()) {
+                                HomeSubCache.putNewReleases(it, 1800, locKey)
+                            }
+                        }
+                    }
                 }
                 if (HomeSubCache.getExplore(locKey) == null && SonoraLocaleManager.cacheTag() == locKey) {
                     withTimeoutOrNull(2500L) {
                         YouTube.explore(localeOverride = ytLocale).getOrNull()?.also {
                             if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putExplore(it, 900, locKey)
-                        }
-                    }
-                }
-                if (HomeSubCache.getHits(locKey) == null && SonoraLocaleManager.cacheTag() == locKey) {
-                    withTimeoutOrNull(2500L) {
-                        YouTube.search(
-                            regionalFallbackQuery(RegionalQueryKind.HITS_HOME, gl, hl),
-                            YouTube.SearchFilter.FILTER_SONG
-                        ).getOrNull()?.also {
-                            if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putHits(it, 1800, locKey)
                         }
                     }
                 }
@@ -2282,7 +2412,7 @@ object SonoraApiInterceptor {
                 YouTube.visitorData = disk.data
                 if (!disk.isFresh) refreshVisitorDataAsync(locKey)
             } else {
-                withTimeoutOrNull(750L) { ensureVisitorData() }
+                withTimeoutOrNull(1500L) { ensureVisitorData() }
                 if (YouTube.visitorData.isNullOrBlank()) refreshVisitorDataAsync(locKey)
             }
         }
@@ -2295,12 +2425,32 @@ object SonoraApiInterceptor {
         val ytLocale = SonoraLocaleManager.effectiveRegionalYoutubeLocale(gl, hl)
 
         val homeDeferred = async(Dispatchers.IO) {
-            HomeSubCache.getHome(locKey) ?: YouTube.home(localeOverride = ytLocale).getOrNull()?.also {
-                if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putHome(it, 600, locKey)
+            HomeSubCache.getHome(locKey) ?: run {
+                var effectiveLoc = ytLocale
+                var page = YouTube.home(localeOverride = effectiveLoc).getOrNull()
+                if ((page == null || page.sections.isEmpty()) && !effectiveLoc.gl.equals("US", ignoreCase = true)) {
+                    effectiveLoc = effectiveLoc.copy(gl = "US")
+                    page = YouTube.home(localeOverride = effectiveLoc).getOrNull()
+                }
+                if (page != null && page.sections.isNotEmpty()) {
+                    val mergedSections = page.sections.toMutableList()
+                    val cont = page.continuation
+                    if (!cont.isNullOrBlank()) {
+                        val nextPage = withTimeoutOrNull(1800L) {
+                            YouTube.home(continuation = cont, localeOverride = effectiveLoc).getOrNull()
+                        }
+                        if (nextPage != null && nextPage.sections.isNotEmpty()) {
+                            val seenTitles = mergedSections.map { it.title.lowercase() }.toHashSet()
+                            nextPage.sections.forEach { sec ->
+                                if (seenTitles.add(sec.title.lowercase())) mergedSections.add(sec)
+                            }
+                            page = HomePage(page.chips, mergedSections, nextPage.continuation)
+                        }
+                    }
+                    if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putHome(page, 600, locKey)
+                }
+                page
             }
-        }
-        val storefrontDeferred = async(Dispatchers.IO) {
-            fetchStorefrontRegionalFeed(gl)
         }
         val seedDeferred = if (!explicitForeign && seed.isNotBlank() && seed.matches(Regex("^[A-Za-z0-9_-]{11}$"))) {
             async(Dispatchers.IO) {
@@ -2308,30 +2458,23 @@ object SonoraApiInterceptor {
             }
         } else null
 
-        val homeResult = withTimeoutOrNull(3200L) { homeDeferred.await() }
-        val storefrontFeed = withTimeoutOrNull(4600L) { storefrontDeferred.await() } ?: HomeSubCache.StorefrontFeed(emptyList(), emptyList())
+        val homeResult = withTimeoutOrNull(3600L) { homeDeferred.await() }
         val seedResult = seedDeferred?.let { withTimeoutOrNull(1200L) { it.await() } }
 
         var exploreResult = HomeSubCache.getExplore(locKey)
-        var hitsResult = HomeSubCache.getHits(locKey)
         val chartsResult = HomeSubCache.getCharts(locKey)
 
-        if (homeResult == null) {
-            val expFallback = async(Dispatchers.IO) {
-                exploreResult ?: YouTube.explore(localeOverride = ytLocale).getOrNull()?.also { HomeSubCache.putExplore(it, 900, locKey) }
+        if (homeResult == null && exploreResult == null) {
+            exploreResult = withTimeoutOrNull(1800L) {
+                YouTube.explore(localeOverride = ytLocale).getOrNull()?.also {
+                    if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putExplore(it, 900, locKey)
+                }
             }
-            val hitsFallback = async(Dispatchers.IO) {
-                hitsResult ?: YouTube.search(
-                    regionalFallbackQuery(RegionalQueryKind.HITS_HOME, gl, hl),
-                    YouTube.SearchFilter.FILTER_SONG
-                ).getOrNull()?.also { HomeSubCache.putHits(it, 1800, locKey) }
-            }
-            exploreResult = withTimeoutOrNull(1800L) { expFallback.await() }
-            hitsResult = withTimeoutOrNull(1800L) { hitsFallback.await() }
         }
 
         val sectionsList = mutableListOf<JSONObject>()
         val ytHomeQuick = mutableListOf<SongItem>()
+        val ytRecommendedSongs = mutableListOf<SongItem>()
         val homeNewReleaseAlbums = mutableListOf<AlbumItem>()
         val homeSectionAlbums = mutableListOf<AlbumItem>()
         val homeSectionArtists = mutableListOf<ArtistItem>()
@@ -2353,6 +2496,12 @@ object SonoraApiInterceptor {
                 }
                 for (item in sec.items) {
                     when (item) {
+                        is SongItem -> if ((meta.key == "recommended_songs" || meta.key == "todays_hits") &&
+                            !shouldFilterTrack(item) && !isFeedVideoTrack(item) &&
+                            !(explicitForeign && !gl.equals("IT", true) && isItalianLeakArtist(item.artists, gl))
+                        ) {
+                            ytRecommendedSongs.add(item)
+                        }
                         is AlbumItem -> if (!shouldFilterReleaseAlbum(item) && !(explicitForeign && !gl.equals("IT", true) && isItalianLeakArtist(item.artists, gl))) {
                             homeSectionAlbums.add(item)
                             if (meta.key == "new_releases") homeNewReleaseAlbums.add(item)
@@ -2364,93 +2513,77 @@ object SonoraApiInterceptor {
             }
         }
 
-        val seedTracks = if (explicitForeign) emptyList() else deduplicateAndPreferStudio(
-            seedResult?.items?.filterIsInstance<SongItem>()
-                ?.filter { !shouldFilterTrack(it) && !isFeedVideoTrack(it) }
-                .orEmpty()
-        )
-        if (storefrontFeed.songs.size < 6 && hitsResult == null) {
-            hitsResult = withTimeoutOrNull(1800L) {
-                YouTube.search(
-                    regionalFallbackQuery(RegionalQueryKind.HITS_HOME, gl, hl),
-                    YouTube.SearchFilter.FILTER_SONG
-                ).getOrNull()?.also {
-                    if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putHits(it, 1800, locKey)
-                }
-            }
-        }
-        val hitsSeen = mutableSetOf<String>()
-        val regionalHits = deduplicateAndPreferStudio(buildList {
-            storefrontFeed.songs.forEach { song ->
-                if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && hitsSeen.add(song.id)) add(song)
-            }
-            hitsResult?.items?.filterIsInstance<SongItem>()?.forEach { song ->
-                if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && hitsSeen.add(song.id)) add(song)
-            }
-            chartsResult?.sections?.flatMap { it.items }?.filterIsInstance<SongItem>()?.forEach { song ->
-                if (!shouldFilterTrack(song) && !isFeedVideoTrack(song) && hitsSeen.add(song.id)) add(song)
-            }
-        })
+        // Match Square: use YouTube Music's curated Home Quick Picks directly without overriding with RSS/search noise.
         val cleanYtHomeQuick = deduplicateAndPreferStudio(ytHomeQuick)
-
-        val quickSongs = mutableListOf<SongItem>()
-        val seenQuickIds = mutableSetOf<String>()
-        fun addQuick(song: SongItem): Boolean {
-            if (quickSongs.size >= 32 || !seenQuickIds.add(song.id)) return false
-            quickSongs.add(song)
-            return true
-        }
-
-        if (explicitForeign || seedTracks.isEmpty()) {
-            regionalHits.forEach { addQuick(it) }
-            cleanYtHomeQuick.forEach { addQuick(it) }
+        val finalQuickSongs = if (cleanYtHomeQuick.isNotEmpty()) {
+            cleanYtHomeQuick.take(20)
         } else {
-            val regionalPool = buildList {
-                val poolSeen = mutableSetOf<String>()
-                regionalHits.forEach { if (poolSeen.add(it.id)) add(it) }
-                cleanYtHomeQuick.forEach { if (poolSeen.add(it.id)) add(it) }
+            val fallbackQuick = buildList {
+                addAll(ytRecommendedSongs)
+                chartsResult?.sections?.flatMap { it.items }?.filterIsInstance<SongItem>()?.forEach { song ->
+                    if (!shouldFilterTrack(song) && !isFeedVideoTrack(song)) add(song)
+                }
+                if (!explicitForeign) {
+                    seedResult?.items?.filterIsInstance<SongItem>()?.forEach { song ->
+                        if (!shouldFilterTrack(song) && !isFeedVideoTrack(song)) add(song)
+                    }
+                }
             }
-            if (regionalPool.isNotEmpty()) {
-                var ri = 0
-                var si = 0
-                val seedBudget = if (regionalHits.size >= 8) 5 else 6
-                var seedUsed = 0
-                while (ri < 3 && ri < regionalPool.size && quickSongs.size < 32) {
-                    addQuick(regionalPool[ri++])
+            deduplicateAndPreferStudio(fallbackQuick).take(20)
+        }
+
+        // Match Square: Home New Releases come from FEmusic_home's own New Releases shelf (localized editorial picks)
+        // and must NOT be padded with FEmusic_new_releases/Explore (which mixes global/foreign catalog releases).
+        val fallbackBrowseAlbums = if (homeNewReleaseAlbums.isEmpty()) {
+            val res = HomeSubCache.getNewReleases(locKey) ?: withTimeoutOrNull(2800L) {
+                var fetched = YouTube.browse("FEmusic_new_releases", null, localeOverride = ytLocale).getOrNull()
+                if ((fetched == null || fetched.items.isEmpty()) && !ytLocale.gl.equals("US", ignoreCase = true)) {
+                    fetched = YouTube.browse("FEmusic_new_releases", null, localeOverride = ytLocale.copy(gl = "US")).getOrNull()
                 }
-                while (quickSongs.size < 32 && (ri < regionalPool.size || (seedUsed < seedBudget && si < seedTracks.size))) {
-                    var addedReg = 0
-                    while (ri < regionalPool.size && addedReg < 2 && quickSongs.size < 32) {
-                        if (addQuick(regionalPool[ri++])) addedReg++
+                if (fetched != null && fetched.items.isNotEmpty() && SonoraLocaleManager.cacheTag() == locKey) {
+                    HomeSubCache.putNewReleases(fetched, 1800, locKey)
+                }
+                fetched
+            }
+            if (exploreResult == null) {
+                exploreResult = withTimeoutOrNull(1800L) {
+                    YouTube.explore(localeOverride = ytLocale).getOrNull()?.also {
+                        if (SonoraLocaleManager.cacheTag() == locKey) HomeSubCache.putExplore(it, 900, locKey)
                     }
-                    if (seedUsed < seedBudget && si < seedTracks.size && quickSongs.size < 32) {
-                        if (addQuick(seedTracks[si++])) seedUsed++
-                    } else if (ri >= regionalPool.size) {
-                        break
-                    }
                 }
-                regionalPool.forEach { addQuick(it) }
-                while (si < seedTracks.size && quickSongs.size < 20) {
-                    addQuick(seedTracks[si++])
+            }
+            res?.items.orEmpty()
+                .flatMap { it.items }
+                .filterIsInstance<AlbumItem>()
+                .filter {
+                    !shouldFilterReleaseAlbum(it) &&
+                        !(explicitForeign && !gl.equals("IT", true) && isItalianLeakArtist(it.artists, gl))
                 }
+        } else {
+            emptyList()
+        }
+        val popularNewReleases = buildList {
+            val seenIds = HashSet<String>()
+            val seenSigs = HashSet<String>()
+            fun addRelease(alb: AlbumItem) {
+                if (size >= 16) return
+                if (shouldFilterReleaseAlbum(alb)) return
+                if (explicitForeign && !gl.equals("IT", true) && isItalianLeakArtist(alb.artists, gl)) return
+                val validArt = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
+                val sig = "${normCompactKey(alb.title)}|${normCompactKey(validArt)}"
+                if (seenIds.add(alb.browseId) && (normCompactKey(alb.title).isEmpty() || seenSigs.add(sig))) {
+                    add(alb)
+                }
+            }
+            if (homeNewReleaseAlbums.isNotEmpty()) {
+                homeNewReleaseAlbums.forEach { addRelease(it) }
             } else {
-                seedTracks.forEach { addQuick(it) }
+                fallbackBrowseAlbums.forEach { addRelease(it) }
+                exploreResult?.newReleaseAlbums.orEmpty().forEach { addRelease(it) }
             }
         }
 
-        val finalQuickSongs = deduplicateAndPreferStudio(quickSongs).take(20)
-
-        val popularNewReleases = selectPopularNewReleases(
-            homeAlbums = homeNewReleaseAlbums,
-            exploreAlbums = exploreResult?.newReleaseAlbums.orEmpty(),
-            fallbackAlbums = emptyList(),
-            userArtistIds = aids.toSet(),
-            chartsResult = chartsResult,
-            gl = gl,
-            storefrontAlbums = storefrontFeed.albums
-        )
-
-        if (AppleCatalog.hasReadyToken()) {
+        run {
             val seenAlbKeys = HashSet<String>()
             val pendingHomeAlbums = mutableListOf<Pair<String, String>>()
             fun addAlbTarget(title: String, artist: String, limit: Int) {
@@ -2460,13 +2593,13 @@ object SonoraApiInterceptor {
                     pendingHomeAlbums.add(title to artist)
                 }
             }
-            popularNewReleases.take(12).forEach { alb ->
+            popularNewReleases.forEach { alb ->
                 val artName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
-                addAlbTarget(alb.title, artName, 18)
+                addAlbTarget(alb.title, artName, 30)
             }
             homeSectionAlbums.forEach { alb ->
                 val artName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
-                addAlbTarget(alb.title, artName, 18)
+                addAlbTarget(alb.title, artName, 30)
             }
             for (aid in aids) {
                 val artistRes = HomeSubCache.getArtist(aid, locKey) ?: continue
@@ -2477,7 +2610,7 @@ object SonoraApiInterceptor {
                         for (item in sec.items) {
                             if (item is AlbumItem) {
                                 val itemArt = cleanArtistsList(item.artists).firstOrNull()?.name ?: item.artists?.firstOrNull()?.name ?: aName
-                                addAlbTarget(item.title, itemArt, 18)
+                                addAlbTarget(item.title, itemArt, 30)
                             }
                         }
                     }
@@ -2492,22 +2625,29 @@ object SonoraApiInterceptor {
                     pendingHomeArtists.add(item)
                 }
             }
-            homeSectionArtists.forEach { addArtTarget(it) }
-            for (aid in aids) {
-                val artistRes = HomeSubCache.getArtist(aid, locKey) ?: continue
-                for (sec in artistRes.sections) {
-                    sec.items.filterIsInstance<ArtistItem>().forEach { addArtTarget(it) }
+            if (AppleCatalog.hasReadyToken()) {
+                homeSectionArtists.forEach { addArtTarget(it) }
+                for (aid in aids) {
+                    val artistRes = HomeSubCache.getArtist(aid, locKey) ?: continue
+                    for (sec in artistRes.sections) {
+                        sec.items.filterIsInstance<ArtistItem>().forEach { addArtTarget(it) }
+                    }
                 }
             }
             if (pendingHomeAlbums.isNotEmpty() || pendingHomeArtists.isNotEmpty()) {
+                val sem = Semaphore(6)
                 val albDefs = pendingHomeAlbums.map { (title, artist) ->
                     async(Dispatchers.IO) {
-                        withTimeoutOrNull(1400L) { resolveAlbumThumb(title, artist, HOME_THUMB_SIZE) }
+                        sem.withPermit {
+                            withTimeoutOrNull(2200L) { resolveAlbumThumb(title, artist, HOME_THUMB_SIZE) }
+                        }
                     }
                 }
                 val artDefs = pendingHomeArtists.map { art ->
                     async(Dispatchers.IO) {
-                        withTimeoutOrNull(1400L) { resolveArtistThumb(art.title) }
+                        sem.withPermit {
+                            withTimeoutOrNull(1500L) { resolveArtistThumb(art.title) }
+                        }
                     }
                 }
                 albDefs.awaitAll()
@@ -2639,7 +2779,7 @@ object SonoraApiInterceptor {
             }
         }
 
-        if (exploreResult == null || hitsResult == null || chartsResult == null || aids.any { HomeSubCache.getArtist(it, locKey) == null }) {
+        if (exploreResult == null || chartsResult == null || aids.any { HomeSubCache.getArtist(it, locKey) == null }) {
             scheduleHomeSecondaryWarm(aids, locKey, gl, hl)
         }
 
@@ -2661,6 +2801,24 @@ object SonoraApiInterceptor {
         root.toString() to (mergedArray.length() > 0)
     }
 
+    private fun homeHasAppleNewReleases(jsonStr: String): Boolean = runCatching {
+        val rows = JSONObject(jsonStr).optJSONArray("rows") ?: return@runCatching true
+        for (i in 0 until rows.length()) {
+            val row = rows.optJSONObject(i) ?: continue
+            if (row.optString("sectionKey") == "new_releases") {
+                val items = row.optJSONArray("items") ?: return@runCatching true
+                if (items.length() == 0) return@runCatching false
+                for (j in 0 until items.length()) {
+                    val thumb = items.optJSONObject(j)?.optString("thumb").orEmpty()
+                    if (!thumb.contains("mzstatic.com", ignoreCase = true)) {
+                        return@runCatching false
+                    }
+                }
+            }
+        }
+        true
+    }.getOrDefault(true)
+
     private fun handleHome(uri: Uri): WebResourceResponse = runBlocking {
         val noSeed = uri.getQueryParameter("noSeed") == "1"
         val seed = if (noSeed) "" else uri.getQueryParameter("seed").orEmpty()
@@ -2669,7 +2827,7 @@ object SonoraApiInterceptor {
         val locKey = SonoraLocaleManager.cacheTag()
         val gl = SonoraLocaleManager.resolvedCountry
         val hl = SonoraLocaleManager.resolvedLang
-        val cacheKey = "home_v7:$locKey:$seed:$artistsParam"
+        val cacheKey = "home_v11:$locKey:$seed:$artistsParam"
 
         if (!forceRefresh) {
             ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
@@ -2682,25 +2840,30 @@ object SonoraApiInterceptor {
             .take(3)
             .sorted()
             .joinToString(",")
-        val snapshotKey = if (normalizedArtists.isEmpty()) "home_default_v7:$locKey" else "home_v7:$locKey:$normalizedArtists"
-        val lastGoodKey = "home_last_good_v7:$locKey"
+        val snapshotKey = if (normalizedArtists.isEmpty()) "home_default_v11:$locKey" else "home_v11:$locKey:$normalizedArtists"
+        val lastGoodKey = "home_last_good_v11:$locKey"
 
         if (!forceRefresh) {
             val disk = SnapshotDiskCache.get(snapshotKey, freshTtlMs = 600_000L)
             if (disk != null) {
-                if (disk.isFresh) {
+                val completeDisk = homeHasAppleNewReleases(disk.data)
+                val needsImmediateHeal = !completeDisk && AppleCatalog.hasReadyToken()
+                if (disk.isFresh && !needsImmediateHeal) {
                     ApiCache.put(cacheKey, disk.data, 300)
                 } else {
-                    ApiCache.put(cacheKey, disk.data, 30)
+                    ApiCache.put(cacheKey, disk.data, if (needsImmediateHeal) 15 else 30)
                     SnapshotDiskCache.revalidate(snapshotKey) {
-                        delay(1800L)
+                        if (!needsImmediateHeal) delay(1800L)
                         if (SonoraLocaleManager.cacheTag() != locKey) return@revalidate
                         ensureLocale()
                         val (fresh, valid) = buildHomeJson(seed, artistsParam, locKey, gl, hl)
+                        val completeFresh = valid && (AppleCatalog.hasReadyToken() || homeHasAppleNewReleases(fresh))
                         if (valid && SonoraLocaleManager.cacheTag() == locKey) {
-                            ApiCache.put(cacheKey, fresh, 600)
-                            SnapshotDiskCache.put(snapshotKey, fresh)
-                            SnapshotDiskCache.put(lastGoodKey, fresh)
+                            ApiCache.put(cacheKey, fresh, if (completeFresh) 600 else 20)
+                            if (completeFresh) {
+                                SnapshotDiskCache.put(snapshotKey, fresh)
+                                SnapshotDiskCache.put(lastGoodKey, fresh)
+                            }
                         }
                     }
                 }
@@ -2709,17 +2872,22 @@ object SonoraApiInterceptor {
 
             val lastGood = SnapshotDiskCache.get(lastGoodKey, freshTtlMs = 600_000L)
             if (lastGood != null) {
-                ApiCache.put(cacheKey, lastGood.data, 60)
-                if (!lastGood.isFresh || normalizedArtists.isNotEmpty()) {
+                val completeLast = homeHasAppleNewReleases(lastGood.data)
+                val needsImmediateHeal = !completeLast && AppleCatalog.hasReadyToken()
+                ApiCache.put(cacheKey, lastGood.data, if (needsImmediateHeal) 15 else 60)
+                if (!lastGood.isFresh || normalizedArtists.isNotEmpty() || needsImmediateHeal) {
                     SnapshotDiskCache.revalidate(snapshotKey) {
-                        delay(1800L)
+                        if (!needsImmediateHeal) delay(1800L)
                         if (SonoraLocaleManager.cacheTag() != locKey) return@revalidate
                         ensureLocale()
                         val (fresh, valid) = buildHomeJson(seed, artistsParam, locKey, gl, hl)
+                        val completeFresh = valid && (AppleCatalog.hasReadyToken() || homeHasAppleNewReleases(fresh))
                         if (valid && SonoraLocaleManager.cacheTag() == locKey) {
-                            ApiCache.put(cacheKey, fresh, 600)
-                            SnapshotDiskCache.put(snapshotKey, fresh)
-                            SnapshotDiskCache.put(lastGoodKey, fresh)
+                            ApiCache.put(cacheKey, fresh, if (completeFresh) 600 else 20)
+                            if (completeFresh) {
+                                SnapshotDiskCache.put(snapshotKey, fresh)
+                                SnapshotDiskCache.put(lastGoodKey, fresh)
+                            }
                         }
                     }
                 }
@@ -2731,9 +2899,12 @@ object SonoraApiInterceptor {
 
         val (rootStr, valid) = buildHomeJson(seed, artistsParam, locKey, gl, hl)
         if (valid && SonoraLocaleManager.cacheTag() == locKey) {
-            ApiCache.put(cacheKey, rootStr, 600)
-            SnapshotDiskCache.putAsync(snapshotKey, rootStr)
-            SnapshotDiskCache.putAsync(lastGoodKey, rootStr)
+            val completeFresh = AppleCatalog.hasReadyToken() || homeHasAppleNewReleases(rootStr)
+            ApiCache.put(cacheKey, rootStr, if (completeFresh) 600 else 20)
+            if (completeFresh) {
+                SnapshotDiskCache.putAsync(snapshotKey, rootStr)
+                SnapshotDiskCache.putAsync(lastGoodKey, rootStr)
+            }
         }
         jsonResponse(rootStr)
     }
@@ -3417,7 +3588,10 @@ object SonoraApiInterceptor {
             return@runBlocking jsonResponse(resp)
         }
 
-        if (!AppleCatalog.hasReadyToken()) {
+        val hasToken = AppleCatalog.hasReadyToken()
+        val resThumb = resolveAlbumThumb(cleanTitle, artist, size)
+
+        if (resThumb == null && !hasToken) {
             return@runBlocking jsonResponse(
                 JSONObject().apply {
                     put("ok", false)
@@ -3429,8 +3603,6 @@ object SonoraApiInterceptor {
                 }.toString()
             )
         }
-
-        val resThumb = resolveAlbumThumb(cleanTitle, artist, size)
 
         val resp = JSONObject().apply {
             put("ok", resThumb != null)
@@ -3622,7 +3794,7 @@ object SonoraApiInterceptor {
         ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
         val playlistResult = YouTube.playlist(id).getOrNull()
         if (playlistResult != null) {
-            val tracksArr = enrichSongsToJson(playlistResult.songs, maxResolve = 18, withTrackNo = true)
+            val tracksArr = enrichSongsToJson(playlistResult.songs, maxResolve = 24, withTrackNo = true)
             val totalDur = playlistResult.songs.sumOf { it.duration ?: 0 }
             val json = playlistResult.playlist.toJson(withTracks = false).apply {
                 put("tracks", tracksArr)

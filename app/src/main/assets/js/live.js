@@ -322,6 +322,14 @@ function isAppleAlbumThumbCold(title, artist) {
   return (_albThumbCold[ck] || 0) > Date.now();
 }
 if (typeof window !== 'undefined') window.isAppleAlbumThumbCold = isAppleAlbumThumbCold;
+function _invalidateCoverCaches(k, sameBase) {
+  if (!k || sameBase) return;
+  if (typeof ARTC !== 'undefined' && ARTC[k] && ARTC[k]._real) return;
+  if (typeof ARTC !== 'undefined') delete ARTC[k];
+  if (typeof PALC !== 'undefined') delete PALC[k];
+  if (typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[k];
+  if (typeof TINTC !== 'undefined') { delete TINTC[k + 'd']; delete TINTC[k + 'l']; }
+}
 function _applyAlbumThumb(id, thumb, title, artist) {
   if (!thumb) return;
   thumb = _forceAppleListThumb(thumb);
@@ -336,11 +344,7 @@ function _applyAlbumThumb(id, thumb, title, artist) {
       : (!sameApple || /[?&]s=1200\b/.test(effAlbThumb) || /[?&]s=288\b/.test(alb.thumb));
     if (alb.thumb !== effAlbThumb && canUpdateAlb) {
       alb.thumb = effAlbThumb;
-      if (!sameApple && !sameBase && typeof ARTC !== 'undefined') delete ARTC[id];
-      if (!sameBase) {
-        if (typeof PALC !== 'undefined') delete PALC[id];
-        if (typeof TINTC !== 'undefined') { delete TINTC[id + 'd']; delete TINTC[id + 'l']; }
-      }
+      _invalidateCoverCaches(id, sameApple || sameBase);
     }
   }
   if (typeof TRACKS !== 'undefined' && Array.isArray(TRACKS)) {
@@ -358,7 +362,7 @@ function _applyAlbumThumb(id, thumb, title, artist) {
           : (!t.canonicalCover && (!tSameApple || /[?&]s=1200\b/.test(effTrkThumb) || /[?&]s=288\b/.test(t.thumb)));
         if (t.thumb !== effTrkThumb && canUpdateTrk) {
           t.thumb = effTrkThumb;
-          if (!tSameApple && !tSameBase && typeof ARTC !== 'undefined' && t.id) delete ARTC[t.id];
+          _invalidateCoverCaches(t.id, tSameApple || tSameBase);
           if (typeof preloadArt === 'function') preloadArt(t, false);
         }
       }
@@ -445,9 +449,7 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
     if (obj.thumb !== eff) {
       obj.thumb = eff;
       anyChanged = true;
-      if (!sameBase && typeof ARTC !== 'undefined' && obj.id) delete ARTC[obj.id];
-      if (!sameBase && typeof PALC !== 'undefined' && obj.id) delete PALC[obj.id];
-      if (!sameBase && typeof SHAD_PALC !== 'undefined' && obj.id) delete SHAD_PALC[obj.id];
+      _invalidateCoverCaches(obj.id, sameBase);
     }
     if (canon && !obj.canonicalCover) { obj.canonicalCover = true; anyChanged = true; }
     obj._appleUpgradeSettled = true;
@@ -470,10 +472,7 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
         if (al.thumb !== alEff) {
           al.thumb = alEff;
           anyChanged = true;
-          if (!alSame && typeof ARTC !== 'undefined') delete ARTC[al.id];
-          if (!alSame && typeof PALC !== 'undefined') delete PALC[al.id];
-          if (!alSame && typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[al.id];
-          if (!alSame && typeof TINTC !== 'undefined') { delete TINTC[al.id + 'd']; delete TINTC[al.id + 'l']; }
+          _invalidateCoverCaches(al.id, alSame);
         }
         if (isStub && resAlb) al.title = resAlb;
         al._appleUpgradeSettled = true;
@@ -489,10 +488,7 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
           stAlb.thumb = stEff;
           if (resAlb) stAlb.title = resAlb;
           stAlb._appleUpgradeSettled = true;
-          if (!stSame && typeof ARTC !== 'undefined') delete ARTC[stubId];
-          if (!stSame && typeof PALC !== 'undefined') delete PALC[stubId];
-          if (!stSame && typeof SHAD_PALC !== 'undefined') delete SHAD_PALC[stubId];
-          if (!stSame && typeof TINTC !== 'undefined') { delete TINTC[stubId + 'd']; delete TINTC[stubId + 'l']; }
+          _invalidateCoverCaches(stubId, stSame);
         }
       }
     } else if (!obj.album && obj.id && typeof stubAlbum === 'function') {
@@ -678,11 +674,7 @@ function ingestItem(x) {
     const bothApple = prevThumb && e.thumb && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(prevThumb) && isAppleArtistThumb(e.thumb);
     const sameBase = Boolean(prevThumb && e.thumb && typeof isSameCoverBase === 'function' && isSameCoverBase(prevThumb, e.thumb));
     if (prevThumb !== e.thumb && x.id) {
-      if (!bothApple && !sameBase && !(ARTC[x.id] && ARTC[x.id]._real)) delete ARTC[x.id];
-      if (!sameBase) {
-        if (typeof PALC !== 'undefined') delete PALC[x.id];
-        if (typeof TINTC !== 'undefined') { delete TINTC[x.id + 'd']; delete TINTC[x.id + 'l']; }
-      }
+      _invalidateCoverCaches(x.id, bothApple || sameBase);
     }
     if (x.kind === 'album' && e.thumb && prevThumb !== e.thumb && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(e.thumb) && typeof _searchCacheAlbumUpgradeHook === 'function') {
       _searchCacheAlbumUpgradeHook(e.id, e.title, e.artist, _forceAppleListThumb(e.thumb));
@@ -754,8 +746,9 @@ function liveLoad(it) {
         if (nextApple || !prevApple) {
           it.thumb = nextThumb;
           const sameBaseAlb = Boolean(prevThumb && nextThumb && typeof isSameCoverBase === 'function' && isSameCoverBase(prevThumb, nextThumb));
-          if (!(prevApple && nextApple) && !sameBaseAlb && !(ARTC[it.id] && ARTC[it.id]._real)) delete ARTC[it.id];
-          if (!sameBaseAlb) {
+          const hasRealHero = Boolean(ARTC[it.id] && ARTC[it.id]._real);
+          if (!(prevApple && nextApple) && !sameBaseAlb && !hasRealHero) delete ARTC[it.id];
+          if (!sameBaseAlb && !hasRealHero) {
             if (typeof PALC !== 'undefined') delete PALC[it.id];
             if (typeof TINTC !== 'undefined') { delete TINTC[it.id + 'd']; delete TINTC[it.id + 'l']; }
           }
@@ -783,7 +776,11 @@ function liveLoad(it) {
       BYID[it.id].thumb = it.thumb;
     }
     it.loaded = true; it.loading = false; it._p = null; preloadArt(it, true);
-    tracksOf(it).slice(0, 2).forEach(x => {
+    const loadedTracks = tracksOf(it);
+    for (let i = 0; i < Math.min(10, loadedTracks.length); i++) {
+      if (loadedTracks[i] && loadedTracks[i].thumb) preloadArt(loadedTracks[i], true);
+    }
+    loadedTracks.slice(0, 2).forEach(x => {
       if (x && x.id) {
         if (window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') window.SonoraNative.prefetch(x.id);
         else fetch('/api/prefetch/' + x.id).catch(() => {});
@@ -2777,7 +2774,7 @@ function reconcileNativePlayback() {
     syncNativeRepeat();
   }
 }
-const HOME_CACHE_KEY = 'sonora-home-v5';
+const HOME_CACHE_KEY = 'sonora-home-v9';
 let _localeCountrySwitched = false;
 let _homeSnapPending = null;
 let _homeSnapTimer = 0;

@@ -1780,11 +1780,18 @@ object YouTube {
     suspend fun browse(
         browseId: String,
         params: String?,
+        localeOverride: YouTubeLocale? = null,
     ): Result<BrowseResult> =
         runCatching {
             // Use authentication for library endpoints
             val needsLogin = browseId.startsWith("FEmusic_library") || browseId == "VLSE" || browseId == "VLRDPN"
-            val response = innerTube.browse(WEB_REMIX, browseId = browseId, params = params, setLogin = needsLogin).body<BrowseResponse>()
+            val response = innerTube.browse(
+                WEB_REMIX,
+                browseId = browseId,
+                params = params,
+                setLogin = needsLogin,
+                localeOverride = localeOverride
+            ).body<BrowseResponse>()
             val sectionContents =
                 response.contents
                     ?.singleColumnBrowseResultsRenderer

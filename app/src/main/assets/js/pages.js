@@ -1700,7 +1700,7 @@ PAGES.settings = (c, P) => {
     const h2 = 68 + 84 + 84;
     if (vis(P, y, h2)) drawSetCard(c, 20, y, W - 40, h2, 22);
     y = setToggleRow(c, P, y, 'pb_alone', t('settings.lyrics_alone_focus'), t('settings.lyrics_alone_sub'), PREFS.lyricsAlone, v => { PREFS.lyricsAlone = v; savePrefs(); });
-    y = setSegmentedRow(c, P, y, t('settings.lyrics_anim_style'), [['anim', t('lyrics.style_animated_sub')], ['classic', t('lyrics.style_classic')]], SRCUI.style || 'anim', st => { SRCUI.style = st; try { localStorage.setItem('sonora-ly-style', st); } catch (e) {} redraw(); }, { glass: true, spKey: 'ly_anim' });
+    y = setSegmentedRow(c, P, y, t('settings.lyrics_anim_style'), [['anim', t('lyrics.style_animated_sub')], ['classic', t('lyrics.style_classic')]], SRCUI.style || 'anim', st => { SRCUI.style = st; try { localStorage.setItem('sonora-ly-style', st); } catch (e) {} redraw(); }, { spKey: 'ly_anim' });
     c.fillStyle = pal.sep; c.fillRect(36, y - .5, W - 72, .5);
     y = setSegmentedRow(c, P, y, t('settings.lyrics_source_pref'), getLySrcOpts(), PREFS.prefLySource || 'auto', src => {
       PREFS.prefLySource = src;

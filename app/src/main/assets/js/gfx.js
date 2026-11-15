@@ -260,7 +260,11 @@ function artOf(item) {
       _artUpQ.push(raw);
       if (!_artUpTimer) _pumpArtUpQ();
     }
-    if (ARTC[k] && ARTC[k].width > 0 && ARTC[k]._real && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(ARTC[k]._url)) return ARTC[k];
+    if (th && typeof liveCover === 'function' &&
+        (!ARTC[k] || !ARTC[k]._real || (ARTC[k]._url !== th && !(typeof isSameCoverBase === 'function' && isSameCoverBase(ARTC[k]._url, th))))) {
+      liveCover(item, k, false);
+    }
+    if (ARTC[k] && ARTC[k].width > 0 && ARTC[k]._real) return ARTC[k];
     return (ARTC[k] && ARTC[k].width > 0) ? ARTC[k] : (ARTC[k] = makeArt(item));
   }
   if ((needsArtistApple || needsAlbumApple) && !item._appleUpgradeSettled) {
@@ -269,7 +273,11 @@ function artOf(item) {
       _artUpQ.push(item);
       if (!_artUpTimer) _pumpArtUpQ();
     }
-    if (ARTC[k] && ARTC[k].width > 0 && ARTC[k]._real && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(ARTC[k]._url)) return ARTC[k];
+    if (th && typeof liveCover === 'function' &&
+        (!ARTC[k] || !ARTC[k]._real || (ARTC[k]._url !== th && !(typeof isSameCoverBase === 'function' && isSameCoverBase(ARTC[k]._url, th))))) {
+      liveCover(item, k, false);
+    }
+    if (ARTC[k] && ARTC[k].width > 0 && ARTC[k]._real) return ARTC[k];
     return (ARTC[k] && ARTC[k].width > 0) ? ARTC[k] : (ARTC[k] = makeArt(item));
   }
   if (ARTC[k] && ARTC[k]._real && ARTC[k].width > 0) {
@@ -280,7 +288,8 @@ function artOf(item) {
       }
       return ARTC[k];
     }
-    if (th) delete ARTC[k];
+    if (th) liveCover(item, k, true);
+    return ARTC[k];
   }
   if (raw && raw.id && ARTC[raw.id] && ARTC[raw.id]._real && ARTC[raw.id].width > 0) {
     if (ARTC[raw.id]._url === th) return ARTC[raw.id];
