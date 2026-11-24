@@ -2,6 +2,7 @@ package dev.sonora.music.lyrics
 
 import dev.sonora.music.LyricLine
 import dev.sonora.music.Lyrics
+import dev.sonora.music.SonoraHttpPool
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
@@ -13,11 +14,13 @@ import org.json.JSONObject
 /** Synced LRC lyrics client backed by NetEase Cloud Music. */
 object NetEase {
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .callTimeout(10, TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient by lazy {
+        SonoraHttpPool.baseClient.newBuilder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
 
     private const val SEARCH_URL = "https://music.163.com/api/search/pc"
     private const val LYRIC_URL = "https://music.163.com/api/song/lyric"

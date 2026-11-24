@@ -53,19 +53,29 @@ const subOf = it => it.kind === 'playlist' ? (it.desc || it.artist || t('common.
 function bigTitle(c, s) { if (CURP === stackOf()[0]) return; txt(c, s, 20, TOP + 38, F(700, 34), pal.fg); }
 function eyebrow(c, s, x, y, col) { if (_canLS) c.letterSpacing = '.6px'; txt(c, s.toUpperCase(), x, y, F(600, 12), col || pal.sub); if (_canLS) c.letterSpacing = '0px'; }
 const _canLS = typeof CanvasRenderingContext2D !== 'undefined' && 'letterSpacing' in CanvasRenderingContext2D.prototype;
-const _songTwCache = new Map();
-function _measureSongTitle(c, shown) {
-  let w = _songTwCache.get(shown);
+const _twCache = new Map();
+function measureTw(c, font, text) {
+  if (!text) return 0;
+  const k = font + '\0' + text;
+  let w = _twCache.get(k);
   if (w !== undefined) return w;
-  c.font = F(400, 16.5);
-  w = c.measureText(shown).width;
-  if (_songTwCache.size >= 400) _songTwCache.clear();
-  _songTwCache.set(shown, w);
+  c.font = font;
+  w = c.measureText(text).width;
+  if (_twCache.size >= 400) _twCache.clear();
+  _twCache.set(k, w);
   return w;
+}
+function _clearTwCache() { _twCache.clear(); }
+if (typeof window !== 'undefined') {
+  window.measureTw = measureTw;
+  window._clearTwCache = _clearTwCache;
+}
+function _measureSongTitle(c, shown) {
+  return measureTw(c, F(400, 16.5), shown);
 }
 function section(c, P, y, s, chev) {
   if (chev === 'big') { if (vis(P, y, 44)) txt(c, s, 20, y + 28, F(500, 26), pal.fg, 'left', W - 40); return y + 46; }
-  if (vis(P, y, 40)) { txt(c, s, 20, y + 24, F(700, 22), pal.fg); if (chev) { c.font = F(700, 22); icon(c, 'chev', 20 + c.measureText(s).width + 12, y + 17, 13, pal.sub2, { lw: 3.2 }); } }
+  if (vis(P, y, 40)) { const sf = F(700, 22); txt(c, s, 20, y + 24, sf, pal.fg); if (chev) { icon(c, 'chev', 20 + measureTw(c, sf, s) + 12, y + 17, 13, pal.sub2, { lw: 3.2 }); } }
   return y + 42;
 }
 function rail(c, P, id, y, items, iw, gap, ch, draw, opt) {
@@ -254,10 +264,19 @@ function drawSwipeQueueBg(c, rx, ry, rw, rh, r, tn, sw) {
   }
   c.restore();
 }
+const _dlBadgeCache = { key: '', val: null };
+function _cachedDlBadgeColors(tn, rowAcc, isDark) {
+  const k = (tn ? tn.accent : rowAcc) + '|' + (isDark ? 1 : 0);
+  if (_dlBadgeCache.key === k && _dlBadgeCache.val) return _dlBadgeCache.val;
+  const val = typeof dlBadgeColors === 'function' ? dlBadgeColors(tn, rowAcc, isDark) : { fill: rowAcc, arrow: pal.bg };
+  _dlBadgeCache.key = k;
+  _dlBadgeCache.val = val;
+  return val;
+}
 function songRow(c, P, y, t, list, idx, o) {
   o = o || {}; const h = 64;
   if (vis(P, y, h)) {
-    const cu = isCur(t), tn = tintOf(P), fg = pageIco(P), sub = pageSubIco(P);
+    const cu = isCur(t), tn = tintOf(P), fg = tn ? tn.ico : pal.fg, sub = tn ? tn.icoSub : pal.sub;
     const rKey = (P ? P.kind : 'p') + ':' + idx + ':' + t.id;
     const pk = 'song:' + rKey;
     const rowAcc = (tn && tn.accent) ? tn.accent : navAccent();
@@ -302,7 +321,7 @@ function songRow(c, P, y, t, list, idx, o) {
     const hasEx = Boolean(t.ex && !o.compact);
     let sx = tx, subMw = mw;
     if (isDl) {
-      const dlC = typeof dlBadgeColors === 'function' ? dlBadgeColors(tn, rowAcc, pal.dark) : { fill: rowAcc, arrow: pal.bg };
+      const dlC = _cachedDlBadgeColors(tn, rowAcc, pal.dark);
       if (typeof drawDlBadge === 'function') drawDlBadge(c, sx + 7.5, ay - 4.7, 7.5, dlC.fill, dlC.arrow);
       sx += 21; subMw -= 21;
     }
@@ -349,12 +368,12 @@ function songRows(c, P, y, list, o) {
 }
 function pillBtn(c, x, y, w, h, label, ico, fn) {
   const pk = 'pill:' + Math.round(x) + ':' + Math.round(y) + ':' + label;
+  const pf = F(600, 17);
   withPressScale(c, pk, x + w / 2, y + h / 2, () => {
     c.fillStyle = pal.fill; rrPath(c, x, y, w, h, 14); c.fill();
     drawRowPressTint(c, pk, x, y, w, h, 14);
-    c.font = F(600, 17);
-    const tw = c.measureText(label).width, st = x + (w - (tw + 30)) / 2;
-    icon(c, ico, st + 10, y + h / 2, 21, pal.accent); txt(c, label, st + 30, y + h / 2 + 6, F(600, 17), pal.accent);
+    const tw = measureTw(c, pf, label), st = x + (w - (tw + 30)) / 2;
+    icon(c, ico, st + 10, y + h / 2, 21, pal.accent); txt(c, label, st + 30, y + h / 2 + 6, pf, pal.accent);
   });
   hit(x, y, w, h, fn, { pressKey: pk });
 }
@@ -369,8 +388,9 @@ function libRow(c, P, y, ico, label, fn) {
   if (vis(P, y, 60)) {
     drawRowPressTint(c, pk, 12, y + 2, W - 24, 56, 14);
     icon(c, ico, 38, y + 30, 26, pal.accent); txt(c, label, 78, y + 38, F(400, 20), pal.fg); icon(c, 'chev', W - 30, y + 30, 12, pal.sub2, { lw: 3.2 }); c.fillStyle = pal.sep; c.fillRect(78, y + 59.5, W - 78, .5);
+    hit(0, y, W, 60, fn, { pressKey: pk });
   }
-  hit(0, y, W, 60, fn, { pressKey: pk }); return y + 60;
+  return y + 60;
 }
 const end = y => y + LAY.bottomPad + 20;
 const downloaded = () => TRACKS.filter((t, i) => i % 3 === 0);
@@ -525,10 +545,21 @@ const _SKEL_FADE_MS = 260;
 const _skelFadeMap = new Map();
 let _skelFadeCv = null, _skelFadeCtx = null;
 
+function _releaseSkelFadeCv() {
+  if (_skelFadeCv && (_skelFadeCv.width || _skelFadeCv.height)) {
+    _skelFadeCv.width = 0;
+    _skelFadeCv.height = 0;
+  }
+}
+
 function markSkelSeen(key) {
   if (!key) return;
   let st = _skelFadeMap.get(key);
-  if (!st) { st = { seen: false, t0: 0, lastSkelMs: 0 }; _skelFadeMap.set(key, st); }
+  if (!st) {
+    if (_skelFadeMap.size >= 40) _skelFadeMap.delete(_skelFadeMap.keys().next().value);
+    st = { seen: false, t0: 0, lastSkelMs: 0 };
+    _skelFadeMap.set(key, st);
+  }
   st.seen = true;
   st.t0 = 0;
   st.lastSkelMs = performance.now();
@@ -546,13 +577,17 @@ function drawSkelCrossfade(c, P, key, ySkel, skelFn, bodyFn) {
     if (st.lastSkelMs && (now - st.lastSkelMs) < 1500) {
       st.t0 = now;
     } else {
-      st.t0 = 0;
+      _skelFadeMap.delete(key);
+      if (!_skelFadeMap.size) _releaseSkelFadeCv();
       return bodyFn(c);
     }
   }
   const dt = Math.max(0, now - st.t0);
   if (dt >= _SKEL_FADE_MS) {
-    st.t0 = 0;
+    _skelFadeMap.delete(key);
+    let anyActive = false;
+    for (const v of _skelFadeMap.values()) { if (v.t0) { anyActive = true; break; } }
+    if (!anyActive) _releaseSkelFadeCv();
     return bodyFn(c);
   }
   const rawP = clamp(dt / _SKEL_FADE_MS, 0, 1);
@@ -598,11 +633,11 @@ function drawSkelCrossfade(c, P, key, ySkel, skelFn, bodyFn) {
   return outY;
 }
 
-let _skWaveP = -1, _skWaveG = null, _skWaveDark = true, _skWaveW = 0, _skWavePeak = '';
+let _skWaveP = -1, _skWaveG = null, _skWaveDark = true, _skWaveW = 0, _skWavePeak = '', _skWaveCtx = null;
 function getSkulletGradient(c, p, isDark, peakCol) {
   const curW = typeof W !== 'undefined' && W > 0 ? W : 400;
   const peak = peakCol || (isDark ? 'rgba(255,255,255,0.13)' : 'rgba(0,0,0,0.09)');
-  if (!peakCol && _skWaveP === p && _skWaveG && _skWaveDark === isDark && _skWaveW === curW && _skWavePeak === peak) {
+  if (_skWaveP === p && _skWaveG && _skWaveCtx === c && _skWaveDark === isDark && _skWaveW === curW && _skWavePeak === peak) {
     return _skWaveG;
   }
   const waveW = Math.max(160, curW * 0.45);
@@ -614,13 +649,12 @@ function getSkulletGradient(c, p, isDark, peakCol) {
   g.addColorStop(1, zero);
   g._x0 = waveX;
   g._x1 = waveX + waveW;
-  if (!peakCol) {
-    _skWaveP = p;
-    _skWaveDark = isDark;
-    _skWaveW = curW;
-    _skWavePeak = peak;
-    _skWaveG = g;
-  }
+  _skWaveP = p;
+  _skWaveCtx = c;
+  _skWaveDark = isDark;
+  _skWaveW = curW;
+  _skWavePeak = peak;
+  _skWaveG = g;
   return g;
 }
 
@@ -871,19 +905,23 @@ function drawArtistBodySkeleton(c, P, y) {
   return y;
 }
 
+let _heroGrad = null, _heroGradKey = '', _heroGradCtx = null;
 function hero(c, P, it, sz) {
   const tn = tintOf(P), st = Math.max(0, -P.scroll), s = sz + st * 1.2, x = (W - s) / 2, y = -st;
   if (!vis(P, 0, sz)) return;
   const rawItem = artItem(it);
-  if (rawItem && typeof rawItem.thumb === 'string' &&
-      typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(rawItem.thumb) &&
-      /[?&]s=(?:288|544)\b/.test(rawItem.thumb)) {
-    const hiUrl = typeof appleThumbAtSize === 'function'
-      ? appleThumbAtSize(rawItem.thumb, 1200)
-      : rawItem.thumb.replace(/([?&])s=(?:288|544)\b/, '$1s=1200');
-    rawItem.thumb = hiUrl;
-    if (it && it !== rawItem && (!it.thumb || /[?&]s=(?:288|544)\b/.test(it.thumb))) it.thumb = hiUrl;
-    if (rawItem.id && typeof BYID !== 'undefined' && BYID[rawItem.id] && BYID[rawItem.id] !== rawItem) BYID[rawItem.id].thumb = hiUrl;
+  if (rawItem && typeof rawItem.thumb === 'string' && rawItem._heroUrlChecked !== rawItem.thumb) {
+    rawItem._heroUrlChecked = rawItem.thumb;
+    if (typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(rawItem.thumb) &&
+        /[?&]s=(?:288|544)\b/.test(rawItem.thumb)) {
+      const hiUrl = typeof appleThumbAtSize === 'function'
+        ? appleThumbAtSize(rawItem.thumb, 1200)
+        : rawItem.thumb.replace(/([?&])s=(?:288|544)\b/, '$1s=1200');
+      rawItem.thumb = hiUrl;
+      rawItem._heroUrlChecked = hiUrl;
+      if (it && it !== rawItem && (!it.thumb || /[?&]s=(?:288|544)\b/.test(it.thumb))) it.thumb = hiUrl;
+      if (rawItem.id && typeof BYID !== 'undefined' && BYID[rawItem.id] && BYID[rawItem.id] !== rawItem) BYID[rawItem.id].thumb = hiUrl;
+    }
   }
   const art = artOf(rawItem);
   if (art && art._real && art.width > 0 && art.width < 720 && rawItem && rawItem.thumb &&
@@ -914,9 +952,14 @@ function hero(c, P, it, sz) {
     drawHeroSkeleton(c, P, it, x, y, s, tn, rawItem);
   }
   if (hasReal) {
-    const g = c.createLinearGradient(0, y + s * .58, 0, y + s * .98);
-    g.addColorStop(0, tintA(tn, 0)); g.addColorStop(.45, tintA(tn, .42)); g.addColorStop(.80, tintA(tn, .88)); g.addColorStop(1, tintA(tn, 1));
-    c.fillStyle = g; c.fillRect(0, y + s * .58, W, s * .44 + 2);
+    const gKey = Math.round(y * 2) + '|' + Math.round(s * 2) + '|' + (tn ? tn.css : '');
+    if (!_heroGrad || _heroGradKey !== gKey || _heroGradCtx !== c) {
+      _heroGradKey = gKey; _heroGradCtx = c;
+      const g = c.createLinearGradient(0, y + s * .58, 0, y + s * .98);
+      g.addColorStop(0, tintA(tn, 0)); g.addColorStop(.45, tintA(tn, .42)); g.addColorStop(.80, tintA(tn, .88)); g.addColorStop(1, tintA(tn, 1));
+      _heroGrad = g;
+    }
+    c.fillStyle = _heroGrad; c.fillRect(0, y + s * .58, W, s * .44 + 2);
   }
 }
 function circBtn(c, x, y, d, ico, fn) {
@@ -938,6 +981,27 @@ function heroBtnAlpha(P) {
   const dk = dock(), g = heroGeom(P.heroY), hy = g.cy - P.scroll, topLim = TOP + 52, botLim = (cur() ? dk.mini.y : dk.tab.y) - 8;
   return sstep(clamp((hy - topLim) / 128, 0, 1)) * sstep(clamp((botLim - (hy + g.cd)) / 44, 0, 1));
 }
+let _heroPlayShadCv = null, _heroPlayShadPad = 20;
+function _getHeroPlayShadow(pw, ph) {
+  if (_heroPlayShadCv && _heroPlayShadCv._pw === pw && _heroPlayShadCv._ph === ph) return _heroPlayShadCv;
+  const pad = _heroPlayShadPad;
+  const cv = _heroPlayShadCv || (_heroPlayShadCv = document.createElement('canvas'));
+  cv.width = pw + pad * 2;
+  cv.height = ph + pad * 2;
+  cv._pw = pw; cv._ph = ph;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.30)';
+  ctx.shadowBlur = 12;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 2;
+  rrPath(ctx, pad, pad, pw, ph, ph / 2);
+  ctx.fillStyle = '#000';
+  ctx.fill();
+  ctx.restore();
+  return cv;
+}
 function heroControls(c, P, y, list) {
   const g = heroGeom(y), tn = tintOf(P), pCol = tn ? tn.playCol : '#111';
   const curIt = P && P.data ? P.data.item : null;
@@ -950,13 +1014,15 @@ function heroControls(c, P, y, list) {
     const cx = g.px + g.pw / 2, cy = y + g.ph / 2;
     c.save(); c.globalAlpha *= al;
     if (sc !== 1) { c.translate(cx, cy); c.scale(sc, sc); c.translate(-cx, -cy); }
-    c.save();
     const shAlpha = (pal.dark ? .30 : .10) * al * (1 - pf * 0.12);
-    c.shadowColor = 'rgba(0,0,0,' + shAlpha.toFixed(3) + ')';
-    c.shadowBlur = 12 - pf * 2;
-    c.shadowOffsetY = 2 - pf * 0.5;
+    if (shAlpha > 0.004 && typeof document !== 'undefined') {
+      const shCv = _getHeroPlayShadow(g.pw, g.ph);
+      c.save();
+      c.globalAlpha *= clamp(shAlpha / 0.30, 0, 1);
+      c.drawImage(shCv, g.px - _heroPlayShadPad, y - _heroPlayShadPad);
+      c.restore();
+    }
     rrPath(c, g.px, y, g.pw, g.ph, g.ph / 2); c.fillStyle = '#ffffff'; c.fill();
-    c.restore();
     if (pf > 0.001) {
       c.save();
       rrPath(c, g.px, y, g.pw, g.ph, g.ph / 2);
@@ -964,9 +1030,9 @@ function heroControls(c, P, y, list) {
       c.fill();
       c.restore();
     }
-    const playLbl = t('common.play');
-    c.font = F(500, 16.5); const tw = c.measureText(playLbl).width, sx = g.px + (g.pw - (tw + 26)) / 2;
-    icon(c, 'play', sx + 7, cy, 16, pCol); txt(c, playLbl, sx + 25, cy + 5.8, F(500, 16.5), pCol);
+    const playLbl = t('common.play'), playFont = F(500, 16.5);
+    const tw = measureTw(c, playFont, playLbl), sx = g.px + (g.pw - (tw + 26)) / 2;
+    icon(c, 'play', sx + 7, cy, 16, pCol); txt(c, playLbl, sx + 25, cy + 5.8, playFont, pCol);
     c.restore();
   }
   if (al > .2) {
@@ -995,9 +1061,9 @@ function drawPlaylistRecsSection(c, P, it, y, fg, sub) {
     c.fillRect(22, y - 12, W - 44, .5);
   }
 
-  c.font = F(600, 13);
+  const refFont = F(600, 13);
   const refLabel = t('common.refresh');
-  const refTw = c.measureText(refLabel).width;
+  const refTw = measureTw(c, refFont, refLabel);
   const btnW = Math.ceil(12 + 13 + 5 + refTw + 12);
   const btnH = 30;
   const btnX = W - 20 - btnW;
@@ -1006,8 +1072,9 @@ function drawPlaylistRecsSection(c, P, it, y, fg, sub) {
 
   if (vis(P, y, 56)) {
     const titleMaxW = Math.max(80, btnX - 22 - 26);
-    const shownTitle = txt(c, t('playlist_page.recommended_title'), 22, y + 23, F(700, 19), fg, 'left', titleMaxW);
-    const titleW = c.measureText(shownTitle).width;
+    const titleFont = F(700, 19);
+    const shownTitle = txt(c, t('playlist_page.recommended_title'), 22, y + 23, titleFont, fg, 'left', titleMaxW);
+    const titleW = measureTw(c, titleFont, shownTitle);
     icon(c, 'smart', 22 + titleW + 11, y + 16, 14, acc);
 
     withPressScale(c, refPk, btnX + btnW / 2, btnY + btnH / 2, () => {
@@ -1103,13 +1170,13 @@ function drawPlaylistRecsSection(c, P, it, y, fg, sub) {
           const tx = 84, ty = ry + 28, ay = ry + 48;
           const colW = W - 68 - tx;
           const shown = txt(dc, tr.title || '', tx, ty, F(400, 16.5), fg, 'left', Math.max(40, colW - 18));
-          const shownW = dc.measureText(shown).width;
+          const shownW = measureTw(dc, F(400, 16.5), shown);
           icon(dc, 'smart', tx + shownW + 10.5, ty - 5.5, 13, acc);
 
           let sx = tx, subMw = colW;
           const isDl = typeof isDownloaded === 'function' ? isDownloaded(tr) : (typeof LIVE !== 'undefined' && LIVE.saved && LIVE.saved.some(x => x.id === tr.id));
           if (isDl) {
-            const dlC = typeof dlBadgeColors === 'function' ? dlBadgeColors(tn, acc, pal.dark) : { fill: acc, arrow: pal.bg };
+            const dlC = _cachedDlBadgeColors(tn, acc, pal.dark);
             if (typeof drawDlBadge === 'function') drawDlBadge(dc, sx + 7.5, ay - 4.7, 7.5, dlC.fill, dlC.arrow);
             sx += 21;
             subMw -= 21;
@@ -1157,7 +1224,17 @@ function drawPlaylistRecsSection(c, P, it, y, fg, sub) {
   );
 }
 PAGES.album = (c, P) => {
-  const it = P.data.item, all = tracksOf(it), q = (P.q || '').trim().toLowerCase(), base = q ? all.filter(t => (t.title + ' ' + t.artist).toLowerCase().includes(q)) : all, list = P.rev ? base.slice().reverse() : base, isPl = it.kind === 'playlist', hs = Math.round(W * .95), fg = pageIco(P), sub = pageSubIco(P); let y = hs;
+  const it = P.data.item, all = tracksOf(it), q = (P.q || '').trim().toLowerCase(), rev = !!P.rev;
+  const firstId = all.length && all[0] ? all[0].id : '', lastId = all.length && all[all.length - 1] ? all[all.length - 1].id : '';
+  let ac = P._albCache;
+  if (!ac || ac.all !== all || ac.len !== all.length || ac.firstId !== firstId || ac.lastId !== lastId || ac.q !== q || ac.rev !== rev) {
+    const base = q ? all.filter(t => (t.title + ' ' + t.artist).toLowerCase().includes(q)) : all;
+    const list = rev ? base.slice().reverse() : base;
+    let totalDur = 0;
+    for (let i = 0; i < list.length; i++) totalDur += (list[i] && list[i].dur) || 0;
+    ac = P._albCache = { all, len: all.length, firstId, lastId, q, rev, list, mins: Math.round(totalDur / 60) };
+  }
+  const list = ac.list, isPl = it.kind === 'playlist', hs = Math.round(W * .95), tn = tintOf(P), fg = tn ? tn.ico : pal.fg, sub = tn ? tn.icoSub : pal.sub; let y = hs;
   hero(c, P, it, W);
   if (it && it.user && vis(P, 0, hs)) {
     hit(W * 0.2, 40, W * 0.6, hs * 0.55, () => {
@@ -1173,8 +1250,10 @@ PAGES.album = (c, P) => {
     c.restore();
   }
   y += 22; y = heroControls(c, P, y, list) + 26;
-  if (vis(P, y, 36)) { txt(c, t('common.songs'), 22, y + 16, F(500, 16), fg); icon(c, 'sort', W - 32, y + 10, 18, fg, { lw: 2 }); }
-  hit(W - 60, y - 6, 52, 36, () => { P.rev = !P.rev; redraw(); });
+  if (vis(P, y, 36)) {
+    txt(c, t('common.songs'), 22, y + 16, F(500, 16), fg); icon(c, 'sort', W - 32, y + 10, 18, fg, { lw: 2 });
+    hit(W - 60, y - 6, 52, 36, () => { P.rev = !P.rev; redraw(); });
+  }
   y += 28;
   const albSkelKey = 'album:' + (it && it.id ? it.id : 'x');
   if (!all.length) {
@@ -1198,8 +1277,7 @@ PAGES.album = (c, P) => {
         let yy = songRows(dc, P, y, list, { sub: true });
         if (!list.length) txt(dc, t('playlist_page.no_match', { q: P.q }), W / 2, yy + 40, F(400, 15), sub, 'center', W - 40);
         else {
-          const mins = Math.round(list.reduce((a, t) => a + t.dur, 0) / 60);
-          if (vis(P, yy + 14, 28)) txt(dc, tPlural(list.length, 'playlist_page.songs_one_and_meta', 'playlist_page.songs_and_meta', { meta: mins + t('common.min_short') }), 22, yy + 34, F(400, 14), sub);
+          if (vis(P, yy + 14, 28)) txt(dc, tPlural(list.length, 'playlist_page.songs_one_and_meta', 'playlist_page.songs_and_meta', { meta: ac.mins + t('common.min_short') }), 22, yy + 34, F(400, 14), sub);
           if (isPl && it.user && all.length > 0 && !q && typeof playlistRecsState === 'function') {
             yy = drawPlaylistRecsSection(dc, P, it, yy + 64, fg, sub);
           }
@@ -1211,7 +1289,7 @@ PAGES.album = (c, P) => {
   return end(y + 20);
 };
 function artistReleaseCard(c, P, it, x, y, s, isSingle) {
-  const fg = pageIco(P), sub = pageSubIco(P);
+  const tn = tintOf(P), fg = tn ? tn.ico : pal.fg, sub = tn ? tn.icoSub : pal.sub;
   const pk = 'artrel:' + (isSingle ? 's:' : 'a:') + (it && it.id ? it.id : '') + ':' + Math.round(x) + ':' + Math.round(y);
   const r = 14;
   withPressScale(c, pk, x + s / 2, y + s / 2, () => {
@@ -1224,12 +1302,19 @@ function artistReleaseCard(c, P, it, x, y, s, isSingle) {
   hit(x, y, s, s + 48, () => open(it), { pressKey: pk });
 }
 PAGES.artist = (c, P) => {
-  const a = P.data.item, hs = Math.round(W * .95), all = tracksOf(a), q = (P.q || '').trim().toLowerCase();
-  const matchQ = it => it && ((it.title || '') + ' ' + (it.artist || '')).toLowerCase().includes(q);
-  const tr = q ? all.filter(matchQ) : all;
+  const a = P.data.item, hs = Math.round(W * .95), q = (P.q || '').trim().toLowerCase();
   const rawAlbs = a.albums || [], rawSings = a.singles || [];
-  const albs = q ? rawAlbs.filter(matchQ) : rawAlbs;
-  const sings = q ? rawSings.filter(matchQ) : rawSings;
+  let arc = P._artCache;
+  if (!arc || arc.a !== a || arc.songs !== a.songs || arc.sLen !== (a.songs ? a.songs.length : -1) ||
+      arc.albs !== rawAlbs || arc.aLen !== rawAlbs.length || arc.sings !== rawSings || arc.sgLen !== rawSings.length || arc.q !== q) {
+    const all = tracksOf(a);
+    const matchQ = it => it && ((it.title || '') + ' ' + (it.artist || '')).toLowerCase().includes(q);
+    const tr = q ? all.filter(matchQ) : all;
+    const albs = q ? rawAlbs.filter(matchQ) : rawAlbs;
+    const sings = q ? rawSings.filter(matchQ) : rawSings;
+    arc = P._artCache = { a, songs: a.songs, sLen: a.songs ? a.songs.length : -1, albs: rawAlbs, aLen: rawAlbs.length, sings: rawSings, sgLen: rawSings.length, q, all, tr, fAlbs: albs, fSings: sings, top5: tr.slice(0, 5) };
+  }
+  const all = arc.all, tr = arc.tr, albs = arc.fAlbs, sings = arc.fSings;
   const sub = pageSubIco(P); let y = hs;
   hero(c, P, a, W);
   y += 18;
@@ -1260,7 +1345,7 @@ PAGES.artist = (c, P) => {
       drawArtistBodySkeleton,
       (dc) => {
         let yy = y;
-        const top5 = tr.slice(0, 5);
+        const top5 = arc.top5;
         top5.forEach((t, i) => { yy = songRow(dc, P, yy, t, tr, i, { sub: true }); });
         if (albs.length) {
           yy += 22;
@@ -1285,13 +1370,19 @@ PAGES.artist = (c, P) => {
 };
 
 NAV.query = '';
-const getSearchFilters = () => [
-  ['all', t('common.all')],
-  ['songs', t('search.filter_songs')],
-  ['artists', t('search.filter_artists')],
-  ['albums', t('search.filter_albums')],
-  ['playlists', t('search.filter_playlists')]
-];
+let _searchFiltLang = null, _searchFiltCache = null;
+const getSearchFilters = () => {
+  const lang = typeof getResolvedLang === 'function' ? getResolvedLang() : 'it';
+  if (_searchFiltCache && _searchFiltLang === lang) return _searchFiltCache;
+  _searchFiltLang = lang;
+  return (_searchFiltCache = [
+    ['all', t('common.all')],
+    ['songs', t('search.filter_songs')],
+    ['artists', t('search.filter_artists')],
+    ['albums', t('search.filter_albums')],
+    ['playlists', t('search.filter_playlists')]
+  ]);
+};
 function drawSearchEmpty(c) {
   const dk = dock(), bot = cur() ? dk.mini.y : dk.search.y, cy = Math.round(TOP + 34 + (bot - (TOP + 34)) * .40);
   c.save();
@@ -1305,12 +1396,26 @@ function drawSearchEmpty(c) {
   return H;
 }
 const _searchChipAnim = { x: null, w: null, t: 0 };
+const _chipLayoutCache = new Map();
 function drawTintedFilterChips(c, P, y, railId, filters, curF, animState, chipPrefix, onSelect, opts) {
-  c.font = F(600, 14.5);
-  const ws = filters.map(f => Math.ceil(c.measureText(f[1]).width) + 36);
-  const posX = [];
-  let ex = 20;
-  for (let i = 0; i < ws.length; i++) { posX.push(ex); ex += ws[i] + 8; }
+  const chipFont = F(600, 14.5);
+  let ck = chipPrefix + '|';
+  for (let i = 0; i < filters.length; i++) ck += filters[i][1] + '\0';
+  let lay = _chipLayoutCache.get(ck);
+  if (!lay) {
+    const ws = new Array(filters.length), posX = new Array(filters.length);
+    let ex = 20;
+    for (let i = 0; i < filters.length; i++) {
+      const w = Math.ceil(measureTw(c, chipFont, filters[i][1])) + 36;
+      ws[i] = w;
+      posX[i] = ex;
+      ex += w + 8;
+    }
+    if (_chipLayoutCache.size >= 16) _chipLayoutCache.clear();
+    lay = { ws, posX };
+    _chipLayoutCache.set(ck, lay);
+  }
+  const ws = lay.ws, posX = lay.posX;
   const now = performance.now();
   const selIdx = Math.max(0, filters.findIndex(f => f[0] === curF));
   const tgX = posX[selIdx], tgW = ws[selIdx];
@@ -1397,8 +1502,8 @@ PAGES.search = (c, P) => {
   const als = ALBUMS.filter(a => (a.title + ' ' + a.artist + ' ' + a.genre).toLowerCase().includes(q)), ars = ARTISTS.filter(a => a.title.toLowerCase().includes(q));
   if (!ts.length && !als.length && !ars.length) { txt(c, t('search.no_results', { q: NAV.query }), W / 2, y + 60, F(600, 17), pal.fg, 'center', W - 40); txt(c, t('search.no_results_hint'), W / 2, y + 84, F(400, 15), pal.sub, 'center', W - 40); y += 110; }
   if ((f === 'all' || f === 'songs') && ts.length) { y = searchHead(c, P, y, t('search.filter_songs')); const l = ts.slice(0, f === 'all' ? 8 : 25); l.forEach((t, i) => { y = songRow(c, P, y, t, l, i, { noSep: true, single: true }); }); y += 12; }
-  if ((f === 'all' || f === 'artists') && ars.length) { y = searchHead(c, P, y, t('search.filter_artists')); ars.slice(0, f === 'all' ? 3 : 15).forEach(a => { if (vis(P, y, 66)) { drawArt(c, a, 24, y + 7, 52, 26); txt(c, a.title, 88, y + 39, F(500, 16.5), pal.fg, 'left', W - 124); icon(c, 'chev', W - 30, y + 33, 12, pal.sub2, { lw: 3.2 }); } hit(0, y, W, 66, () => open(a)); y += 66; }); y += 12; }
-  if ((f === 'all' || f === 'albums') && als.length) { y = searchHead(c, P, y, t('search.filter_albums')); als.slice(0, f === 'all' ? 4 : 15).forEach(a => { if (vis(P, y, 66)) { drawArt(c, a, 24, y + 7, 52, 8); txt(c, a.title, 88, y + 30, F(500, 16.5), pal.fg, 'left', W - 124); txt(c, a.artist + ' · ' + a.year, 88, y + 50, F(400, 14), pal.sub, 'left', W - 124); icon(c, 'chev', W - 30, y + 33, 12, pal.sub2, { lw: 3.2 }); } hit(0, y, W, 66, () => open(a)); y += 66; }); y += 12; }
+  if ((f === 'all' || f === 'artists') && ars.length) { y = searchHead(c, P, y, t('search.filter_artists')); ars.slice(0, f === 'all' ? 3 : 15).forEach(a => { if (vis(P, y, 66)) { drawArt(c, a, 24, y + 7, 52, 26); txt(c, a.title, 88, y + 39, F(500, 16.5), pal.fg, 'left', W - 124); icon(c, 'chev', W - 30, y + 33, 12, pal.sub2, { lw: 3.2 }); hit(0, y, W, 66, () => open(a)); } y += 66; }); y += 12; }
+  if ((f === 'all' || f === 'albums') && als.length) { y = searchHead(c, P, y, t('search.filter_albums')); als.slice(0, f === 'all' ? 4 : 15).forEach(a => { if (vis(P, y, 66)) { drawArt(c, a, 24, y + 7, 52, 8); txt(c, a.title, 88, y + 30, F(500, 16.5), pal.fg, 'left', W - 124); txt(c, a.artist + ' · ' + a.year, 88, y + 50, F(400, 14), pal.sub, 'left', W - 124); icon(c, 'chev', W - 30, y + 33, 12, pal.sub2, { lw: 3.2 }); hit(0, y, W, 66, () => open(a)); } y += 66; }); y += 12; }
   return end(y + (NAV.focus ? KBH : 0));
 };
 
@@ -1497,7 +1602,11 @@ function drawSetHeader(c, P, y, ico, title, sub, col) {
 function setToggleRow(c, P, y, id, title, sub, val, onChange, isLast) {
   const h = sub ? 68 : 56;
   const ctrl = lqCtrl('tg_' + id, val ? 1 : 0);
-  if (!ctrl.pressed) ctrl.val.t = val ? 1 : 0;
+  const tgt = val ? 1 : 0;
+  if (!ctrl.pressed && ctrl.val.t !== tgt) {
+    ctrl.val.t = tgt;
+    if (typeof markLqBusy === 'function') markLqBusy();
+  }
   const f = clamp(ctrl.val.x, 0, 1), pp = clamp(ctrl.pp.x, 0, 1);
   const vel = ctrl.vel.x / 50;
   const cvx = clamp(vel * .75, -.2, .2), cvy = clamp(vel * .25, -.2, .2);
@@ -1518,12 +1627,12 @@ function setToggleRow(c, P, y, id, title, sub, val, onChange, isLast) {
     const isFbTg = typeof FALLBACK !== 'undefined' && !!FALLBACK;
     const fastSlideThumb = !isFbTg && typeof NAV !== 'undefined' && NAV.popP > 0.001 && pp <= 0.001;
     if (isFbTg || fastSlideThumb) {
-      c.save();
-      c.shadowColor = 'rgba(0,0,0,.10)'; c.shadowBlur = 4; c.shadowOffsetY = 2;
+      rrPath(c, thumbCX - thumbW / 2, thumbCY - thumbH / 2 + 1.5, thumbW, thumbH, thumbH / 2);
+      c.fillStyle = 'rgba(0,0,0,.10)';
+      c.fill();
       rrPath(c, thumbCX - thumbW / 2, thumbCY - thumbH / 2, thumbW, thumbH, thumbH / 2);
       c.fillStyle = '#ffffff';
       c.fill();
-      c.restore();
     } else {
       SET_GLASS.push({
         kind: 'toggle',
@@ -1535,14 +1644,14 @@ function setToggleRow(c, P, y, id, title, sub, val, onChange, isLast) {
         f, pp, sx, sy, trackBg, cardBg
       });
     }
+    hit(20, y, W - 40, h, null, {
+      lqCtrl: ctrl,
+      lqSpan: 20,
+      lqScale: 1.5,
+      lqTap: () => { const next = !val; ctrl.val.t = next ? 1 : 0; if (typeof markLqBusy === 'function') markLqBusy(); onChange(next); },
+      lqCommit: () => { const next = ctrl.val.t >= .5; ctrl.val.t = next ? 1 : 0; if (typeof markLqBusy === 'function') markLqBusy(); if (next !== val) onChange(next); }
+    });
   }
-  hit(20, y, W - 40, h, null, {
-    lqCtrl: ctrl,
-    lqSpan: 20,
-    lqScale: 1.5,
-    lqTap: () => { const next = !val; ctrl.val.t = next ? 1 : 0; onChange(next); },
-    lqCommit: () => { const next = ctrl.val.t >= .5; ctrl.val.t = next ? 1 : 0; if (next !== val) onChange(next); }
-  });
   return y + h;
 }
 
@@ -1552,7 +1661,10 @@ function setSegmentedRow(c, P, y, label, opts, curVal, onPick, cfg) {
   const spKey = (cfg && cfg.spKey) || label;
   let sp = typeof SEG_SP !== 'undefined' ? SEG_SP[spKey] : null;
   if (!sp && typeof SEG_SP !== 'undefined') sp = SEG_SP[spKey] = new Spring(selIdx, 340, 35);
-  if (sp) sp.t = selIdx;
+  if (sp && sp.t !== selIdx) {
+    sp.t = selIdx;
+    if (typeof markLqBusy === 'function') markLqBusy();
+  }
   const animIdx = sp ? clamp(sp.x, -.08, opts.length - .92) : selIdx;
 
   if (vis(P, y, h)) {
@@ -1580,12 +1692,19 @@ function setSegmentedRow(c, P, y, label, opts, curVal, onPick, cfg) {
         opts
       });
     } else {
-      c.save();
-      if (!pal.dark) { c.shadowColor = 'rgba(0,0,0,.10)'; c.shadowBlur = 6; c.shadowOffsetY = 2; }
+      if (!pal.dark) {
+        rrPath(c, pillX, ry + 4.5, iw, rh - 6, 9.5);
+        c.fillStyle = 'rgba(0,0,0,.07)';
+        c.fill();
+      }
       rrPath(c, pillX, ry + 3, iw, rh - 6, 9.5);
       c.fillStyle = pal.dark ? 'rgba(255,255,255,.18)' : '#ffffff';
       c.fill();
-      c.restore();
+      if (!pal.dark) {
+        c.lineWidth = 0.75;
+        c.strokeStyle = 'rgba(0,0,0,.06)';
+        c.stroke();
+      }
     }
 
     opts.forEach(([id, lb], i) => {
@@ -1605,7 +1724,11 @@ function setSegmentedRow(c, P, y, label, opts, curVal, onPick, cfg) {
 function setSliderRow(c, P, y, id, label, valStr, norm, onSet, isLast, accentCol) {
   const h = 80, sx = 36, sw = W - 72, sy = y + 52, col = accentCol || '#0091FF';
   const ctrl = lqCtrl('sl_' + id, clamp(norm, 0, 1));
-  if (!ctrl.pressed) ctrl.val.t = clamp(norm, 0, 1);
+  const tgt = clamp(norm, 0, 1);
+  if (!ctrl.pressed && Math.abs(ctrl.val.t - tgt) > 1e-4) {
+    ctrl.val.t = tgt;
+    if (typeof markLqBusy === 'function') markLqBusy();
+  }
   const f = clamp(ctrl.val.x, 0, 1), pp = clamp(ctrl.pp.x, 0, 1);
   const vel = ctrl.vel.x / 10;
   const cv = clamp(vel * .75, -.2, .2);
@@ -1634,25 +1757,25 @@ function setSliderRow(c, P, y, id, label, valStr, norm, onSet, isLast, accentCol
       w: thumbW, h: thumbH,
       pp
     });
-  }
-  const span = Math.max(1, sw - 40);
-  hit(20, y + 24, W - 40, 50, null, {
-    lqCtrl: ctrl,
-    lqSpan: span,
-    lqScale: 1.5,
-    lqDown: px => {
-      const clickX = px - sx;
-      if (Math.abs(clickX - (thumbLeft + 20)) > 28) {
-        const nf = clamp((clickX - 20) / span, 0, 1);
-        ctrl.val.t = nf; onSet(nf);
+    const span = Math.max(1, sw - 40);
+    hit(20, y + 24, W - 40, 50, null, {
+      lqCtrl: ctrl,
+      lqSpan: span,
+      lqScale: 1.5,
+      lqDown: px => {
+        const clickX = px - sx;
+        if (Math.abs(clickX - (thumbLeft + 20)) > 28) {
+          const nf = clamp((clickX - 20) / span, 0, 1);
+          ctrl.val.t = nf; if (typeof markLqBusy === 'function') markLqBusy(); onSet(nf);
+        }
+      },
+      lqMove: () => { onSet(clamp(ctrl.val.t, 0, 1)); },
+      lqCommit: () => {
+        onSet(clamp(ctrl.val.t, 0, 1));
+        if (typeof flushPrefsSave === 'function') flushPrefsSave();
       }
-    },
-    lqMove: () => { onSet(clamp(ctrl.val.t, 0, 1)); },
-    lqCommit: () => {
-      onSet(clamp(ctrl.val.t, 0, 1));
-      if (typeof flushPrefsSave === 'function') flushPrefsSave();
-    }
-  });
+    });
+  }
   return y + h;
 }
 
@@ -1682,8 +1805,8 @@ PAGES.settings = (c, P) => {
           txt(c, title, tx + 16, ty + 74, F(700, 16.5), pal.fg, 'left', tw - 28);
           txt(c, desc, tx + 16, ty + 94, F(400, 12.5), pal.sub, 'left', tw - 28);
         });
+        hit(tx, ty, tw, th, () => setSubOf(P, id, title), { pressKey: pk });
       }
-      hit(tx, ty, tw, th, () => setSubOf(P, id, title), { pressKey: pk });
     });
     y += 2 * (th + 12);
 
@@ -1709,8 +1832,8 @@ PAGES.settings = (c, P) => {
         txt(c, curLangLbl + ' · ' + curGeoLbl, 84, y + 51, F(400, 12.5), pal.sub, 'left', W - 140);
         icon(c, 'chev', W - 38, y + langH / 2, 11, pal.sub2, { lw: 3 });
       });
+      hit(20, y, W - 40, langH, () => setSubOf(P, 'language', t('settings.cat_language')), { pressKey: langPk });
     }
-    hit(20, y, W - 40, langH, () => setSubOf(P, 'language', t('settings.cat_language')), { pressKey: langPk });
     y += langH + 18;
 
     eyebrow(c, t('settings.quick_controls'), 26, y + 12);
@@ -1818,11 +1941,10 @@ PAGES.settings = (c, P) => {
         const scaleY = ctrl.sy.x / (1 - cv), scaleX = ctrl.sx.x * (1 - cv * .33);
         const thumbW = 24 * scaleX, thumbH = 32 * scaleY;
         if (typeof FALLBACK !== 'undefined' && FALLBACK) {
-          c.save();
-          c.shadowColor = 'rgba(0,0,0,.28)'; c.shadowBlur = 5; c.shadowOffsetY = 1.5;
+          c.beginPath(); c.arc(p.x, p.y + 1.5, 10, 0, Math.PI * 2);
+          c.fillStyle = 'rgba(0,0,0,.18)'; c.fill();
           c.beginPath(); c.arc(p.x, p.y, 10, 0, Math.PI * 2);
           c.fillStyle = '#ffffff'; c.fill();
-          c.restore();
         } else if (typeof SET_GLASS !== 'undefined') {
           SET_GLASS.push({
             kind: 'slider',
@@ -1846,7 +1968,7 @@ PAGES.settings = (c, P) => {
           PREFS.eqPreset = 'custom';
           if (PL.audio) attachAudioEq(PL.audio);
           syncEqFilters();
-          savePrefs();
+          savePrefs(false, { skipAudioSync: true });
         };
         hit(p.x - bw / 2, topY - 16, bw, trH + 36, () => setBand(INP.y - T.y), {
           lqCtrl: ctrl,
@@ -1873,30 +1995,39 @@ PAGES.settings = (c, P) => {
     const bHw = tw * pSx / 2, bHh = (barH - 8) * pSy / 2;
 
     if (vis(P, y, ph)) {
-      c.save();
-      rrPath(c, px, y, pw, ph, 22); c.clip();
-      const bgGrad = c.createLinearGradient(px, y, px + pw, y + ph);
-      bgGrad.addColorStop(0, '#fa2e49');
-      bgGrad.addColorStop(.34, '#ff7a45');
-      bgGrad.addColorStop(.68, '#2ed3c6');
-      bgGrad.addColorStop(1, '#1b1b1b');
-      c.fillStyle = bgGrad; c.fillRect(px, y, pw, ph);
-
-      const glow = c.createRadialGradient(px + pw * .72, y + ph * .32, 4, px + pw * .72, y + ph * .32, pw * .48);
-      glow.addColorStop(0, 'rgba(255,255,255,.32)');
-      glow.addColorStop(.5, 'rgba(167,139,250,.24)');
-      glow.addColorStop(1, 'rgba(0,0,0,0)');
-      c.fillStyle = glow; c.fillRect(px, y, pw, ph);
-
-      const stripeCount = 6, padY = 12, availH = ph - padY * 2;
-      for (let i = 0; i < stripeCount; i++) {
-        const sy = y + padY + (i + .5) * (availH / stripeCount) - 2.5;
-        const sw = pw * (i % 2 === 0 ? .94 : .70);
-        rrPath(c, px, sy, sw, 5, 2.5);
-        c.fillStyle = i % 2 === 0 ? 'rgba(255,255,255,.85)' : 'rgba(0,0,0,.50)';
-        c.fill();
+      if (typeof document !== 'undefined') {
+        if (!P._glassPrevCv || P._glassPrevW !== pw || P._glassPrevH !== ph) {
+          const gcv = P._glassPrevCv || (P._glassPrevCv = document.createElement('canvas'));
+          gcv.width = Math.max(1, Math.round(pw));
+          gcv.height = Math.max(1, Math.round(ph));
+          P._glassPrevW = pw; P._glassPrevH = ph;
+          const gc = gcv.getContext('2d');
+          gc.clearRect(0, 0, gcv.width, gcv.height);
+          gc.save();
+          rrPath(gc, 0, 0, pw, ph, 22); gc.clip();
+          const bgGrad = gc.createLinearGradient(0, 0, pw, ph);
+          bgGrad.addColorStop(0, '#fa2e49');
+          bgGrad.addColorStop(.34, '#ff7a45');
+          bgGrad.addColorStop(.68, '#2ed3c6');
+          bgGrad.addColorStop(1, '#1b1b1b');
+          gc.fillStyle = bgGrad; gc.fillRect(0, 0, pw, ph);
+          const glow = gc.createRadialGradient(pw * .72, ph * .32, 4, pw * .72, ph * .32, pw * .48);
+          glow.addColorStop(0, 'rgba(255,255,255,.32)');
+          glow.addColorStop(.5, 'rgba(167,139,250,.24)');
+          glow.addColorStop(1, 'rgba(0,0,0,0)');
+          gc.fillStyle = glow; gc.fillRect(0, 0, pw, ph);
+          const stripeCount = 6, padY = 12, availH = ph - padY * 2;
+          for (let i = 0; i < stripeCount; i++) {
+            const sy = padY + (i + .5) * (availH / stripeCount) - 2.5;
+            const sw = pw * (i % 2 === 0 ? .94 : .70);
+            rrPath(gc, 0, sy, sw, 5, 2.5);
+            gc.fillStyle = i % 2 === 0 ? 'rgba(255,255,255,.85)' : 'rgba(0,0,0,.50)';
+            gc.fill();
+          }
+          gc.restore();
+        }
+        c.drawImage(P._glassPrevCv, px, y, pw, ph);
       }
-      c.restore();
 
       c.save();
       rrPath(c, px + .5, y + .5, pw - 1, ph - 1, 22);
@@ -1911,24 +2042,24 @@ PAGES.settings = (c, P) => {
           tw, pVal, pPP, bCx: bCx + T.x, bCy: bCy + T.y, bHw, bHh, slosh: pCtrl.vel.x * tw * .02
         });
       }
+      const barSpan = Math.max(1, barW - tw);
+      hit(barX, barY - 6, barW, barH + 12, null, {
+        lqCtrl: pCtrl,
+        lqSpan: barSpan,
+        lqScale: 74 / 56,
+        lqDown: clickX => {
+          const idx = clamp(Math.floor((clickX - barX) / tw), 0, 3);
+          P.prevTab = idx; pCtrl.val.t = idx / 3;
+        },
+        lqMove: () => {
+          P.prevTab = clamp(Math.round(pCtrl.val.t * 3), 0, 3);
+        },
+        lqCommit: () => {
+          const idx = clamp(Math.round(pCtrl.val.t * 3), 0, 3);
+          P.prevTab = idx; pCtrl.val.t = idx / 3;
+        }
+      });
     }
-    const barSpan = Math.max(1, barW - tw);
-    hit(barX, barY - 6, barW, barH + 12, null, {
-      lqCtrl: pCtrl,
-      lqSpan: barSpan,
-      lqScale: 74 / 56,
-      lqDown: clickX => {
-        const idx = clamp(Math.floor((clickX - barX) / tw), 0, 3);
-        P.prevTab = idx; pCtrl.val.t = idx / 3;
-      },
-      lqMove: () => {
-        P.prevTab = clamp(Math.round(pCtrl.val.t * 3), 0, 3);
-      },
-      lqCommit: () => {
-        const idx = clamp(Math.round(pCtrl.val.t * 3), 0, 3);
-        P.prevTab = idx; pCtrl.val.t = idx / 3;
-      }
-    });
     y += ph + 18;
 
     eyebrow(c, t('settings.glass_section'), 26, y + 12); y += 22;
@@ -1943,21 +2074,22 @@ PAGES.settings = (c, P) => {
       else { PREFS.glassBlur = 4; PREFS.glassRefraction = 36; PREFS.glassChromatic = true; }
       if (LQ.sl_ref) LQ.sl_ref.val.t = (PREFS.glassRefraction || 0) / 42;
       if (LQ.sl_blur) LQ.sl_blur.val.t = (PREFS.glassBlur || 0) / 8;
-      savePrefs();
+      if (typeof markLqBusy === 'function') markLqBusy();
+      savePrefs(false, { glass: true });
     }, { spKey: 'glass_profile' });
     c.fillStyle = pal.sep; c.fillRect(36, y - .5, W - 72, .5);
     y = setSliderRow(c, P, y, 'ref', t('settings.glass_refraction'), Math.round(PREFS.glassRefraction || 0) + ' px', (PREFS.glassRefraction || 0) / 42, f => {
       PREFS.glassProfile = 'balanced';
       PREFS.glassRefraction = Math.round(f * 42);
-      savePrefs();
+      savePrefs(false, { glass: true, skipAudioSync: true });
     });
     y = setSliderRow(c, P, y, 'blur', t('settings.glass_blur'), (PREFS.glassBlur || 0).toFixed(1) + ' px', (PREFS.glassBlur || 0) / 8, f => {
       PREFS.glassProfile = 'balanced';
       PREFS.glassBlur = Math.round(f * 16) / 2;
-      savePrefs();
+      savePrefs(false, { glass: true, skipAudioSync: true });
     });
-    y = setToggleRow(c, P, y, 'gl_chr', t('settings.glass_chromatic'), t('settings.glass_chromatic_sub'), PREFS.glassChromatic, v => { PREFS.glassChromatic = v; savePrefs(); });
-    y = setToggleRow(c, P, y, 'gl_fold', t('settings.bar_folds'), t('settings.bar_folds_sub'), PREFS.barFolds, v => { PREFS.barFolds = v; if (!PREFS.barFolds) NAV.min = 0; savePrefs(); }, true);
+    y = setToggleRow(c, P, y, 'gl_chr', t('settings.glass_chromatic'), t('settings.glass_chromatic_sub'), PREFS.glassChromatic, v => { PREFS.glassChromatic = v; savePrefs(false, { glass: true, skipAudioSync: true }); });
+    y = setToggleRow(c, P, y, 'gl_fold', t('settings.bar_folds'), t('settings.bar_folds_sub'), PREFS.barFolds, v => { PREFS.barFolds = v; if (!PREFS.barFolds) NAV.min = 0; savePrefs(false, { skipAudioSync: true }); }, true);
   } else if (sub === 'language') {
     const curLang = typeof getConfiguredLang === 'function' ? getConfiguredLang() : (PREFS.lang || 'auto');
     const curCountry = typeof getConfiguredCountry === 'function' ? getConfiguredCountry() : (PREFS.country || 'auto');
@@ -1993,28 +2125,28 @@ PAGES.settings = (c, P) => {
     }
     y += 24;
 
-    const countries = typeof getI18nCountries === 'function' ? getI18nCountries() : [{ code: 'auto' }, { code: 'IT' }, { code: 'US' }];
+    const countries = (typeof window !== 'undefined' && Array.isArray(window.I18N_COUNTRIES)) ? window.I18N_COUNTRIES : (typeof getI18nCountries === 'function' ? getI18nCountries() : [{ code: 'auto' }, { code: 'IT' }, { code: 'US' }]);
     const rowH = 54, cardH = countries.length * rowH;
     if (vis(P, y, cardH)) drawSetCard(c, 20, y, W - 40, cardH, 22);
-    countries.forEach((cty, i) => {
+    for (let i = 0; i < countries.length; i++) {
+      const cty = countries[i];
       const ry = y + i * rowH;
+      if (!vis(P, ry, rowH)) continue;
       const pk = 'geo:' + cty.code;
       const isSel = cty.code === curCountry;
       const label = typeof getCountryLabel === 'function' ? getCountryLabel(cty.code) : cty.code;
       const badge = cty.code === 'auto' ? resCountry : cty.code;
-      if (vis(P, ry, rowH)) {
-        if (i > 0) { c.fillStyle = pal.sep; c.fillRect(36, ry - .5, W - 72, .5); }
-        c.save();
-        if (i === 0 || i === countries.length - 1) { rrPath(c, 20, y, W - 40, cardH, 22); c.clip(); }
-        drawRowPressTint(c, pk, 20, ry, W - 40, rowH, 0);
-        c.restore();
-        txt(c, label, 36, ry + 32, F(isSel ? 600 : 500, 15.5), isSel ? pal.accent : pal.fg, 'left', W - 140);
-        if (badge) {
-          txt(c, badge, W - (isSel ? 68 : 36), ry + 32, F(600, 12.5), isSel ? pal.accent : pal.sub, 'right');
-        }
-        if (isSel) {
-          icon(c, 'check', W - 46, ry + 27, 17, pal.accent, { lw: 2.2 });
-        }
+      if (i > 0) { c.fillStyle = pal.sep; c.fillRect(36, ry - .5, W - 72, .5); }
+      c.save();
+      if (i === 0 || i === countries.length - 1) { rrPath(c, 20, y, W - 40, cardH, 22); c.clip(); }
+      drawRowPressTint(c, pk, 20, ry, W - 40, rowH, 0);
+      c.restore();
+      txt(c, label, 36, ry + 32, F(isSel ? 600 : 500, 15.5), isSel ? pal.accent : pal.fg, 'left', W - 140);
+      if (badge) {
+        txt(c, badge, W - (isSel ? 68 : 36), ry + 32, F(600, 12.5), isSel ? pal.accent : pal.sub, 'right');
+      }
+      if (isSel) {
+        icon(c, 'check', W - 46, ry + 27, 17, pal.accent, { lw: 2.2 });
       }
       hit(20, ry, W - 40, rowH, () => {
         if (cty.code !== curCountry && typeof setLocaleConfig === 'function') {
@@ -2022,15 +2154,14 @@ PAGES.settings = (c, P) => {
           if (typeof liveToast === 'function') liveToast(t('toast.locale_updated'), 1800);
         }
       }, { pressKey: pk });
-    });
+    }
     y += cardH + 18;
   } else if (sub === 'storage') {
-    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-    if (!P._cacheStats || !P._cacheStatsAt || (now - P._cacheStatsAt) > 4000) {
+    if (!P._cacheStatsLoaded) {
+      P._cacheStatsLoaded = true;
       if (typeof window !== 'undefined' && window.SonoraNative && typeof window.SonoraNative.getCacheStats === 'function') {
         try {
           P._cacheStats = JSON.parse(window.SonoraNative.getCacheStats());
-          P._cacheStatsAt = now;
         } catch (e) {}
       }
     }
@@ -2092,7 +2223,7 @@ PAGES.settings = (c, P) => {
         window.clearLiveCachesAndRefresh();
       }
       P._cacheStats = null;
-      P._cacheStatsAt = 0;
+      P._cacheStatsLoaded = false;
       liveToast(t('toast.cache_cleared'));
       redraw();
     });
@@ -2137,13 +2268,13 @@ PAGES.settings = (c, P) => {
       if (uStatus) {
         txt(c, uStatus, W - 36, y + 33, F(600, 13.5), uState === 'available' ? '#fa2e49' : pal.sub, 'right', 164);
       }
-    }
-    if (!uBusy) {
-      hit(20, y, W - 40, updRowH, () => {
-        if (typeof window !== 'undefined' && typeof window.onSonoraUpdateRowTap === 'function') {
-          window.onSonoraUpdateRowTap();
-        }
-      }, { pressKey: 'set_upd' });
+      if (!uBusy) {
+        hit(20, y, W - 40, updRowH, () => {
+          if (typeof window !== 'undefined' && typeof window.onSonoraUpdateRowTap === 'function') {
+            window.onSonoraUpdateRowTap();
+          }
+        }, { pressKey: 'set_upd' });
+      }
     }
     y += updRowH + 18;
 
@@ -2226,8 +2357,7 @@ function drawMonthlyRecapPage(c, P) {
   const isFb = typeof FALLBACK !== 'undefined' && !!FALLBACK;
 
   const selH = 44, mh = 42;
-  c.font = F(700, 17.5);
-  const mw = clamp(Math.ceil(c.measureText(rec.label).width) + 96, 212, W - 40);
+  const mw = clamp(Math.ceil(measureTw(c, F(700, 17.5), rec.label)) + 96, 212, W - 40);
   const mx = Math.round((W - mw) / 2), my = y + 1;
   const canPrev = mIdx > 0, canNext = mIdx < months.length - 1;
   if (vis(P, y, selH)) {
@@ -2260,9 +2390,9 @@ function drawMonthlyRecapPage(c, P) {
         hlColor: monthHlCol
       });
     }
+    if (canPrev) hit(mx, y, 54, 44, () => { P.recapYm = months[mIdx - 1]; ra.ym = P.recapYm; ra.dir = -1; ra.t0 = performance.now(); ra.barT0 = ra.t0; P.scroll = 0; P.vel = 0; redraw(); }, { pressKey: 'recap_prev' });
+    if (canNext) hit(mx + mw - 54, y, 54, 44, () => { P.recapYm = months[mIdx + 1]; ra.ym = P.recapYm; ra.dir = 1; ra.t0 = performance.now(); ra.barT0 = ra.t0; P.scroll = 0; P.vel = 0; redraw(); }, { pressKey: 'recap_next' });
   }
-  if (canPrev) hit(mx, y, 54, 44, () => { P.recapYm = months[mIdx - 1]; ra.ym = P.recapYm; ra.dir = -1; ra.t0 = performance.now(); ra.barT0 = ra.t0; P.scroll = 0; P.vel = 0; redraw(); }, { pressKey: 'recap_prev' });
-  if (canNext) hit(mx + mw - 54, y, 54, 44, () => { P.recapYm = months[mIdx + 1]; ra.ym = P.recapYm; ra.dir = 1; ra.t0 = performance.now(); ra.barT0 = ra.t0; P.scroll = 0; P.vel = 0; redraw(); }, { pressKey: 'recap_next' });
   y += selH + 14;
 
   c.save();
@@ -2299,11 +2429,15 @@ function drawMonthlyRecapPage(c, P) {
         } else {
           c.fillStyle = '#222'; c.fillRect(cx, y, cw, ch);
         }
-        const g = c.createLinearGradient(0, y + ch * .32, 0, y + ch);
-        g.addColorStop(0, 'rgba(0,0,0,0)');
-        g.addColorStop(.45, 'rgba(0,0,0,.38)');
-        g.addColorStop(1, 'rgba(0,0,0,.86)');
-        c.fillStyle = g;
+        if (!P._recapHeroGrad || P._recapHeroGradY !== y || P._recapHeroGradH !== ch || P._recapHeroGradCtx !== c) {
+          P._recapHeroGradY = y; P._recapHeroGradH = ch; P._recapHeroGradCtx = c;
+          const g = c.createLinearGradient(0, y + ch * .32, 0, y + ch);
+          g.addColorStop(0, 'rgba(0,0,0,0)');
+          g.addColorStop(.45, 'rgba(0,0,0,.38)');
+          g.addColorStop(1, 'rgba(0,0,0,.86)');
+          P._recapHeroGrad = g;
+        }
+        c.fillStyle = P._recapHeroGrad;
         c.fillRect(cx, y, cw, ch);
         drawRowPressTint(c, somPk, cx, y, cw, ch, 26);
 
@@ -2351,10 +2485,10 @@ function drawMonthlyRecapPage(c, P) {
           hlColor: monthHlCol
         });
       }
+      hit(cx, y, cw, ch, () => {
+        playList(rc.topList, 0);
+      }, { pressKey: somPk });
     }
-    hit(cx, y, cw, ch, () => {
-      playList(rc.topList, 0);
-    }, { pressKey: somPk });
     y += ch + 14;
   }
 
@@ -2384,8 +2518,8 @@ function drawMonthlyRecapPage(c, P) {
         txt(c, track.title, 106, y + 28, F(600, 15.5), cu ? pal.accent : pal.fg, 'left', W - 106 - 86);
         txt(c, track.artist, 106, y + 47, F(400, 13.5), pal.sub, 'left', W - 106 - 86);
         txt(c, tPlural(plays, 'recap.play_one', 'recap.play_many'), W - 22, y + 36, F(500, 13), pal.sub, 'right');
+        hit(0, y, W, rh, () => playList(tAll, i), { pressKey: tPk });
       }
-      hit(0, y, W, rh, () => playList(tAll, i), { pressKey: tPk });
       y += rh;
     });
     y += 16;
@@ -2414,10 +2548,10 @@ function drawMonthlyRecapPage(c, P) {
         drawArt(c, ar.artist && ar.artist.thumb ? ar.artist : ar.sampleTrack, barX + 6, barY + 6, 32, 16);
         txt(c, ar.name, barX + 46, barY + 27.5, F(600, 15), pal.fg, 'left', barW - 118);
         txt(c, String(ar.plays), barX + barW - 14, barY + 27.5, F(600, 13.5), pal.sub, 'right');
+        hit(0, y, W, rh, () => {
+          if (ar.sampleTrack) openTrackArtist(ar.sampleTrack);
+        }, { pressKey: arPk });
       }
-      hit(0, y, W, rh, () => {
-        if (ar.sampleTrack) openTrackArtist(ar.sampleTrack);
-      }, { pressKey: arPk });
       y += rh;
     });
   }
@@ -2430,6 +2564,10 @@ PAGES.stats = drawMonthlyRecapPage;
 const NAV_TITLED = { albums: 1, plist: 1, artists: 1, songs: 1, mood: 1, stats: 1, settings: 1 };
 
 window.invalidatePagesLocaleCaches = function (langChanged, countryChanged) {
+  _clearTwCache();
+  _chipLayoutCache.clear();
+  _searchFiltLang = null;
+  _searchFiltCache = null;
   if (typeof syncPrevTabs === 'function') syncPrevTabs();
   if (typeof _searchChipAnim !== 'undefined' && _searchChipAnim) {
     _searchChipAnim.x = null;

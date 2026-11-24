@@ -1,6 +1,7 @@
 package dev.sonora.music.lyrics
 
 import dev.sonora.music.Lyrics
+import dev.sonora.music.SonoraHttpPool
 import java.net.URLEncoder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -11,11 +12,13 @@ import org.json.JSONObject
 /** Word-timed TTML lyrics client backed by Better Lyrics. */
 object BetterLyrics {
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-        .callTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient by lazy {
+        SonoraHttpPool.baseClient.newBuilder()
+            .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
 
     suspend fun lyrics(title: String, artist: String, durationMs: Long): Lyrics? =
         withContext(Dispatchers.IO) {

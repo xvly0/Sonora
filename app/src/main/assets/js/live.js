@@ -26,8 +26,28 @@ function stubAlbum(id, f) {
   return e;
 }
 const _byArtistId = new Map();
+const _byAlbumId = new Map();
+const _byAlbumKey = new Map();
 const _savedIdSet = new Set();
 let _libVersion = 0;
+function _capObjCache(obj, maxKeys) {
+  const keys = Object.keys(obj);
+  if (keys.length <= maxKeys) return;
+  const drop = keys.length - Math.floor(maxKeys * 0.8);
+  for (let i = 0; i < drop; i++) delete obj[keys[i]];
+}
+function _pruneExpiredObj(obj, maxKeys) {
+  const keys = Object.keys(obj);
+  if (keys.length <= maxKeys) return;
+  const now = Date.now();
+  for (let i = 0; i < keys.length; i++) {
+    if ((obj[keys[i]] || 0) <= now) delete obj[keys[i]];
+  }
+  _capObjCache(obj, maxKeys);
+}
+function _liveWakeFrame() {
+  if (typeof window !== 'undefined' && typeof window.wakeFrame === 'function') window.wakeFrame();
+}
 function _indexTrackArtist(t, prevArtistId) {
   if (prevArtistId && prevArtistId !== t.artistId) {
     const prevSet = _byArtistId.get(prevArtistId);
@@ -38,6 +58,49 @@ function _indexTrackArtist(t, prevArtistId) {
     if (!set) { set = new Set(); _byArtistId.set(t.artistId, set); }
     set.add(t);
   }
+}
+function _indexTrackAlbum(t, prevAlbId, prevAlbKey) {
+  if (!t) return;
+  const nextAlbId = t.album || '';
+  if (prevAlbId && prevAlbId !== nextAlbId) {
+    const ps = _byAlbumId.get(prevAlbId);
+    if (ps) { ps.delete(t); if (!ps.size) _byAlbumId.delete(prevAlbId); }
+  }
+  if (nextAlbId) {
+    let set = _byAlbumId.get(nextAlbId);
+    if (!set) { set = new Set(); _byAlbumId.set(nextAlbId, set); }
+    set.add(t);
+  }
+  const nextAlbKey = t.albumTitle && typeof _cleanAlbumThumbKey === 'function' ? _cleanAlbumThumbKey(t.albumTitle, t.artist) : '';
+  if (prevAlbKey && prevAlbKey !== nextAlbKey) {
+    const pk = _byAlbumKey.get(prevAlbKey);
+    if (pk) { pk.delete(t); if (!pk.size) _byAlbumKey.delete(prevAlbKey); }
+  }
+  if (nextAlbKey) {
+    let kset = _byAlbumKey.get(nextAlbKey);
+    if (!kset) { kset = new Set(); _byAlbumKey.set(nextAlbKey, kset); }
+    kset.add(t);
+  }
+  t._albIdxKey = nextAlbKey;
+}
+function _isTrackInSavedLibrary(id) {
+  if (!id) return false;
+  if (_savedIdSet.has(id)) return true;
+  if (typeof PL !== 'undefined' && PL && PL.fav && PL.fav[id]) return true;
+  if (typeof LIVE !== 'undefined' && LIVE) {
+    if (Array.isArray(LIVE.recent)) {
+      for (let i = 0; i < LIVE.recent.length; i++) if (LIVE.recent[i] && LIVE.recent[i].id === id) return true;
+    }
+    if (Array.isArray(LIVE.userPlaylists)) {
+      for (let i = 0; i < LIVE.userPlaylists.length; i++) {
+        const trs = LIVE.userPlaylists[i] && LIVE.userPlaylists[i].tracks;
+        if (Array.isArray(trs)) {
+          for (let j = 0; j < trs.length; j++) if (trs[j] && trs[j].id === id) return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 function _syncSavedIndex() {
   _savedIdSet.clear();
@@ -116,7 +179,7 @@ function ingestTrack(t) {
       }
     }
   }
-  const old = LIVE.known[t.id], oldEx = old && old.ex, prevArtId = old && old.artistId, o = old || (LIVE.known[t.id] = {});
+  const old = LIVE.known[t.id], oldEx = old && old.ex, prevArtId = old && old.artistId, prevAlb = old && old.album, prevAlbIdxKey = old && old._albIdxKey, o = old || (LIVE.known[t.id] = {});
   const inAlbName = (t.albumTitle !== undefined && (t.album === t.albumId || (typeof t.album === 'string' && t.album.indexOf('s_') === 0))) ? t.albumTitle : t.album;
   const inComp = _isCompilationAlbumName(inAlbName, t.title);
   const oldAlbName = old ? (old.albumTitle || (old.album && BYID[old.album] && BYID[old.album].title) || '') : '';
@@ -155,12 +218,19 @@ function ingestTrack(t) {
       typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(rawAlbObj.thumb) &&
       typeof isSameCoverBase === 'function' && !isSameCoverBase(rawAlbObj.thumb, effThumb)
     );
-    const rawAlbSharedDifferent = Boolean(
-      t.canonicalCover && rawAlbObj && rawAlbObj.thumb && effThumb &&
-      typeof isSameCoverBase === 'function' && !isSameCoverBase(rawAlbObj.thumb, effThumb) &&
-      typeof TRACKS !== 'undefined' &&
-      TRACKS.some(x => x && x.id !== t.id && x.album === rawAlbId && x.thumb && !isSameCoverBase(x.thumb, effThumb))
-    );
+    let rawAlbSharedDifferent = false;
+    if (t.canonicalCover && rawAlbObj && rawAlbObj.thumb && effThumb &&
+        typeof isSameCoverBase === 'function' && !isSameCoverBase(rawAlbObj.thumb, effThumb)) {
+      const albSet = _byAlbumId.get(rawAlbId);
+      if (albSet && albSet.size) {
+        for (const x of albSet) {
+          if (x && x.id !== t.id && x.thumb && !isSameCoverBase(x.thumb, effThumb)) {
+            rawAlbSharedDifferent = true;
+            break;
+          }
+        }
+      }
+    }
     const detachRawAlb = Boolean(
       rawAlbId && (
         (upgradeFromComp && !inComp && (rawAlbIdIsComp || rawAlbTitleMismatch || rawAlbThumbMismatch || rawAlbSharedDifferent)) ||
@@ -257,12 +327,19 @@ function ingestTrack(t) {
     }
   }
   delete o._lyricMatch;
+  delete o._recKey;
+  delete o._recKeySrc;
   delete o.kind; o.dur = o.dur || 210; if (!old) TRACKS.push(o);
   _indexTrackArtist(o, prevArtId);
+  _indexTrackAlbum(o, prevAlb, prevAlbIdxKey);
   const albumChanged = Boolean(old && old.album !== key);
   if ((upgradeFromComp || t.canonicalCover) && (trackThumbChanged || albumChanged || canonicalBecameTrue)) {
-    if (typeof _propagateCanonicalTrack === 'function') _propagateCanonicalTrack(o);
-    else if (typeof _searchCacheUpgradeHook === 'function') _searchCacheUpgradeHook(o);
+    const needsProp = Boolean(old) || Boolean(typeof _searchMemCache !== 'undefined' && _searchMemCache.size > 0) || Boolean(typeof LIVE !== 'undefined' && LIVE && LIVE.lastSearch);
+    if (needsProp) {
+      if (typeof _queueCanonicalPropagate === 'function') _queueCanonicalPropagate(o, false);
+      else if (typeof _propagateCanonicalTrack === 'function') _propagateCanonicalTrack(o);
+      else if (typeof _searchCacheUpgradeHook === 'function') _searchCacheUpgradeHook(o);
+    }
   }
   _libVersion++;
   return o;
@@ -323,6 +400,7 @@ function fetchArtistThumb(name, id) {
         const effThumb = _preserveAppleHiRes(prevThumb, resolvedThumb);
         delete _artThumbCold[cacheKey];
         _artThumbCache[cacheKey] = resolvedThumb;
+        _capObjCache(_artThumbCache, 500);
         if (existingObj) {
           const sameBase = Boolean(prevThumb && typeof isSameCoverBase === 'function' && isSameCoverBase(prevThumb, effThumb));
           existingObj.thumb = effThumb;
@@ -386,12 +464,20 @@ function _applyAlbumThumb(id, thumb, title, artist) {
       _invalidateCoverCaches(id, sameBase, true);
     }
   }
-  if (typeof TRACKS !== 'undefined' && Array.isArray(TRACKS)) {
-    for (let i = 0; i < TRACKS.length; i++) {
-      const t = TRACKS[i];
-      if (!t) continue;
+  const candTracks = new Set();
+  if (id) {
+    const byId = _byAlbumId.get(id);
+    if (byId) byId.forEach(t => candTracks.add(t));
+  }
+  if (ck) {
+    const byKey = _byAlbumKey.get(ck);
+    if (byKey) byKey.forEach(t => candTracks.add(t));
+  }
+  if (candTracks.size) {
+    candTracks.forEach(t => {
+      if (!t) return;
       const matchId = id && t.album === id;
-      const tKey = !matchId && ck && t.albumTitle ? _cleanAlbumThumbKey(t.albumTitle, t.artist) : '';
+      const tKey = !matchId && ck && t.albumTitle ? (t._albIdxKey || _cleanAlbumThumbKey(t.albumTitle, t.artist)) : '';
       if (matchId || (tKey && tKey === ck && (!t.album || t.album.indexOf('s_') === 0))) {
         const tSameBase = Boolean(t.thumb && typeof isSameCoverBase === 'function' && isSameCoverBase(t.thumb, thumb));
         const tSameApple = t.thumb && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(t.thumb) && isAppleArtistThumb(thumb);
@@ -405,7 +491,7 @@ function _applyAlbumThumb(id, thumb, title, artist) {
           if (typeof preloadArt === 'function') preloadArt(t, false);
         }
       }
-    }
+    });
   }
   if (typeof _searchCacheAlbumUpgradeHook === 'function') {
     _searchCacheAlbumUpgradeHook(id, title, artist, thumb);
@@ -440,6 +526,7 @@ function fetchAlbumThumb(title, artist, id) {
           delete _albThumbCold[ck];
           delete _albThumbMiss[pendingKey];
           _albThumbCache[ck] = resolvedThumb;
+          _capObjCache(_albThumbCache, 500);
         }
         _applyAlbumThumb(id, resolvedThumb, cleanTitle, artist);
         return resolvedThumb;
@@ -448,6 +535,7 @@ function fetchAlbumThumb(title, artist, id) {
         _albThumbCold[ck] = Date.now() + 2000;
       } else {
         _albThumbMiss[pendingKey] = Date.now() + 120000;
+        _pruneExpiredObj(_albThumbMiss, 300);
       }
       return null;
     })
@@ -607,19 +695,37 @@ function _applyTrackThumb(track, thumb, resolvedAlbum, isCanonical) {
     applyTo(byIdTrack);
   }
   const canonicalSrc = knownTrack || track;
-  if (typeof _propagateCanonicalTrack === 'function' && _propagateCanonicalTrack(canonicalSrc, true)) {
+  if (typeof _indexTrackAlbum === 'function') {
+    _indexTrackAlbum(canonicalSrc, canonicalSrc.album, canonicalSrc._albIdxKey);
+  }
+  if (typeof _queueCanonicalPropagate === 'function') {
+    _queueCanonicalPropagate(canonicalSrc, true);
+  } else if (typeof _propagateCanonicalTrack === 'function' && _propagateCanonicalTrack(canonicalSrc, true)) {
     anyChanged = true;
   }
   _syncPlaybackArtworkIfChanged(artSnap);
   if (typeof preloadArt === 'function') preloadArt(track, false);
   if (anyChanged) {
-    if (typeof liveSave === 'function') liveSave();
+    if (typeof liveSave === 'function' && _isTrackInSavedLibrary(track.id)) liveSave();
     if (typeof savePlayerState === 'function' && typeof PL !== 'undefined' && Array.isArray(PL.queue) &&
         PL.queue.some(x => x && x.id === track.id)) {
       savePlayerState();
     }
-    if (typeof redrawSheetContent === 'function') redrawSheetContent();
-    else if (typeof redraw === 'function') redraw();
+    const curTr = typeof cur === 'function' ? cur() : null;
+    const isCurTrk = Boolean(curTr && track.id && curTr.id === track.id);
+    const shVis = typeof SH !== 'undefined' && SH && SH.t >= 0.01;
+    const cmVis = typeof CM !== 'undefined' && CM && CM.open;
+    const outVis = typeof OUT_DRAWER !== 'undefined' && OUT_DRAWER && OUT_DRAWER.open;
+    if (isCurTrk || cmVis || outVis) {
+      if (typeof redraw === 'function') redraw();
+    } else if (!shVis) {
+      if (typeof redrawSceneOnly === 'function') redrawSceneOnly();
+      else if (typeof redraw === 'function') redraw();
+    } else if (typeof redrawSheetContent === 'function') {
+      redrawSheetContent();
+    } else if (typeof redraw === 'function') {
+      redraw();
+    }
   }
 }
 function fetchTrackThumb(track) {
@@ -654,15 +760,17 @@ function fetchTrackThumb(track) {
         const resAlb = (d.album || '').trim();
         const resCanonical = d.canonicalCover !== false;
         _trkThumbCache[ck] = { thumb: resThumb, album: resAlb, canonicalCover: resCanonical };
+        _capObjCache(_trkThumbCache, 600);
         delete _trkThumbMiss[ck];
         _applyTrackThumb(track, resThumb, resAlb, resCanonical);
         if (resCanonical && resAlb && !(typeof _isCompilationAlbumName === 'function' && _isCompilationAlbumName(resAlb, track.title))) {
           const ack = _cleanAlbumThumbKey(resAlb, track.artist);
-          if (ack && !_albThumbCache[ack]) _albThumbCache[ack] = resThumb;
+          if (ack && !_albThumbCache[ack]) { _albThumbCache[ack] = resThumb; _capObjCache(_albThumbCache, 500); }
         }
         return { thumb: resThumb, album: resAlb, canonicalCover: resCanonical };
       }
       _trkThumbMiss[ck] = Date.now() + 120000;
+      _pruneExpiredObj(_trkThumbMiss, 300);
       return null;
     })
     .catch(() => null)
@@ -677,6 +785,21 @@ function _scheduleArtThumbPump(delayMs) {
     _artThumbTimer = 0;
     _pumpArtThumbQ();
   }, delayMs);
+}
+function _applyArtistObjThumb(ar, thumb) {
+  if (!ar || !thumb) return;
+  const listThumb = _forceAppleListThumb(thumb);
+  const prev = ar.thumb;
+  const eff = _preserveAppleHiRes(prev, listThumb);
+  const sameBase = Boolean(prev && typeof isSameCoverBase === 'function' && isSameCoverBase(prev, eff));
+  ar.thumb = eff;
+  if (!sameBase && ar.id && !_hasRealArt(ar.id)) delete ARTC[ar.id];
+  const trSet = ar.id ? _byArtistId.get(ar.id) : null;
+  if (trSet) trSet.forEach(t => { t.artistThumb = _preserveAppleHiRes(t.artistThumb, listThumb); });
+  if (typeof preloadArt === 'function') preloadArt(ar, false);
+  const shVis = typeof SH !== 'undefined' && SH && SH.t >= 0.01;
+  if (!shVis && typeof redrawSceneOnly === 'function') redrawSceneOnly();
+  else if (typeof redraw === 'function') redraw();
 }
 function _pumpArtThumbQ() {
   if (!_artThumbQ.length) { _artThumbStaggerCount = 0; return; }
@@ -700,13 +823,19 @@ function _pumpArtThumbQ() {
       _artThumbWaiters.delete(cacheKey);
       const cached = _artThumbCache[cacheKey];
       entry.tracks.forEach(tr => _applyArtistThumb(tr, entry.rawName, cached));
+      if (entry.artists) entry.artists.forEach(ar => { ar._thBusy = false; _applyArtistObjThumb(ar, cached); });
       continue;
     }
     _artThumbAct++;
     fetchArtistThumb(entry.rawName, entry.artistId)
       .then(thumb => {
         _artThumbWaiters.delete(cacheKey);
-        if (thumb) entry.tracks.forEach(tr => _applyArtistThumb(tr, entry.rawName, thumb));
+        if (thumb) {
+          entry.tracks.forEach(tr => _applyArtistThumb(tr, entry.rawName, thumb));
+          if (entry.artists) entry.artists.forEach(ar => { ar._thBusy = false; _applyArtistObjThumb(ar, thumb); });
+        } else if (entry.artists) {
+          entry.artists.forEach(ar => { ar._thBusy = false; });
+        }
       })
       .finally(() => {
         _artThumbAct = Math.max(0, _artThumbAct - 1);
@@ -733,7 +862,7 @@ function prefetchArtistThumb(t) {
     entry.tracks.add(t);
     if (!entry.artistId && t.artistId) entry.artistId = t.artistId;
   } else {
-    entry = { rawName, artistId: t.artistId || null, tracks: new Set([t]) };
+    entry = { rawName, artistId: t.artistId || null, tracks: new Set([t]), artists: null };
     _artThumbWaiters.set(cacheKey, entry);
     _artThumbQ.push(cacheKey);
   }
@@ -789,15 +918,35 @@ function ingestItem(x) {
 }
 function liveArtistThumb(ar) {
   if (!ar || ar.kind !== 'artist' || !ar.id || ar.thumb || ar._thBusy) return;
+  const rawName = _cleanArtistThumbName(ar.title || '');
+  if (!rawName) return;
+  const cacheKey = rawName.toLowerCase();
+  if (_artThumbCache[cacheKey]) {
+    _applyArtistObjThumb(ar, _artThumbCache[cacheKey]);
+    return;
+  }
   ar._thBusy = true;
-  liveLoad(ar).finally(() => {
-    ar._thBusy = false;
-    if (ar.thumb) {
-      const trSet = _byArtistId.get(ar.id);
-      if (trSet) trSet.forEach(t => { t.artistThumb = ar.thumb; });
-      liveSave(); redraw();
-    }
-  });
+  if (_artThumbPending[cacheKey]) {
+    _artThumbPending[cacheKey].then(thumb => {
+      ar._thBusy = false;
+      if (thumb) _applyArtistObjThumb(ar, thumb);
+    }).catch(() => { ar._thBusy = false; });
+    return;
+  }
+  let entry = _artThumbWaiters.get(cacheKey);
+  if (entry) {
+    if (!entry.artists) entry.artists = new Set();
+    entry.artists.add(ar);
+    if (!entry.artistId && ar.id) entry.artistId = ar.id;
+  } else {
+    entry = { rawName, artistId: ar.id || null, tracks: new Set(), artists: new Set([ar]) };
+    _artThumbWaiters.set(cacheKey, entry);
+    _artThumbQ.push(cacheKey);
+  }
+  const initDelay = _artThumbAct === 0
+    ? (!_startupSecondaryReady && _startupGraceUntil > performance.now() ? Math.max(450, Math.round(_startupGraceUntil - performance.now())) : 180)
+    : 60;
+  _scheduleArtThumbPump(initDelay);
 }
 function liveLoad(it) {
   if (it.loaded && tracksOf(it).length && (it.kind !== 'artist' || (typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(it.thumb)))) return Promise.resolve(it);
@@ -882,24 +1031,34 @@ function liveLoad(it) {
     }
     it.loaded = true; it.loading = false; it._p = null; preloadArt(it, true);
     const loadedTracks = tracksOf(it);
-    for (let i = 0; i < Math.min(10, loadedTracks.length); i++) {
-      if (loadedTracks[i] && loadedTracks[i].thumb) preloadArt(loadedTracks[i], true);
+    for (let i = 0; i < Math.min(6, loadedTracks.length); i++) {
+      if (loadedTracks[i] && loadedTracks[i].thumb) preloadArt(loadedTracks[i], i < 2);
     }
-    loadedTracks.slice(0, 2).forEach(x => {
-      if (x && x.id) {
-        if (window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') window.SonoraNative.prefetch(x.id);
-        else fetch('/api/prefetch/' + x.id).catch(() => {});
-      }
-    });
-    liveSave(); redraw(); return it;
+    if (loadedTracks[0] && loadedTracks[0].id) {
+      if (window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') window.SonoraNative.prefetch(loadedTracks[0].id);
+      else fetch('/api/prefetch/' + loadedTracks[0].id).catch(() => {});
+    }
+    redraw(); return it;
   }).catch(e => { it.err = e.message; it.loading = false; it._p = null; redraw(); });
 }
 const playOne = t => playList([t], 0);
 
 /* ── copertine reali (coda con priorità ai brani visibili su schermo + deduplicazione per URL + LRU bounded + rasterizzazione distribuita) ── */
 const IMGS = {}, _covUrl = {}, _covWait = {}, _covQ = [], _covRastQ = [];
-const _covLru = new Map(), _covQSet = new Set(), _covPriSet = new Set(), COV_LRU_CAP = 220, COV_SCENE_COALESCE_MS = 16;
-let _covAct = 0, _covRastRaf = 0, _covDirtyRaf = 0, _covPendingOv = false, _covFlushTimer = 0, _lastCovScenePaintAt = 0, _covScenePending = false;
+const _covLru = new Map(), _covQSet = new Set(), _covPriSet = new Set(), COV_LRU_CAP = 104, COV_LIST_MAX_SZ = 384, COV_SCENE_COALESCE_MS = 16;
+let _covAct = 0, _covRastRaf = 0, _covRastDelayTimer = 0, _covDirtyRaf = 0, _covPendingOv = false, _covFlushTimer = 0, _lastCovScenePaintAt = 0, _covScenePending = false;
+function _setArtKey(k, cv) {
+  if (!k) return;
+  const prev = ARTC[k];
+  if (prev && prev !== cv && prev._artKeys) prev._artKeys.delete(k);
+  ARTC[k] = cv;
+  if (cv) {
+    try {
+      if (!cv._artKeys) cv._artKeys = new Set();
+      cv._artKeys.add(k);
+    } catch (e) {}
+  }
+}
 function _isUiAnimatingOrBusy() {
   if (typeof INP !== 'undefined' && INP && INP.down) return true;
   if (typeof topPage === 'function') {
@@ -930,11 +1089,12 @@ function _isHeroOrActiveCoverUrl(u) {
 }
 function _isCoverReferenced(cv) {
   if (!cv) return false;
-  for (const ak in ARTC) {
-    if (ARTC[ak] === cv) return true;
-  }
-  for (const u in _covUrl) {
-    if (_covUrl[u] === cv) return true;
+  if (cv._url && _covUrl[cv._url] === cv) return true;
+  if (cv._artKeys && cv._artKeys.size) {
+    for (const ak of cv._artKeys) {
+      if (ARTC[ak] === cv) return true;
+    }
+    return false;
   }
   return false;
 }
@@ -942,16 +1102,18 @@ let _covMatchedCur = false;
 function _disposeCover(cv, forceClearRefs) {
   if (!cv) return;
   if (forceClearRefs) {
-    for (const ak in ARTC) {
-      if (ARTC[ak] === cv) delete ARTC[ak];
+    if (cv._artKeys && cv._artKeys.size) {
+      for (const ak of cv._artKeys) {
+        if (ARTC[ak] === cv) delete ARTC[ak];
+      }
+      cv._artKeys.clear();
     }
-    for (const u in _covUrl) {
-      if (_covUrl[u] === cv) delete _covUrl[u];
-    }
+    if (cv._url && _covUrl[cv._url] === cv) delete _covUrl[cv._url];
   } else if (_isCoverReferenced(cv)) {
     return;
   }
   try {
+    if (cv._artKeys) cv._artKeys.clear();
     if (cv._tiles) {
       for (const tk in cv._tiles) {
         const tc = cv._tiles[tk];
@@ -972,11 +1134,14 @@ function _markCoverDirty(priority) {
   _covMatchedCur = false;
   if (priority === true && (cmVis || outVis || (!shFull && (shVis || matchedCur)))) {
     if (typeof redraw === 'function') redraw();
-    else if (typeof D !== 'undefined') { D.scene = D.ov = D.gl = true; }
+    else if (typeof D !== 'undefined') { D.scene = D.ov = D.gl = true; _liveWakeFrame(); }
+  } else if (!shVis) {
+    if (typeof redrawSceneOnly === 'function') redrawSceneOnly();
+    else if (typeof D !== 'undefined') { D.scene = D.gl = true; _liveWakeFrame(); }
   } else {
     if (typeof redrawSheetContent === 'function') redrawSheetContent();
     else if (typeof redrawSceneOnly === 'function') redrawSceneOnly();
-    else if (typeof D !== 'undefined') { D.scene = D.gl = true; }
+    else if (typeof D !== 'undefined') { D.scene = D.gl = true; _liveWakeFrame(); }
   }
 }
 function _coalesceCoverScene(needOv) {
@@ -989,7 +1154,7 @@ function _coalesceCoverScene(needOv) {
     return;
   }
   const busy = _isUiAnimatingOrBusy();
-  const coalesceMs = busy ? 48 : COV_SCENE_COALESCE_MS;
+  const coalesceMs = busy ? 110 : COV_SCENE_COALESCE_MS;
   const queueDrained = !busy && !_covRastQ.length && _covAct === 0 && !_covQ.length;
   if (queueDrained || (now - _lastCovScenePaintAt >= coalesceMs)) {
     if (_covFlushTimer) { clearTimeout(_covFlushTimer); _covFlushTimer = 0; }
@@ -1026,6 +1191,7 @@ function clearLiveCoverCache() {
   _covQSet.clear();
   _covPriSet.clear();
   if (_covRastRaf) { cancelAnimationFrame(_covRastRaf); _covRastRaf = 0; }
+  if (_covRastDelayTimer) { clearTimeout(_covRastDelayTimer); _covRastDelayTimer = 0; }
   if (_covDirtyRaf) { cancelAnimationFrame(_covDirtyRaf); _covDirtyRaf = 0; }
   if (_covFlushTimer) { clearTimeout(_covFlushTimer); _covFlushTimer = 0; }
   _covPendingOv = false;
@@ -1069,8 +1235,13 @@ function _covStore(u, cv) {
     if (prev._real && !prev._placeholder) {
       try { cv._fadePending = false; cv._t0 = 0; } catch (e) {}
     }
-    for (const ak in ARTC) {
-      if (ARTC[ak] === prev) ARTC[ak] = cv;
+    if (prev._artKeys && prev._artKeys.size) {
+      const moved = Array.from(prev._artKeys);
+      for (let i = 0; i < moved.length; i++) {
+        const ak = moved[i];
+        if (ARTC[ak] === prev) _setArtKey(ak, cv);
+      }
+      prev._artKeys.clear();
     }
     _disposeCover(prev, false);
   }
@@ -1080,8 +1251,11 @@ function _covStore(u, cv) {
       if (_isActiveCoverUrl(evUrl)) continue;
       _covLru.delete(evUrl);
       if (_covUrl[evUrl] === evCv) delete _covUrl[evUrl];
-      for (const ak in ARTC) {
-        if (ARTC[ak] === evCv) delete ARTC[ak];
+      if (evCv && evCv._artKeys && evCv._artKeys.size) {
+        for (const ak of evCv._artKeys) {
+          if (ARTC[ak] === evCv) delete ARTC[ak];
+        }
+        evCv._artKeys.clear();
       }
       _disposeCover(evCv, false);
     }
@@ -1130,13 +1304,12 @@ function _covApply(k, cv) {
   if (prevReal || altPrevReal) {
     try { cv._fadePending = false; cv._t0 = 0; } catch (e) {}
   }
-  ARTC[k] = cv;
+  _setArtKey(k, cv);
   if (!sameBase) {
     delete PALC[k];
     delete SHAD_PALC[k];
     delete TINTC[k + 'd'];
     delete TINTC[k + 'l'];
-    if (FLU) FLU.key = null;
   }
   let needOv = false;
   const c = cur();
@@ -1145,6 +1318,7 @@ function _covApply(k, cv) {
     if (c.id === k || (cAlb && cAlb.id === k) || c.thumb === cv._url || c.artistThumb === cv._url || (cAlb && cAlb.thumb === cv._url)) {
       _covMatchedCur = true;
       needOv = true;
+      if (!sameBase && typeof FLU !== 'undefined' && FLU) FLU.key = null;
     }
   }
   if (!needOv && typeof CM !== 'undefined' && CM && CM.open && CM.tr) {
@@ -1184,15 +1358,16 @@ function _covApply(k, cv) {
       const keepTrkPal = trSameBase || (!trPrev && (albSameBase || sameBase));
       const keepAlbPal = albSameBase || (!albPrev && sameBase);
       if (trkId && !trWaitingApple && trSameUrlBase) {
-        if (!(trSameBase && isHiUrl(trPrev._url) && !isHiUrl(cv._url))) ARTC[trkId] = cv;
+        if (!(trSameBase && isHiUrl(trPrev._url) && !isHiUrl(cv._url))) _setArtKey(trkId, cv);
         if (!keepTrkPal) { delete SHAD_PALC[trkId]; delete PALC[trkId]; }
       }
       if (albId && !(trWaitingApple && albId === 's_' + trkId) && albSameUrlBase) {
-        if (!(albSameBase && isHiUrl(albPrev._url) && !isHiUrl(cv._url))) ARTC[albId] = cv;
+        if (!(albSameBase && isHiUrl(albPrev._url) && !isHiUrl(cv._url))) _setArtKey(albId, cv);
         if (!keepAlbPal) { delete SHAD_PALC[albId]; delete PALC[albId]; }
       }
       if (idx === 0 && !trWaitingApple) {
         _covMatchedCur = true;
+        if (!keepTrkPal && !keepAlbPal && typeof FLU !== 'undefined' && FLU) FLU.key = null;
         if (typeof SH === 'undefined' || !SH || SH.t < 0.999) needOv = true;
         if (!keepTrkPal && !keepAlbPal && sheetVis && typeof shaderPalette === 'function') {
           setTimeout(() => { if (typeof shaderPalette === 'function') shaderPalette(tr); }, 24);
@@ -1202,6 +1377,17 @@ function _covApply(k, cv) {
   });
   return needOv;
 }
+function _scheduleCovRast(delayMs) {
+  if (delayMs > 0) {
+    if (_covRastDelayTimer || _covRastRaf) return;
+    _covRastDelayTimer = setTimeout(() => {
+      _covRastDelayTimer = 0;
+      if (_covRastQ.length && !_covRastRaf) _covRastRaf = requestAnimationFrame(_covStepRast);
+    }, delayMs);
+    return;
+  }
+  if (!_covRastRaf) _covRastRaf = requestAnimationFrame(_covStepRast);
+}
 function _covStepRast() {
   _covRastRaf = 0;
   if (!_covRastQ.length) return;
@@ -1209,8 +1395,13 @@ function _covStepRast() {
   const busy = _isUiAnimatingOrBusy();
   const maxN = busy ? 2 : 6;
   const budgetMs = busy ? 1.0 : 3.0;
-  let n = 0, croppedN = 0, applied = false, needOv = false;
+  let n = 0, croppedN = 0, applied = false, needOv = false, deferredCrop = false;
   while (_covRastQ.length && (n === 0 || (n < maxN && (!busy || croppedN < 1) && (performance.now() - t0) < budgetMs))) {
+    const head = _covRastQ[0];
+    if (busy && head && head.needsCrop && !head.pri) {
+      deferredCrop = true;
+      break;
+    }
     const item = _covRastQ.shift();
     const u = item.u, sz = item.sz;
     let cv = null;
@@ -1224,7 +1415,7 @@ function _covStepRast() {
         cv = document.createElement('canvas'); cv.width = cv.height = sz; cv._real = true; cv._url = u; cv._tiles = {};
         const x = cv.getContext('2d');
         x.imageSmoothingEnabled = true;
-        x.imageSmoothingQuality = 'high';
+        x.imageSmoothingQuality = 'medium';
         if (hasValidBmp) {
           const bw = item.bmp.width, bh = item.bmp.height, sw = item.sw || Math.min(bw, bh);
           const sx = Math.floor((bw - sw) / 2), sy = Math.floor((bh - sw) / 2);
@@ -1262,13 +1453,13 @@ function _covStepRast() {
   }
   if (applied) _coalesceCoverScene(needOv);
   _covPump();
-  if (_covRastQ.length && !_covRastRaf) _covRastRaf = requestAnimationFrame(_covStepRast);
+  if (_covRastQ.length) _scheduleCovRast(deferredCrop ? 60 : 0);
 }
 function _covEnqueueRast(entry) {
   entry.pri = _covPriSet.delete(entry.u);
   if (entry.pri) _covRastQ.unshift(entry);
   else _covRastQ.push(entry);
-  if (!_covRastRaf) _covRastRaf = requestAnimationFrame(_covStepRast);
+  _scheduleCovRast(0);
 }
 function _covPump() {
   if (_covRastQ.length >= 48) return;
@@ -1293,23 +1484,38 @@ function _covPump() {
       .then(r => { if (!r.ok) throw new Error('http'); return r.blob(); })
       .then(blob => createImageBitmap(blob))
       .then(rawBmp => {
-        if (!finishLoad()) {
-          if (rawBmp && typeof rawBmp.close === 'function') { try { rawBmp.close(); } catch (e) {} }
-          return;
-        }
         const w = rawBmp ? (rawBmp.width || 0) : 0, h = rawBmp ? (rawBmp.height || 0) : 0;
         const sw = Math.min(w, h);
         if (sw <= 0) {
           if (rawBmp && typeof rawBmp.close === 'function') { try { rawBmp.close(); } catch (e) {} }
+          return null;
+        }
+        const maxCovSz = _isHeroOrActiveCoverUrl(u) ? 1080 : COV_LIST_MAX_SZ;
+        const sz = Math.min(maxCovSz, Math.max(192, sw));
+        const needsCrop = Math.abs(w - h) > 2 || w > maxCovSz + 24;
+        if (!needsCrop) {
+          return { bmp: rawBmp, sw, sz: w, needsCrop: false };
+        }
+        const sx = Math.floor((w - sw) / 2), sy = Math.floor((h - sw) / 2);
+        return createImageBitmap(rawBmp, sx, sy, sw, sw, { resizeWidth: sz, resizeHeight: sz, resizeQuality: 'medium' })
+          .then(scaledBmp => {
+            if (typeof rawBmp.close === 'function') { try { rawBmp.close(); } catch (e) {} }
+            return { bmp: scaledBmp, sw: sz, sz, needsCrop: false };
+          })
+          .catch(() => ({ bmp: rawBmp, sw, sz, needsCrop: true }));
+      })
+      .then(res => {
+        if (!finishLoad()) {
+          if (res && res.bmp && typeof res.bmp.close === 'function') { try { res.bmp.close(); } catch (e) {} }
+          return;
+        }
+        if (!res || !res.bmp || res.sw <= 0) {
           _covPriSet.delete(u);
           delete _covWait[u];
           _covPump();
           return;
         }
-        const maxCovSz = _isHeroOrActiveCoverUrl(u) ? 1080 : 544;
-        const sz = Math.min(maxCovSz, Math.max(192, sw));
-        const needsCrop = Math.abs(w - h) > 2 || w > maxCovSz + 64;
-        _covEnqueueRast({ u, bmp: rawBmp, sw, sz: needsCrop ? sz : w, needsCrop });
+        _covEnqueueRast({ u, bmp: res.bmp, sw: res.sw, sz: res.sz, needsCrop: res.needsCrop });
         _covPump();
       })
       .catch(() => {
@@ -1373,8 +1579,19 @@ function liveCover(item, k, pri) {
 }
 
 /* ── riproduzione: cronologia, radio infinita, tasti multimediali ── */
+let _nextLyPrefetchTimer = 0;
+function _cancelStaleLyPolls(keepIds) {
+  if (typeof _lyPollTimers === 'undefined') return;
+  for (const [id, tid] of _lyPollTimers) {
+    if (!keepIds || !keepIds.has(id)) {
+      clearTimeout(tid);
+      _lyPollTimers.delete(id);
+    }
+  }
+}
 function liveOnTrack(t, restoreOnly) {
   if (!LIVE.on || !t) return;
+  if (_nextLyPrefetchTimer) { clearTimeout(_nextLyPrefetchTimer); _nextLyPrefetchTimer = 0; }
   if (!restoreOnly) {
     _localeCountrySwitched = false;
     if (typeof getResolvedCountry === 'function') t._playedCountry = getResolvedCountry();
@@ -1386,20 +1603,33 @@ function liveOnTrack(t, restoreOnly) {
     }
     if (typeof savePlayerState === 'function') savePlayerState();
   }
+  const nx1 = PL.queue[PL.qi + 1];
+  const keepLy = new Set([t.id]);
+  if (nx1 && nx1.id) keepLy.add(nx1.id);
+  _cancelStaleLyPolls(keepLy);
   const shouldPrefetchExtras = !restoreOnly || (typeof PL !== 'undefined' && PL.playing);
   if (shouldPrefetchExtras) {
     if (_startupSecondaryReady && t.artist && !t.artistThumb && typeof prefetchArtistThumb === 'function') prefetchArtistThumb(t);
     if (!t.canonicalCover && !t._appleUpgradeSettled && typeof preloadArt === 'function') preloadArt(t, true);
     liveLy(t); /* il testo parte a caricarsi appena scegli il brano, non quando apri la pagina testi */
     if (typeof prewarmLyrics === 'function' && cur() && cur().id === t.id) prewarmLyrics(t);
-    for (let i = 1; i <= 2; i++) {
-      const nx = PL.queue[PL.qi + i];
-      if (nx && nx.id && nx.id !== t.id) {
-        if (window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') window.SonoraNative.prefetch(nx.id);
-        else if (i === 1) fetch('/api/prefetch/' + nx.id).catch(() => {});
-        if (typeof preloadArt === 'function') preloadArt(nx, true);
-        liveLy(nx);
-      }
+    if (nx1 && nx1.id && nx1.id !== t.id) {
+      if (window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') window.SonoraNative.prefetch(nx1.id);
+      else fetch('/api/prefetch/' + nx1.id).catch(() => {});
+      if (typeof preloadArt === 'function') preloadArt(nx1, true);
+      const nextId = nx1.id;
+      _nextLyPrefetchTimer = setTimeout(() => {
+        _nextLyPrefetchTimer = 0;
+        const cNow = typeof cur === 'function' ? cur() : null;
+        const qNext = PL.queue && PL.queue[PL.qi + 1];
+        if (cNow && cNow.id === t.id && qNext && qNext.id === nextId) {
+          liveLy(qNext);
+        }
+      }, 2400);
+    }
+    const nx2 = PL.queue[PL.qi + 2];
+    if (nx2 && nx2.id && nx2.id !== t.id && typeof preloadArt === 'function') {
+      preloadArt(nx2, false);
     }
   }
   const seedId = t && t.id;
@@ -1422,13 +1652,15 @@ function liveOnTrack(t, restoreOnly) {
       if (tr && tr.id && !have.has(tr.id)) { have.add(tr.id); added.push(tr); }
     }
     if (added.length) {
+      const prevLen = PL.queue.length;
       PL.queue.push(...added);
-      added.slice(0, 8).forEach((x, idx) => {
-        if (idx < 4) {
-          if (window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') window.SonoraNative.prefetch(x.id);
-          else fetch('/api/prefetch/' + x.id).catch(() => {});
-        }
-        if (typeof preloadArt === 'function') preloadArt(x, true);
+      const nextAdded = (PL.qi + 1 >= prevLen) ? PL.queue[PL.qi + 1] : null;
+      if (nextAdded && nextAdded.id) {
+        if (window.SonoraNative && typeof window.SonoraNative.prefetch === 'function') window.SonoraNative.prefetch(nextAdded.id);
+        else fetch('/api/prefetch/' + nextAdded.id).catch(() => {});
+      }
+      added.slice(0, 6).forEach((x, idx) => {
+        if (typeof preloadArt === 'function') preloadArt(x, idx === 0 && nextAdded === x);
       });
       if (typeof syncNativeNextTrack === 'function') syncNativeNextTrack();
       redraw();
@@ -1486,6 +1718,8 @@ const _offlineLyDeletedIds = new Set();
 let _offlineLyHydrated = false;
 let _offlineLyHydrating = false;
 let _offlineLyDirty = false;
+let _offlineLySaveTimer = 0;
+let _offlineLySavePending = false;
 
 function _normOfflineLyEntry(item) {
   if (!item || !Array.isArray(item.lines) || !item.lines.length) return null;
@@ -1515,7 +1749,7 @@ function _applyOfflineLyricsMap(parsed, fromIdb) {
     const norm = _normOfflineLyEntry(parsed[id]);
     if (!norm) continue;
     LIVE.offlineLy[id] = norm;
-    if (!LIVE.ly[id] || LIVE.ly[id].loading) {
+    if (LIVE.ly[id] && LIVE.ly[id].loading) {
       LIVE.ly[id] = Object.assign({}, norm, { loading: false, v: ++LIVE.lyV });
     }
     added = true;
@@ -1592,7 +1826,7 @@ function loadOfflineLyrics() {
   } catch (e) {}
 }
 
-function saveOfflineLyrics() {
+function _writeOfflineLyricsNow() {
   try {
     if (typeof LIVE === 'undefined') return;
     if (!_offlineLyHydrated) {
@@ -1600,6 +1834,7 @@ function saveOfflineLyrics() {
       return;
     }
     _offlineLyDirty = false;
+    _offlineLySavePending = false;
     const map = LIVE.offlineLy || (LIVE.offlineLy = {});
     if (typeof idbSet === 'function') {
       idbSet(OFFLINE_LYRICS_KEY, Object.assign({}, map)).then(ok => {
@@ -1614,6 +1849,33 @@ function saveOfflineLyrics() {
     } else {
       _saveOfflineLyricsLocalFallback(map);
     }
+  } catch (e) {}
+}
+
+function flushOfflineLyricsSave(force) {
+  if (_offlineLySaveTimer) { clearTimeout(_offlineLySaveTimer); _offlineLySaveTimer = 0; }
+  if (!_offlineLySavePending && !_offlineLyDirty) return;
+  if (!force && _isUiAnimatingOrBusy()) {
+    _offlineLySaveTimer = setTimeout(() => flushOfflineLyricsSave(false), 600);
+    return;
+  }
+  _writeOfflineLyricsNow();
+}
+
+function saveOfflineLyrics(immediate) {
+  try {
+    if (typeof LIVE === 'undefined') return;
+    if (!_offlineLyHydrated) {
+      _offlineLyDirty = true;
+      return;
+    }
+    _offlineLySavePending = true;
+    if (immediate) {
+      flushOfflineLyricsSave(true);
+      return;
+    }
+    if (_offlineLySaveTimer) clearTimeout(_offlineLySaveTimer);
+    _offlineLySaveTimer = setTimeout(() => flushOfflineLyricsSave(false), 1500);
   } catch (e) {}
 }
 
@@ -1730,6 +1992,24 @@ async function downloadLyricsForTrack(t) {
 }
 
 const _lyUpgradeChecked = new Set();
+const _lyPollTimers = new Map();
+const _lyLru = new Set();
+const LY_MEM_CAP = 40;
+function _touchLyLru(id) {
+  if (!id) return;
+  _lyLru.delete(id);
+  _lyLru.add(id);
+  if (_lyLru.size > LY_MEM_CAP && typeof LIVE !== 'undefined' && LIVE && LIVE.ly) {
+    const curId = typeof cur === 'function' && cur() ? cur().id : null;
+    const nextId = typeof PL !== 'undefined' && PL && Array.isArray(PL.queue) && PL.queue[PL.qi + 1] ? PL.queue[PL.qi + 1].id : null;
+    for (const oldId of _lyLru) {
+      if (_lyLru.size <= LY_MEM_CAP) break;
+      if (oldId === curId || oldId === nextId) continue;
+      _lyLru.delete(oldId);
+      if (LIVE.ly[oldId] && !LIVE.ly[oldId].loading) delete LIVE.ly[oldId];
+    }
+  }
+}
 const TOP_SRCS = ['apple', 'better'];
 function _isTopTierLyric(L) {
   return !!(L && L.kind === 'word' && TOP_SRCS.indexOf(L.source) >= 0);
@@ -1754,7 +2034,9 @@ function liveLy(t) {
   const online = (typeof LIVE !== 'undefined' && LIVE.on) && (typeof navigator === 'undefined' || navigator.onLine !== false);
   const L = LIVE.ly[t.id];
   if (L) {
+    _touchLyLru(t.id);
     if (online && sel === 'auto' && !L.loading && !_isTopTierLyric(L) && !_lyUpgradeChecked.has(t.id)) {
+      if (_lyUpgradeChecked.size > 300) _lyUpgradeChecked.clear();
       _lyUpgradeChecked.add(t.id);
       lyFetch(t, 'auto', 'fast', 0, true);
     }
@@ -1762,13 +2044,16 @@ function liveLy(t) {
   }
   if (LIVE.offlineLy && LIVE.offlineLy[t.id]) {
     const off = LIVE.ly[t.id] = Object.assign({}, LIVE.offlineLy[t.id], { loading: false, v: ++LIVE.lyV });
+    _touchLyLru(t.id);
     if (online && sel === 'auto' && !_isTopTierLyric(off) && !_lyUpgradeChecked.has(t.id)) {
+      if (_lyUpgradeChecked.size > 300) _lyUpgradeChecked.clear();
       _lyUpgradeChecked.add(t.id);
       lyFetch(t, 'auto', 'fast', 0, true);
     }
     return off;
   }
   lyFetch(t, sel, 'fast', 0, false);
+  _touchLyLru(t.id);
   return LIVE.ly[t.id] = { lines: [{ text: window.t('lyrics.loading'), _placeholder: true }], synced: false, sources: [], pending: [], v: ++LIVE.lyV, loading: true };
 }
 window.liveLy = liveLy;
@@ -1779,22 +2064,37 @@ window.saveOfflineLyrics = saveOfflineLyrics;
 
 const LY_ORDER = ['apple', 'better', 'lrclib', 'netease', 'kugou', 'ovh'];
 const WORD_SRCS = ['apple', 'better', 'netease', 'kugou'];
+function _isTrackCurOrNext(trackId) {
+  if (!trackId) return false;
+  const c = typeof cur === 'function' ? cur() : null;
+  if (c && c.id === trackId) return true;
+  if (typeof PL !== 'undefined' && PL && Array.isArray(PL.queue)) {
+    const nx = PL.queue[PL.qi + 1];
+    if (nx && nx.id === trackId) return true;
+  }
+  return false;
+}
 function lyFetch(t, src, mode, tries, upgradeOnly) {
+  const prevPoll = _lyPollTimers.get(t.id);
+  if (prevPoll) { clearTimeout(prevPoll); _lyPollTimers.delete(t.id); }
   const extra = '&title=' + encodeURIComponent(t.title || '') + '&artist=' + encodeURIComponent(t.artist || '') + '&dur=' + (t.dur || 0);
   api('/api/lyrics/' + t.id + '?src=' + src + '&wait=' + mode + extra).then(d => {
     if ((LIVE.lySel[t.id] || (typeof PREFS !== 'undefined' && PREFS.prefLySource) || 'auto') !== src) return;
+    const isCurTrk = Boolean(typeof cur === 'function' && cur() && cur().id === t.id);
+    const shouldRedraw = isCurTrk || Boolean(typeof SRCUI !== 'undefined' && SRCUI && SRCUI.open);
     const had = LIVE.ly[t.id], ok = d && d.available && d.lines && d.lines.length;
     const cand = ok ? { lines: d.lines, synced: d.synced, wordSync: d.wordSync, kind: d.kind || null, source: d.source, best: d.best, sources: d.sources || [], pending: d.pending || [], v: ++LIVE.lyV } : null;
     if (upgradeOnly && had && !had.loading && had.source) {
       if (cand && _isBetterLyric(cand, had)) {
         LIVE.ly[t.id] = cand;
+        _touchLyLru(t.id);
         if (LIVE.offlineLy && LIVE.offlineLy[t.id]) {
           LIVE.offlineLy[t.id] = Object.assign({}, cand, { pending: [] });
           saveOfflineLyrics();
         }
-        if (typeof SH !== 'undefined' && SH) SH.lSnap = true;
-        if (typeof prewarmLyrics === 'function' && typeof cur === 'function' && cur() && cur().id === t.id) prewarmLyrics(t);
-        if (typeof redraw === 'function') redraw();
+        if (isCurTrk && typeof SH !== 'undefined' && SH) SH.lSnap = true;
+        if (isCurTrk && typeof prewarmLyrics === 'function') prewarmLyrics(t);
+        if (shouldRedraw && typeof redraw === 'function') redraw();
       }
     } else {
       if (cand) {
@@ -1804,12 +2104,13 @@ function lyFetch(t, src, mode, tries, upgradeOnly) {
       } else {
         LIVE.ly[t.id] = { lines: [{ text: window.t('lyrics.unavailable'), _placeholder: true }], synced: false, kind: (d && d.kind) || null, source: null, best: d && d.best, sources: (d && d.sources) || [], pending: (d && d.pending) || [], v: ++LIVE.lyV };
       }
-      if (typeof SH !== 'undefined' && SH && (!had || had.loading || had.source !== LIVE.ly[t.id].source || had.kind !== LIVE.ly[t.id].kind)) SH.lSnap = true;
-      if (typeof prewarmLyrics === 'function' && typeof cur === 'function' && cur() && cur().id === t.id) prewarmLyrics(t);
-      if (typeof redraw === 'function') redraw();
+      _touchLyLru(t.id);
+      if (isCurTrk && typeof SH !== 'undefined' && SH && (!had || had.loading || had.source !== LIVE.ly[t.id].source || had.kind !== LIVE.ly[t.id].kind)) SH.lSnap = true;
+      if (isCurTrk && typeof prewarmLyrics === 'function') prewarmLyrics(t);
+      if (shouldRedraw && typeof redraw === 'function') redraw();
     }
     /* Poll fast while higher-tier lyrics providers are pending, then settle with wait=all. */
-    if (src === 'auto' && mode === 'fast' && d) {
+    if (src === 'auto' && mode === 'fast' && d && _isTrackCurOrNext(t.id)) {
       const pend = d.pending || [];
       const curIdx = LY_ORDER.indexOf(d.source);
       const hasBetterPending = pend.length > 0 && (
@@ -1822,9 +2123,17 @@ function lyFetch(t, src, mode, tries, upgradeOnly) {
       );
       if (hasBetterPending) {
         if (tries < 4) {
-          setTimeout(() => lyFetch(t, src, 'fast', tries + 1, upgradeOnly), 900);
+          const tid = setTimeout(() => {
+            _lyPollTimers.delete(t.id);
+            if (_isTrackCurOrNext(t.id)) lyFetch(t, src, 'fast', tries + 1, upgradeOnly);
+          }, 900);
+          _lyPollTimers.set(t.id, tid);
         } else if (tries === 4) {
-          setTimeout(() => lyFetch(t, src, 'all', 9, upgradeOnly), 400);
+          const tid = setTimeout(() => {
+            _lyPollTimers.delete(t.id);
+            if (_isTrackCurOrNext(t.id)) lyFetch(t, src, 'all', 9, upgradeOnly);
+          }, 400);
+          _lyPollTimers.set(t.id, tid);
         }
       }
     }
@@ -1835,8 +2144,10 @@ function lyFetch(t, src, mode, tries, upgradeOnly) {
       } else {
         LIVE.ly[t.id] = { lines: [{ text: window.t('lyrics.unavailable'), _placeholder: true }], synced: false, kind: null, sources: [], pending: [], v: ++LIVE.lyV };
       }
-      if (typeof prewarmLyrics === 'function' && typeof cur === 'function' && cur() && cur().id === t.id) prewarmLyrics(t);
-      if (typeof redraw === 'function') redraw();
+      _touchLyLru(t.id);
+      const isCurTrk = Boolean(typeof cur === 'function' && cur() && cur().id === t.id);
+      if (isCurTrk && typeof prewarmLyrics === 'function') prewarmLyrics(t);
+      if ((isCurTrk || (typeof SRCUI !== 'undefined' && SRCUI && SRCUI.open)) && typeof redraw === 'function') redraw();
     }
   });
 }
@@ -1859,13 +2170,28 @@ const slimT = t => {
   return o;
 };
 const slimI = it => ({ kind: it.kind, id: it.id, title: it.title, artist: it.artist, hue: it.hue, style: it.style, thumb: it.thumb, year: it.year, desc: it.desc });
-const favList = () => Object.keys(PL.fav).filter(k => PL.fav[k] && LIVE.known[k]).map(k => LIVE.known[k]);
+let _favListCache = null, _favListVer = -1, _favListOn = null;
+function favList() {
+  const isOn = Boolean(typeof LIVE !== 'undefined' && LIVE && LIVE.on);
+  if (_favListCache && _favListVer === _libVersion && _favListOn === isOn) return _favListCache;
+  const out = [];
+  if (typeof PL !== 'undefined' && PL && PL.fav && typeof LIVE !== 'undefined' && LIVE && LIVE.known) {
+    for (const k in PL.fav) {
+      if (PL.fav[k] && LIVE.known[k]) out.push(LIVE.known[k]);
+    }
+  }
+  _favListCache = out;
+  _favListVer = _libVersion;
+  _favListOn = isOn;
+  return out;
+}
 LIVE.saved = []; LIVE.localFiles = [];
 LIVE.userPlaylists = [];
 let USER_PLAYLISTS = LIVE.userPlaylists;
 window.USER_PLAYLISTS = USER_PLAYLISTS;
 
 const _plCoverHydrating = new Set();
+let _userPlSaveTimer = 0, _userPlSaveDirty = false;
 function _plCoverKey(plId) {
   return 'pl-cover-' + plId;
 }
@@ -1895,7 +2221,17 @@ function _writeUserPlaylistsLs(forceInlineIds) {
   });
   localStorage.setItem('sonora-user-playlists', JSON.stringify(raw));
 }
-function saveUserPlaylists() {
+function flushUserPlaylistsSave(force) {
+  if (_userPlSaveTimer) { clearTimeout(_userPlSaveTimer); _userPlSaveTimer = 0; }
+  if (!_userPlSaveDirty) return;
+  if (!force && _isUiAnimatingOrBusy()) {
+    _userPlSaveTimer = setTimeout(() => flushUserPlaylistsSave(false), 400);
+    return;
+  }
+  _userPlSaveDirty = false;
+  try { _writeUserPlaylistsLs(null); } catch (e) {}
+}
+function saveUserPlaylists(immediate) {
   try {
     const canIdb = typeof idbSet === 'function' && typeof indexedDB !== 'undefined';
     const inlineFallbackIds = new Set();
@@ -1907,19 +2243,30 @@ function saveUserPlaylists() {
           pl._idbCover = true;
           delete pl._idbCoverPending;
           const coverData = pl.thumb;
-          idbSet(_plCoverKey(pl.id), coverData).then(ok => {
-            if (!ok) {
-              inlineFallbackIds.add(pl.id);
-              try { _writeUserPlaylistsLs(inlineFallbackIds); } catch (e) {}
-            }
-          });
+          if (pl._idbCoverSaved !== coverData) {
+            pl._idbCoverSaved = coverData;
+            idbSet(_plCoverKey(pl.id), coverData).then(ok => {
+              if (!ok) {
+                if (pl._idbCoverSaved === coverData) pl._idbCoverSaved = null;
+                inlineFallbackIds.add(pl.id);
+                try { _writeUserPlaylistsLs(inlineFallbackIds); } catch (e) {}
+              }
+            });
+          }
         } else if (!pl._idbCoverPending && pl._idbCover) {
           delete pl._idbCover;
+          delete pl._idbCoverSaved;
           if (typeof idbDel === 'function') idbDel(_plCoverKey(pl.id));
         }
       });
     }
-    _writeUserPlaylistsLs(null);
+    _userPlSaveDirty = true;
+    if (immediate) {
+      flushUserPlaylistsSave(true);
+      return;
+    }
+    if (_userPlSaveTimer) clearTimeout(_userPlSaveTimer);
+    _userPlSaveTimer = setTimeout(() => flushUserPlaylistsSave(false), 350);
   } catch (e) {}
 }
 
@@ -1935,9 +2282,11 @@ function _hydratePlaylistIdbCover(plId) {
       if (!curPl.thumb || curPl.thumb.indexOf('data:') !== 0) {
         curPl.thumb = dataUrl;
         curPl._idbCover = true;
+        curPl._idbCoverSaved = dataUrl;
         if (typeof BYID !== 'undefined' && BYID[plId]) {
           BYID[plId].thumb = dataUrl;
           BYID[plId]._idbCover = true;
+          BYID[plId]._idbCoverSaved = dataUrl;
           delete BYID[plId]._idbCoverPending;
         }
         if (typeof ARTC !== 'undefined' && ARTC[plId] && (ARTC[plId]._placeholder || !ARTC[plId]._real)) {
@@ -2055,16 +2404,24 @@ function _plRecNormPrimaryArtist(artist) {
 
 function _plRecTrackKey(tr) {
   if (!tr) return '';
+  const src = (tr.title || '') + '\x00' + (tr.artist || '');
+  if (tr._recKeySrc === src && tr._recKey !== undefined) return tr._recKey;
   const nt = _plRecNormTitle(tr.title);
   const na = _plRecNormPrimaryArtist(tr.artist);
-  if (!nt) return '';
-  return nt + '||' + na;
+  const key = nt ? (nt + '||' + na) : '';
+  tr._recKeySrc = src;
+  tr._recKey = key;
+  return key;
 }
 
 function _plRecPlaylistKeys(pl) {
+  const list = (pl && Array.isArray(pl.tracks)) ? pl.tracks : [];
+  const rev = (pl && pl._rev) || 0;
+  if (pl && pl._cachedRecKeys && pl._cachedRecKeysRev === rev && pl._cachedRecKeysLen === list.length) {
+    return pl._cachedRecKeys;
+  }
   const idSet = new Set();
   const normSet = new Set();
-  const list = (pl && Array.isArray(pl.tracks)) ? pl.tracks : [];
   for (let i = 0; i < list.length; i++) {
     const t = list[i];
     if (!t) continue;
@@ -2072,7 +2429,13 @@ function _plRecPlaylistKeys(pl) {
     const tk = _plRecTrackKey(t);
     if (tk) normSet.add(tk);
   }
-  return { idSet, normSet };
+  const res = { idSet, normSet };
+  if (pl) {
+    pl._cachedRecKeys = res;
+    pl._cachedRecKeysRev = rev;
+    pl._cachedRecKeysLen = list.length;
+  }
+  return res;
 }
 
 function _plRecHash(str, seed) {
@@ -2086,17 +2449,24 @@ function _plRecHash(str, seed) {
 
 function playlistRecsSig(pl) {
   if (!pl || !pl.user || !Array.isArray(pl.tracks) || pl.tracks.length === 0) return '';
+  const rev = pl._rev || 0;
+  if (pl._cachedRecSig && pl._cachedRecSigRev === rev && pl._cachedRecSigLen === pl.tracks.length) {
+    return pl._cachedRecSig;
+  }
   const parts = new Array(pl.tracks.length);
   for (let i = 0; i < pl.tracks.length; i++) {
     const t = pl.tracks[i] || {};
     const id = t.id ? String(t.id).trim() : '';
-    const nt = _plRecNormTitle(t.title);
-    const na = _plRecNormPrimaryArtist(t.artist);
-    parts[i] = id + ':' + nt + ':' + na;
+    const tk = _plRecTrackKey(t);
+    parts[i] = id + ':' + tk;
   }
   parts.sort();
   const joined = parts.join('|');
-  return pl.tracks.length + ':' + _plRecHash(joined, 2166136261) + ':' + _plRecHash(joined, 33554467);
+  const sig = pl.tracks.length + ':' + _plRecHash(joined, 2166136261) + ':' + _plRecHash(joined, 33554467);
+  pl._cachedRecSig = sig;
+  pl._cachedRecSigRev = rev;
+  pl._cachedRecSigLen = pl.tracks.length;
+  return sig;
 }
 
 function _isPlaylistInCurrentStack(plId) {
@@ -2123,9 +2493,16 @@ function _plRecEntry(plId) {
       invalidated: false,
       inFlightKey: '',
       reqSeq: 0,
-      lastFetchAt: 0
+      lastFetchAt: 0,
+      filteredRev: -1,
+      filteredLen: -1,
+      stateObj: null
     };
     _plRecCache.set(plId, entry);
+    if (_plRecCache.size > 30) {
+      const oldestKey = _plRecCache.keys().next().value;
+      if (oldestKey !== plId) _plRecCache.delete(oldestKey);
+    }
   }
   return entry;
 }
@@ -2367,6 +2744,8 @@ function _executePlaylistRecsFetch(pl, entry, sig) {
         filtered = _computeOfflinePlaylistRecs(curPl, entry.excludedIds, refreshToken, PLAYLIST_RECS_LIMIT);
       }
       entry.tracks = filtered.slice(0, PLAYLIST_RECS_LIMIT);
+      entry.filteredRev = curPl._rev || 0;
+      entry.filteredLen = curPl.tracks.length;
       entry.loading = false;
       entry.err = null;
       entry.inFlightKey = '';
@@ -2381,6 +2760,8 @@ function _executePlaylistRecsFetch(pl, entry, sig) {
       if (playlistRecsSig(curPl) !== sig) return;
       const fallback = _computeOfflinePlaylistRecs(curPl, entry.excludedIds, refreshToken, PLAYLIST_RECS_LIMIT);
       entry.tracks = fallback;
+      entry.filteredRev = curPl._rev || 0;
+      entry.filteredLen = curPl.tracks.length;
       entry.loading = false;
       entry.err = fallback.length ? null : (err && err.message ? err.message : window.t('toast.recs_error'));
       entry.inFlightKey = '';
@@ -2432,29 +2813,38 @@ function _schedulePlaylistRecsFetch(pl, entry, opts) {
   _plRecDebounceTimers.set(pl.id, timer);
 }
 
+const _EMPTY_PL_REC_STATE = Object.freeze({ loading: false, tracks: [], err: null, sig: '' });
 function playlistRecsState(pl) {
   if (!pl || !pl.user || !Array.isArray(pl.tracks) || pl.tracks.length === 0) {
-    return { loading: false, tracks: [], err: null, sig: '' };
+    return _EMPTY_PL_REC_STATE;
   }
   const sig = playlistRecsSig(pl);
   const entry = _plRecEntry(pl.id);
+  const rev = pl._rev || 0;
+  const len = pl.tracks.length;
   if (entry.sig === sig && !entry.invalidated) {
-    const clean = _plRecFilterTracks(entry.tracks || [], pl, null);
-    if (clean.length !== (entry.tracks || []).length) entry.tracks = clean;
-    return {
-      loading: !!entry.loading,
-      tracks: entry.tracks || [],
-      err: entry.err || null,
-      sig
-    };
+    if (entry.filteredRev !== rev || entry.filteredLen !== len) {
+      const clean = _plRecFilterTracks(entry.tracks || [], pl, null);
+      if (clean.length !== (entry.tracks || []).length) entry.tracks = clean;
+      entry.filteredRev = rev;
+      entry.filteredLen = len;
+    }
+    const st = entry.stateObj || (entry.stateObj = { loading: false, tracks: [], err: null, sig: '' });
+    st.loading = !!entry.loading;
+    st.tracks = entry.tracks || [];
+    st.err = entry.err || null;
+    st.sig = sig;
+    return st;
   }
   _schedulePlaylistRecsFetch(pl, entry, { keepTracks: false });
-  return {
-    loading: !!entry.loading,
-    tracks: entry.tracks || [],
-    err: entry.err || null,
-    sig
-  };
+  entry.filteredRev = rev;
+  entry.filteredLen = len;
+  const st = entry.stateObj || (entry.stateObj = { loading: false, tracks: [], err: null, sig: '' });
+  st.loading = !!entry.loading;
+  st.tracks = entry.tracks || [];
+  st.err = entry.err || null;
+  st.sig = sig;
+  return st;
 }
 
 function refreshPlaylistRecs(pl) {
@@ -2518,8 +2908,10 @@ function addTrackFromRec(pl, tr) {
   const ing = _ensureIngestedPlaylistTrack(tr);
 
   targetPl.tracks.push(ing);
+  targetPl._rev = (targetPl._rev || 0) + 1;
   if (typeof BYID !== 'undefined' && BYID[targetPl.id] && BYID[targetPl.id] !== targetPl && Array.isArray(BYID[targetPl.id].tracks)) {
     BYID[targetPl.id].tracks = targetPl.tracks;
+    BYID[targetPl.id]._rev = targetPl._rev;
   }
 
   if (!targetPl.thumb && ing.thumb) {
@@ -2615,6 +3007,10 @@ function addToUserPlaylist(plId, tracks) {
     }
     added++;
   });
+  if (added > 0) {
+    pl._rev = (pl._rev || 0) + 1;
+    if (typeof BYID !== 'undefined' && BYID[plId] && BYID[plId] !== pl) BYID[plId]._rev = pl._rev;
+  }
   saveUserPlaylists();
   liveSave();
   if (added > 0) invalidatePlaylistRecs(pl);
@@ -2630,8 +3026,10 @@ function removeFromUserPlaylist(plId, trackId) {
   if (!pl || !Array.isArray(pl.tracks)) return false;
   const prevLen = pl.tracks.length;
   pl.tracks = pl.tracks.filter(t => t && t.id !== trackId);
+  if (pl.tracks.length !== prevLen) pl._rev = (pl._rev || 0) + 1;
   if (typeof BYID !== 'undefined' && BYID[plId] && BYID[plId] !== pl && Array.isArray(BYID[plId].tracks)) {
     BYID[plId].tracks = pl.tracks;
+    BYID[plId]._rev = pl._rev;
   }
   saveUserPlaylists();
   liveSave();
@@ -2723,34 +3121,49 @@ function removeDownloadedItem(item, list) {
   if (typeof redraw === 'function') redraw();
   liveToast(window.t('toast.removed_downloads'));
 }
+function _drainLyricDownloads(queue, maxConc, isCanceled) {
+  if (!queue.length) return Promise.resolve();
+  let idx = 0;
+  const nWorkers = Math.min(maxConc || 2, queue.length);
+  const workers = [];
+  for (let w = 0; w < nWorkers; w++) {
+    workers.push((async () => {
+      while (idx < queue.length) {
+        if (isCanceled && isCanceled()) break;
+        const tr = queue[idx++];
+        if (tr) await downloadLyricsForTrack(tr).catch(() => {});
+      }
+    })());
+  }
+  return Promise.all(workers);
+}
 function startSequentialDownload(item, list) {
   const tracks = ((Array.isArray(list) && list.length) ? list : (item && typeof tracksOf === 'function' ? tracksOf(item) : [])).filter(t => t && t.id);
   if (!tracks.length) return;
   const key = _dlKeyFor(item, tracks);
   if (_dlJobs[key] && !_dlJobs[key].canceled) return;
+  let initDone = 0;
+  for (let i = 0; i < tracks.length; i++) if (isDownloaded(tracks[i])) initDone++;
   const job = _dlJobs[key] = {
     key,
     id: item && item.id,
     total: tracks.length,
-    done: tracks.filter(isDownloaded).length,
+    done: initDone,
     canceled: false
   };
   if (typeof redraw === 'function') redraw();
   (async () => {
     let downloadedNow = 0, failedNow = 0;
-    const lyPromises = [];
+    const lyQueue = [];
     for (let i = 0; i < tracks.length; i++) {
       if (job.canceled) break;
       const tr = tracks[i];
       if (isDownloaded(tr)) {
-        if (!hasOfflineLyrics(tr)) {
-          lyPromises.push(downloadLyricsForTrack(tr).catch(() => {}));
-        }
-        job.done = tracks.filter(isDownloaded).length;
+        if (!hasOfflineLyrics(tr)) lyQueue.push(tr);
         continue;
       }
       if (typeof preloadArt === 'function') preloadArt(tr, false);
-      lyPromises.push(downloadLyricsForTrack(tr).catch(() => {}));
+      if (!hasOfflineLyrics(tr)) lyQueue.push(tr);
       let ok = true;
       if (LIVE.on && tr.id && !tr._local) {
         try {
@@ -2765,10 +3178,10 @@ function startSequentialDownload(item, list) {
         if (!_savedIdSet.has(tr.id)) {
           LIVE.saved.unshift(tr);
           _savedIdSet.add(tr.id);
+          job.done = Math.min(job.total, job.done + 1);
           liveSave();
         }
         downloadedNow++;
-        job.done = tracks.filter(isDownloaded).length;
       } else {
         failedNow++;
       }
@@ -2776,8 +3189,9 @@ function startSequentialDownload(item, list) {
       await new Promise(res => setTimeout(res, 16));
     }
     const wasCanceled = Boolean(job.canceled);
-    if (!wasCanceled && lyPromises.length) {
-      await Promise.all(lyPromises);
+    if (!wasCanceled && lyQueue.length) {
+      await _drainLyricDownloads(lyQueue, 2, () => Boolean(job.canceled));
+      saveOfflineLyrics(true);
     }
     if (_dlJobs[key] === job) delete _dlJobs[key];
     liveSave(true);
@@ -2892,8 +3306,10 @@ window.refreshPlaylistRecs = refreshPlaylistRecs;
 window.addTrackFromRec = addTrackFromRec;
 window.invalidatePlaylistRecs = invalidatePlaylistRecs;
 
-restoreUserPlaylists();
-loadOfflineLyrics();
+if (typeof location === 'undefined' || (location.protocol !== 'http:' && location.protocol !== 'https:')) {
+  restoreUserPlaylists();
+  loadOfflineLyrics();
+}
 
 function toggleSavedList(list, item) {
   if (!list || !list.length) return;
@@ -2905,15 +3321,17 @@ function toggleSavedList(list, item) {
     _removeOfflineLyrics(ids);
     liveToast(window.t('toast.removed_downloads'));
   } else {
+    const lyQ = [];
     list.forEach(t => {
       if (t && t.id && !_savedIdSet.has(t.id)) {
         LIVE.saved.unshift(t);
         _savedIdSet.add(t.id);
       }
-      if (t && t.id && !t._local) {
-        downloadLyricsForTrack(t).catch(() => {});
+      if (t && t.id && !t._local && !hasOfflineLyrics(t)) {
+        lyQ.push(t);
       }
     });
+    if (lyQ.length) _drainLyricDownloads(lyQ, 2);
     list.slice(0, 3).forEach(t => { if (t.id && t.src && t.src.indexOf('/api/') === 0) fetch('/api/prefetch/' + t.id).catch(() => {}); });
     liveToast(window.tPlural(list.length, 'toast.download_saved_one', 'toast.download_saved_many'));
   }
@@ -3027,9 +3445,13 @@ function flushPlayerState(force) {
   _playerSaveDirty = false;
   _writePlayerStorage();
 }
+let _lastSyncedRepeat = null;
 function savePlayerState(immediate) {
   _playerSaveDirty = true;
-  if (typeof syncNativeRepeat === 'function') syncNativeRepeat();
+  if (typeof syncNativeRepeat === 'function' && typeof PL !== 'undefined' && PL && PL.repeat !== _lastSyncedRepeat) {
+    _lastSyncedRepeat = PL.repeat;
+    syncNativeRepeat();
+  }
   if (immediate) { flushPlayerState(true); return; }
   if (_playerSaveTimer) clearTimeout(_playerSaveTimer);
   _playerSaveTimer = setTimeout(() => flushPlayerState(false), _startupSecondaryReady ? 400 : 1200);
@@ -3164,21 +3586,48 @@ function _scheduleSaveHomeSnapshot(rows) {
 }
 if (typeof window !== 'undefined') {
   window.reconcileNativePlayback = reconcileNativePlayback;
-  window.addEventListener('pagehide', () => { flushLiveSave(true); flushPlayerState(true); flushHomeSnapshot(); });
+  const _flushAllStorageOnHide = () => {
+    flushLiveSave(true);
+    flushPlayerState(true);
+    flushHomeSnapshot();
+    flushOfflineLyricsSave(true);
+    flushUserPlaylistsSave(true);
+  };
+  window.addEventListener('pagehide', _flushAllStorageOnHide);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') { flushLiveSave(true); flushPlayerState(true); flushHomeSnapshot(); }
+    if (document.visibilityState === 'hidden') _flushAllStorageOnHide();
   });
+}
+function _classifyHomeRow(r, idx) {
+  if (!r || !Array.isArray(r.items)) return r;
+  const quickTracks = r.items.filter(isTr);
+  const isQuick = (r.sectionKey === 'quick_picks' || idx === 0 || /scelte rapide|quick picks/i.test(r.title)) && quickTracks.length >= 4 &&
+    (r.sectionKey === 'quick_picks' || /scelte rapide|quick picks/i.test(r.title) || quickTracks.length === r.items.length);
+  const isTrend = (r.sectionKey === 'charts' || /in tendenza|trending|charts/i.test(r.title)) && quickTracks.length >= 4;
+  const isSimilar = r.sectionKey === 'similar_artists' || r.type === 'similar_artists' || /^simile a|^similar to/i.test(r.title);
+  const isReleases = r.sectionKey === 'artist_releases' || r.type === 'artist_releases' || /^altro da|^more from/i.test(r.title);
+  r._kind = (isQuick || isTrend) ? 'quick' : (isSimilar ? 'similar' : (isReleases ? 'releases' : 'shelf'));
+  if (r._kind === 'quick') r._quickTracks = quickTracks.slice(0, 20);
+  return r;
 }
 function _restoreHomeSnapshot() {
   try {
     const raw = JSON.parse(localStorage.getItem(HOME_CACHE_KEY) || 'null');
     if (!Array.isArray(raw) || !raw.length) return null;
-    const rows = raw.map(r => ({
-      title: r.title || '',
-      type: r.type || '',
-      artist: r.artist || '',
-      items: (r.items || []).map(ingestItem).filter(Boolean)
-    })).filter(r => r.items.length);
+    const rows = [];
+    for (let i = 0; i < raw.length; i++) {
+      const r = raw[i];
+      const items = (r.items || []).map(ingestItem).filter(Boolean);
+      if (items.length) {
+        rows.push(_classifyHomeRow({
+          title: r.title || '',
+          sectionKey: r.sectionKey || '',
+          type: r.type || '',
+          artist: r.artist || '',
+          items
+        }, rows.length));
+      }
+    }
     return rows.length ? rows : null;
   } catch (e) { return null; }
 }
@@ -3216,11 +3665,14 @@ function liveToast(m, ms) {
   ms = ms || 4200;
   const now = performance.now();
   LIVE.toast = m;
+  LIVE._toastW = -1;
+  LIVE._toastWMsg = '';
   LIVE.toastStart = now;
   LIVE.toastT = now + ms;
   if (LIVE._toastTimer) clearTimeout(LIVE._toastTimer);
+  _liveWakeFrame();
   if (typeof redraw === 'function') redraw();
-  LIVE._toastTimer = setTimeout(() => { LIVE._toastTimer = 0; if (typeof redraw === 'function') redraw(); }, ms);
+  LIVE._toastTimer = setTimeout(() => { LIVE._toastTimer = 0; _liveWakeFrame(); if (typeof redraw === 'function') redraw(); }, ms);
 }
 function liveAudioError(t) {
   liveToast(window.t('toast.cannot_play', { title: (t && t.title) || window.t('common.track') }));
@@ -3241,12 +3693,17 @@ function liveToastDraw(c) {
   if (a <= 0.002) return;
   if (ent < 1 || (now >= LIVE.toastT && ex < 1)) {
     if (typeof scheduleAnimRedraw === 'function') scheduleAnimRedraw();
+    _liveWakeFrame();
   }
   const dy = -12 * (1 - entE) - 8 * exE;
   const sc = mix(0.92, 1, entE) * mix(1, 0.94, exE);
   c.save();
-  c.font = F(600, 15);
-  const w = Math.min(W - 40, c.measureText(LIVE.toast).width + 40), x = (W - w) / 2, y = TOP + 62 + dy;
+  if (LIVE._toastWMsg !== LIVE.toast || !(LIVE._toastW > 0)) {
+    c.font = F(600, 15);
+    LIVE._toastW = c.measureText(LIVE.toast).width + 40;
+    LIVE._toastWMsg = LIVE.toast;
+  }
+  const w = Math.min(W - 40, LIVE._toastW), x = (W - w) / 2, y = TOP + 62 + dy;
   const cx = W / 2, cy = y + 20;
   c.globalAlpha *= a;
   c.translate(cx, cy); c.scale(sc, sc); c.translate(-cx, -cy);
@@ -3284,10 +3741,10 @@ function _sceneRedrawSoft() {
   if (typeof redrawSceneOnly === 'function') redrawSceneOnly();
   else redraw();
 }
-function _ingestHomeRow(r) {
+function _ingestHomeRow(r, idx) {
   const items = (r && r.items ? r.items : []).map(ingestItem).filter(Boolean);
   if (!items.length) return null;
-  return { title: r.title, sectionKey: r.sectionKey || '', type: r.type || '', artist: r.artist || '', items };
+  return _classifyHomeRow({ title: r.title, sectionKey: r.sectionKey || '', type: r.type || '', artist: r.artist || '', items }, idx);
 }
 function liveHome(force) {
   const seq = ++_homeIngestSeq;
@@ -3304,7 +3761,7 @@ function liveHome(force) {
     const rawRows = Array.isArray(d && d.rows) ? d.rows : [];
     const rows = [];
     for (let i = 0; i < rawRows.length; i++) {
-      const r = _ingestHomeRow(rawRows[i]);
+      const r = _ingestHomeRow(rawRows[i], rows.length);
       if (r) rows.push(r);
     }
     if (rows.length) {
@@ -3384,7 +3841,7 @@ function livePlayItem(it) {
 }
 const _resKeys = [], RES_CACHE_CAP = 30;
 const _searchMemCache = new Map();
-let _searchAbort = null, _searchLyricsAbort = null, _searchInFlightKey = '', _searchPendingInput = 0;
+let _searchAbort = null, _searchLyricsAbort = null, _searchLyricsTimer = 0, _searchInFlightKey = '', _searchPendingInput = 0;
 function _setSearchMemCache(key, val) {
   _searchMemCache.delete(key);
   _searchMemCache.set(key, val);
@@ -3432,9 +3889,15 @@ function _tryUpgradeSongEntry(existing, tr) {
   }
   if (existing.album && typeof BYID !== 'undefined' && BYID[existing.album]) {
     const isSameOrStubAlb = existing.album === tr.album || existing.album === 's_' + existing.id;
-    const sharedOther = !isSameOrStubAlb &&
-      typeof TRACKS !== 'undefined' &&
-      TRACKS.some(x => x && x.id !== existing.id && x.id !== tr.id && x.album === existing.album);
+    let sharedOther = false;
+    if (!isSameOrStubAlb) {
+      const albSet = _byAlbumId.get(existing.album);
+      if (albSet && albSet.size) {
+        for (const x of albSet) {
+          if (x && x.id !== existing.id && x.id !== tr.id) { sharedOther = true; break; }
+        }
+      }
+    }
     const albSameBase = Boolean(BYID[existing.album].thumb && typeof isSameCoverBase === 'function' && isSameCoverBase(BYID[existing.album].thumb, nextThumb));
     if (isSameOrStubAlb || (!sharedOther && tr.album === existing.album)) {
       BYID[existing.album].thumb = _preserveAppleHiRes(BYID[existing.album].thumb, nextThumb);
@@ -3545,46 +4008,84 @@ function _syncResCoversFromKnown(targetRes) {
   }
   return changed;
 }
-function _propagateCanonicalTrack(tr, skipBridgeSync) {
-  if (!tr || !tr.id) return false;
-  const artSnap = skipBridgeSync ? null : _snapshotPlaybackArtwork();
-  const src = (typeof LIVE !== 'undefined' && LIVE && LIVE.known && LIVE.known[tr.id]) || tr;
+const _propPendingMap = new Map();
+let _propPendingBridge = false;
+let _propFlushScheduled = false;
+function _syncCanonicalCopy(obj, src) {
+  if (!obj || obj === src || !obj.id || String(obj.id) !== String(src.id)) return false;
+  if (obj.canonicalCover && !src.canonicalCover) return false;
+  const nextThumb = _preserveAppleHiRes(obj.thumb, src.thumb || obj.thumb);
+  const diff = Boolean(
+    (nextThumb && obj.thumb !== nextThumb) ||
+    obj.album !== src.album ||
+    obj.albumTitle !== src.albumTitle ||
+    (obj.albumId || null) !== (src.albumId || null) ||
+    Boolean(obj.canonicalCover) !== Boolean(src.canonicalCover)
+  );
+  if (!diff) return false;
+  const sameBase = Boolean(obj.thumb && nextThumb && typeof isSameCoverBase === 'function' && isSameCoverBase(obj.thumb, nextThumb));
+  const oldAlb = obj.album;
+  if (nextThumb) obj.thumb = nextThumb;
+  obj.album = src.album;
+  obj.albumTitle = src.albumTitle;
+  obj.albumId = src.albumId != null ? src.albumId : null;
+  obj.canonicalCover = Boolean(src.canonicalCover);
+  if (src._appleUpgradeSettled || src.canonicalCover) obj._appleUpgradeSettled = true;
+  if (!sameBase) {
+    if (obj._sheetHiResUpgraded) delete obj._sheetHiResUpgraded;
+    _invalidateCoverCaches(obj.id, false, true);
+    if (oldAlb && oldAlb === 's_' + obj.id && oldAlb !== src.album) _invalidateCoverCaches(oldAlb, false, true);
+  }
+  return true;
+}
+function _upgradeResFromTrackBatch(targetRes, idMap, keyMap) {
+  if (!targetRes || !Array.isArray(targetRes.songs) || !targetRes.songs.length) return false;
   let changed = false;
-  const syncCopy = obj => {
-    if (!obj || obj === src || !obj.id || String(obj.id) !== String(src.id)) return false;
-    if (obj.canonicalCover && !src.canonicalCover) return false;
-    const nextThumb = _preserveAppleHiRes(obj.thumb, src.thumb || obj.thumb);
-    const diff = Boolean(
-      (nextThumb && obj.thumb !== nextThumb) ||
-      obj.album !== src.album ||
-      obj.albumTitle !== src.albumTitle ||
-      (obj.albumId || null) !== (src.albumId || null) ||
-      Boolean(obj.canonicalCover) !== Boolean(src.canonicalCover)
-    );
-    if (!diff) return false;
-    const sameBase = Boolean(obj.thumb && nextThumb && typeof isSameCoverBase === 'function' && isSameCoverBase(obj.thumb, nextThumb));
-    const oldAlb = obj.album;
-    if (nextThumb) obj.thumb = nextThumb;
-    obj.album = src.album;
-    obj.albumTitle = src.albumTitle;
-    obj.albumId = src.albumId != null ? src.albumId : null;
-    obj.canonicalCover = Boolean(src.canonicalCover);
-    if (src._appleUpgradeSettled || src.canonicalCover) obj._appleUpgradeSettled = true;
-    if (!sameBase) {
-      if (obj._sheetHiResUpgraded) delete obj._sheetHiResUpgraded;
-      _invalidateCoverCaches(obj.id, false, true);
-      if (oldAlb && oldAlb === 's_' + obj.id && oldAlb !== src.album) _invalidateCoverCaches(oldAlb, false, true);
+  for (let i = 0; i < targetRes.songs.length; i++) {
+    const s = targetRes.songs[i];
+    if (!s) continue;
+    let tr = s.id ? idMap.get(String(s.id)) : null;
+    if (!tr && keyMap.size) {
+      const tk = _plRecTrackKey(s);
+      if (tk) tr = keyMap.get(tk);
     }
-    return true;
-  };
+    if (!tr || s === tr) continue;
+    const coverPatch = _tryUpgradeSongEntry(s, tr);
+    if (coverPatch) {
+      targetRes.songs[i] = Object.assign({}, s, coverPatch);
+      changed = true;
+    }
+  }
+  return changed;
+}
+function _flushCanonicalPropagate() {
+  _propFlushScheduled = false;
+  if (!_propPendingMap.size) return;
+  const doBridge = _propPendingBridge;
+  _propPendingBridge = false;
+  const idMap = new Map();
+  const keyMap = new Map();
+  for (const [id, rawTr] of _propPendingMap) {
+    const src = (typeof LIVE !== 'undefined' && LIVE && LIVE.known && LIVE.known[id]) || rawTr;
+    if (!src || !src.id) continue;
+    idMap.set(String(src.id), src);
+    const tk = _plRecTrackKey(src);
+    if (tk && !keyMap.has(tk)) keyMap.set(tk, src);
+  }
+  _propPendingMap.clear();
+  if (!idMap.size) return;
+  const artSnap = doBridge ? _snapshotPlaybackArtwork() : null;
+  let changed = false;
   const syncList = arr => {
     if (!Array.isArray(arr)) return;
     for (let i = 0; i < arr.length; i++) {
-      if (syncCopy(arr[i])) changed = true;
+      const obj = arr[i];
+      if (!obj || !obj.id) continue;
+      const src = idMap.get(String(obj.id));
+      if (src && obj !== src && _syncCanonicalCopy(obj, src)) changed = true;
     }
   };
   if (typeof PL !== 'undefined' && PL) syncList(PL.queue);
-  if (typeof TRACKS !== 'undefined') syncList(TRACKS);
   if (typeof LIVE !== 'undefined' && LIVE) {
     syncList(LIVE.radio);
     syncList(LIVE.recent);
@@ -3601,8 +4102,10 @@ function _propagateCanonicalTrack(tr, skipBridgeSync) {
     }
   }
   if (typeof BYID !== 'undefined') {
-    const byIdSelf = BYID[src.id];
-    if (byIdSelf && (!byIdSelf.kind || byIdSelf.kind === 'track') && syncCopy(byIdSelf)) changed = true;
+    for (const [id, src] of idMap) {
+      const byIdSelf = BYID[id];
+      if (byIdSelf && byIdSelf !== src && (!byIdSelf.kind || byIdSelf.kind === 'track') && _syncCanonicalCopy(byIdSelf, src)) changed = true;
+    }
     for (const k in BYID) {
       const it = BYID[k];
       if (!it || typeof it !== 'object') continue;
@@ -3610,11 +4113,41 @@ function _propagateCanonicalTrack(tr, skipBridgeSync) {
       if (Array.isArray(it.songs)) syncList(it.songs);
     }
   }
-  if (typeof _searchCacheUpgradeHook === 'function') {
-    _searchCacheUpgradeHook(src);
+  let searchChanged = false;
+  const seen = new Set();
+  for (const v of _searchMemCache.values()) {
+    if (v && !seen.has(v)) { seen.add(v); if (_upgradeResFromTrackBatch(v, idMap, keyMap)) searchChanged = true; }
+  }
+  if (typeof LIVE !== 'undefined' && LIVE && LIVE.res) {
+    for (const k in LIVE.res) {
+      const v = LIVE.res[k];
+      if (v && !seen.has(v)) { seen.add(v); if (_upgradeResFromTrackBatch(v, idMap, keyMap)) searchChanged = true; }
+    }
+  }
+  if (typeof LIVE !== 'undefined' && LIVE && LIVE.lastSearch && !seen.has(LIVE.lastSearch)) {
+    if (_upgradeResFromTrackBatch(LIVE.lastSearch, idMap, keyMap)) searchChanged = true;
   }
   if (artSnap) _syncPlaybackArtworkIfChanged(artSnap);
-  return changed;
+  if (changed || searchChanged) {
+    const shVis = typeof SH !== 'undefined' && SH && SH.t >= 0.01;
+    if (!shVis && typeof redrawSceneOnly === 'function') redrawSceneOnly();
+    else if (typeof redraw === 'function') redraw();
+  }
+}
+function _queueCanonicalPropagate(tr, skipBridgeSync) {
+  if (!tr || !tr.id) return;
+  _propPendingMap.set(String(tr.id), tr);
+  if (!skipBridgeSync) _propPendingBridge = true;
+  if (!_propFlushScheduled) {
+    _propFlushScheduled = true;
+    if (typeof queueMicrotask === 'function') queueMicrotask(_flushCanonicalPropagate);
+    else setTimeout(_flushCanonicalPropagate, 0);
+  }
+}
+function _propagateCanonicalTrack(tr, skipBridgeSync) {
+  if (!tr || !tr.id) return false;
+  _queueCanonicalPropagate(tr, skipBridgeSync);
+  return false;
 }
 _searchCacheUpgradeHook = function(tr) {
   if (!tr || !tr.id) return;
@@ -3632,7 +4165,11 @@ _searchCacheUpgradeHook = function(tr) {
   if (typeof LIVE !== 'undefined' && LIVE && LIVE.lastSearch && !seen.has(LIVE.lastSearch)) {
     if (_upgradeResFromTrack(LIVE.lastSearch, tr)) changed = true;
   }
-  if (changed && typeof redraw === 'function') redraw();
+  if (changed) {
+    const shVis = typeof SH !== 'undefined' && SH && SH.t >= 0.01;
+    if (!shVis && typeof redrawSceneOnly === 'function') redrawSceneOnly();
+    else if (typeof redraw === 'function') redraw();
+  }
 };
 function _upgradeResFromAlbum(targetRes, id, title, artist, thumb) {
   if (!targetRes || !thumb) return false;
@@ -3699,30 +4236,52 @@ _searchCacheAlbumUpgradeHook = function(id, title, artist, thumb) {
     _upgradeResFromAlbum(LIVE.lastSearch, id, title, artist, thumb);
   }
 };
+function _getNormLyricIndex(ly) {
+  if (!ly || ly.loading || !Array.isArray(ly.lines) || !ly.lines.length) return null;
+  if (ly._normIdx && ly._normIdxV === ly.v) return ly._normIdx;
+  const loadStr = window.t('lyrics.loading');
+  const unavailStr = window.t('lyrics.unavailable');
+  const entries = [];
+  const parts = [];
+  for (let i = 0; i < ly.lines.length; i++) {
+    const ln = ly.lines[i];
+    if (ln && ln._placeholder) continue;
+    const rawLine = (typeof ln === 'string' ? ln : (ln && typeof ln.text === 'string' ? ln.text : '')).trim();
+    if (!rawLine || rawLine === loadStr || rawLine === unavailStr || rawLine === 'Caricamento del testo…' || rawLine === 'Testo non disponibile') continue;
+    const nl = _normSearch(rawLine);
+    if (!nl) continue;
+    entries.push({ raw: rawLine, norm: nl });
+    parts.push(nl);
+  }
+  const idx = { blob: parts.join('\n'), entries };
+  ly._normIdx = idx;
+  ly._normIdxV = ly.v;
+  return idx;
+}
 function _findLocalLyricSnippet(id, nq) {
   if (!id || !nq || nq.length < 4 || typeof LIVE === 'undefined') return '';
-  const sources = [];
-  if (LIVE.ly && LIVE.ly[id]) sources.push(LIVE.ly[id]);
-  if (LIVE.offlineLy && LIVE.offlineLy[id]) sources.push(LIVE.offlineLy[id]);
-  for (let s = 0; s < sources.length; s++) {
-    const ly = sources[s];
-    if (!ly || ly.loading || !Array.isArray(ly.lines) || !ly.lines.length) continue;
-    for (let i = 0; i < ly.lines.length; i++) {
-      const ln = ly.lines[i];
-      if (ln && ln._placeholder) continue;
-      const rawLine = (typeof ln === 'string' ? ln : (ln && typeof ln.text === 'string' ? ln.text : '')).trim();
-      if (!rawLine || rawLine === window.t('lyrics.loading') || rawLine === window.t('lyrics.unavailable') || rawLine === 'Caricamento del testo…' || rawLine === 'Testo non disponibile') continue;
-      const nl = _normSearch(rawLine);
-      if (nl && nl.indexOf(nq) >= 0) {
-        return '♪ «' + rawLine.slice(0, 60) + '»';
+  const s1 = LIVE.ly && LIVE.ly[id];
+  const s2 = LIVE.offlineLy && LIVE.offlineLy[id];
+  for (let s = 0; s < 2; s++) {
+    const ly = s === 0 ? s1 : s2;
+    if (!ly || (s === 1 && ly === s1)) continue;
+    const idx = _getNormLyricIndex(ly);
+    if (!idx || !idx.blob || idx.blob.indexOf(nq) < 0) continue;
+    const entries = idx.entries;
+    for (let i = 0; i < entries.length; i++) {
+      if (entries[i].norm.indexOf(nq) >= 0) {
+        return '♪ «' + entries[i].raw.slice(0, 60) + '»';
       }
     }
   }
   return '';
 }
+let _localSearchMemo = { sig: '', res: null };
 function _localSearchMatches(rawQ) {
   const nq = _normSearch(rawQ);
   if (!nq || nq.length < 2) return null;
+  const memoSig = nq + '|' + _libVersion + '|' + (typeof LIVE !== 'undefined' && LIVE ? (LIVE.lyV || 0) : 0);
+  if (_localSearchMemo.sig === memoSig) return _localSearchMemo.res;
   const songs = [], albums = [], artists = [], playlists = [];
   const seenS = new Set(), seenA = new Set(), seenR = new Set(), seenP = new Set();
   const match = (t, sub) => {
@@ -3737,8 +4296,9 @@ function _localSearchMatches(rawQ) {
       songs.push(snippet ? Object.assign({}, tr, { _lyricMatch: snippet }) : tr);
     }
   };
+  const favs = favList();
   (LIVE.recent || []).forEach(pushTrack);
-  favList().forEach(pushTrack);
+  favs.forEach(pushTrack);
   for (const k in LIVE.known) {
     if (songs.length >= 8) break;
     pushTrack(LIVE.known[k]);
@@ -3756,13 +4316,26 @@ function _localSearchMatches(rawQ) {
     };
     collectKeys(LIVE.ly);
     collectKeys(LIVE.offlineLy);
+    let recentMap = null, favMap = null;
     for (let i = 0; i < lyIds.length && songs.length < 8; i++) {
       const id = lyIds[i];
       if (seenS.has(id)) continue;
-      const tr = (LIVE.known && LIVE.known[id]) ||
-        (typeof BYID !== 'undefined' && BYID[id]) ||
-        (LIVE.recent || []).find(x => x && x.id === id) ||
-        favList().find(x => x && x.id === id);
+      let tr = (LIVE.known && LIVE.known[id]) || (typeof BYID !== 'undefined' && BYID[id]) || null;
+      if (!tr) {
+        if (!recentMap) {
+          recentMap = new Map();
+          const rec = LIVE.recent || [];
+          for (let j = 0; j < rec.length; j++) if (rec[j] && rec[j].id) recentMap.set(rec[j].id, rec[j]);
+        }
+        tr = recentMap.get(id) || null;
+      }
+      if (!tr) {
+        if (!favMap) {
+          favMap = new Map();
+          for (let j = 0; j < favs.length; j++) if (favs[j] && favs[j].id) favMap.set(favs[j].id, favs[j]);
+        }
+        tr = favMap.get(id) || null;
+      }
       if (!tr || tr.kind) continue;
       const snippet = _findLocalLyricSnippet(id, nq);
       if (snippet) {
@@ -3783,8 +4356,11 @@ function _localSearchMatches(rawQ) {
   };
   PINS.forEach(pushItem);
   for (const k in BYID) pushItem(BYID[k]);
-  if (!songs.length && !albums.length && !artists.length && !playlists.length) return null;
-  return { songs, albums, artists, playlists, loading: true, _prelim: true };
+  const res = (!songs.length && !albums.length && !artists.length && !playlists.length)
+    ? null
+    : { songs, albums, artists, playlists, loading: true, _prelim: true };
+  _localSearchMemo = { sig: memoSig, res };
+  return res;
 }
 function _mergeLyricTracksIntoRes(targetRes, lyTracks) {
   if (!targetRes || !Array.isArray(lyTracks) || !lyTracks.length) return false;
@@ -3832,6 +4408,7 @@ function liveSearch(q) {
   const rawQ = String(q || '').trim(), key = rawQ.toLowerCase();
   if (!key) {
     if (_searchAbort) { try { _searchAbort.abort(); } catch (e) {} _searchAbort = null; }
+    if (_searchLyricsTimer) { clearTimeout(_searchLyricsTimer); _searchLyricsTimer = 0; }
     if (_searchLyricsAbort) { try { _searchLyricsAbort.abort(); } catch (e) {} _searchLyricsAbort = null; }
     _searchInFlightKey = '';
     LIVE.search.q = '';
@@ -3841,6 +4418,7 @@ function liveSearch(q) {
   LIVE.search.q = rawQ;
   const mem = _searchMemCache.get(key);
   if (mem) {
+    if (_searchLyricsTimer) { clearTimeout(_searchLyricsTimer); _searchLyricsTimer = 0; }
     if (_searchLyricsAbort) { try { _searchLyricsAbort.abort(); } catch (e) {} _searchLyricsAbort = null; }
     _syncResCoversFromKnown(mem);
     _setSearchMemCache(key, mem);
@@ -3854,6 +4432,7 @@ function liveSearch(q) {
   if (curRes && !curRes.err && !curRes.loading && !curRes._prelim &&
       ((curRes.songs && curRes.songs.length) || (curRes.albums && curRes.albums.length) ||
        (curRes.artists && curRes.artists.length) || (curRes.playlists && curRes.playlists.length))) {
+    if (_searchLyricsTimer) { clearTimeout(_searchLyricsTimer); _searchLyricsTimer = 0; }
     if (_searchLyricsAbort) { try { _searchLyricsAbort.abort(); } catch (e) {} _searchLyricsAbort = null; }
     _syncResCoversFromKnown(curRes);
     _setSearchMemCache(key, curRes);
@@ -3864,6 +4443,7 @@ function liveSearch(q) {
   }
   if (_searchInFlightKey === key && curRes && curRes.loading) return;
   if (_searchAbort) { try { _searchAbort.abort(); } catch (e) {} _searchAbort = null; }
+  if (_searchLyricsTimer) { clearTimeout(_searchLyricsTimer); _searchLyricsTimer = 0; }
   if (_searchLyricsAbort) { try { _searchLyricsAbort.abort(); } catch (e) {} _searchLyricsAbort = null; }
   const localPrelim = !LIVE.search.res || (curRes && curRes.loading) || (!curRes) ? _localSearchMatches(rawQ) : null;
   const localLyTracks = (localPrelim && Array.isArray(localPrelim.songs)) ? localPrelim.songs.filter(s => s && s._lyricMatch) : [];
@@ -3904,56 +4484,60 @@ function liveSearch(q) {
 
   const looksLikePhrase = rawQ.length >= 5 && (rawQ.split(/\s+/).length >= 2 || /^["'«].*["'»]$/.test(rawQ));
   if (looksLikePhrase) {
-    const lyCtrl = typeof AbortController === 'function' ? new AbortController() : null;
-    _searchLyricsAbort = lyCtrl;
-    fetch('/api/lyrics_search?q=' + encodeURIComponent(rawQ), lyCtrl ? { signal: lyCtrl.signal } : undefined)
-      .then(r => (r && r.ok ? r.json() : null))
-      .then(d => {
-        if (lyCtrl && lyCtrl.signal && lyCtrl.signal.aborted) return;
-        if (_searchLyricsAbort === lyCtrl) _searchLyricsAbort = null;
-        if (!LIVE.search || LIVE.search.q !== rawQ) return;
-        const rawTracks = Array.isArray(d && d.tracks) ? d.tracks : [];
-        if (!rawTracks.length) return;
-        const lyTracks = [];
-        for (let i = 0; i < rawTracks.length; i++) {
-          const raw = rawTracks[i];
-          const ingested = ingestTrack(raw);
-          if (!ingested) continue;
-          lyTracks.push(Object.assign({}, ingested, { _lyricMatch: raw.lyricSnippet || '' }));
-        }
-        if (!lyTracks.length) return;
-        reqState.lyTracks = lyTracks;
-        const curKeyRes = LIVE.res[key];
-        if (curKeyRes && curKeyRes.loading && !curKeyRes.songs) {
-          const prelim = { songs: [], albums: [], artists: [], playlists: [], loading: true, _prelim: true };
-          _setLiveRes(key, prelim);
-          LIVE.search.res = prelim;
-        } else if (!LIVE.search.res) {
-          const prelim = { songs: [], albums: [], artists: [], playlists: [], loading: true, _prelim: true };
-          LIVE.search.res = prelim;
-          if (curKeyRes && curKeyRes.loading) _setLiveRes(key, prelim);
-        }
-        let changed = false;
-        const targetKeyRes = LIVE.res[key];
-        if (targetKeyRes && targetKeyRes.songs) {
-          if (_mergeLyricTracksIntoRes(targetKeyRes, lyTracks)) changed = true;
-          if (LIVE.search.res && LIVE.search.res !== targetKeyRes && LIVE.search.res === LIVE.lastSearch) {
-            LIVE.search.res = targetKeyRes;
+    _searchLyricsTimer = setTimeout(() => {
+      _searchLyricsTimer = 0;
+      if (!LIVE.search || LIVE.search.q !== rawQ) return;
+      const lyCtrl = typeof AbortController === 'function' ? new AbortController() : null;
+      _searchLyricsAbort = lyCtrl;
+      fetch('/api/lyrics_search?q=' + encodeURIComponent(rawQ), lyCtrl ? { signal: lyCtrl.signal } : undefined)
+        .then(r => (r && r.ok ? r.json() : null))
+        .then(d => {
+          if (lyCtrl && lyCtrl.signal && lyCtrl.signal.aborted) return;
+          if (_searchLyricsAbort === lyCtrl) _searchLyricsAbort = null;
+          if (!LIVE.search || LIVE.search.q !== rawQ) return;
+          const rawTracks = Array.isArray(d && d.tracks) ? d.tracks : [];
+          if (!rawTracks.length) return;
+          const lyTracks = [];
+          for (let i = 0; i < rawTracks.length; i++) {
+            const raw = rawTracks[i];
+            const ingested = ingestTrack(raw);
+            if (!ingested) continue;
+            lyTracks.push(Object.assign({}, ingested, { _lyricMatch: raw.lyricSnippet || '' }));
           }
-        }
-        if (LIVE.search && LIVE.search.q === rawQ && LIVE.search.res && LIVE.search.res !== targetKeyRes && LIVE.search.res.songs) {
-          if (_mergeLyricTracksIntoRes(LIVE.search.res, lyTracks)) changed = true;
-        }
-        const memEntry = _searchMemCache.get(key);
-        if (memEntry && memEntry !== targetKeyRes && memEntry !== LIVE.search.res && memEntry.songs) {
-          if (_mergeLyricTracksIntoRes(memEntry, lyTracks)) changed = true;
-        }
-        for (let i = 0; i < lyTracks.length; i++) _searchCacheUpgradeHook(lyTracks[i]);
-        if (changed) redraw();
-      })
-      .catch(() => {
-        if (_searchLyricsAbort === lyCtrl) _searchLyricsAbort = null;
-      });
+          if (!lyTracks.length) return;
+          reqState.lyTracks = lyTracks;
+          const curKeyRes = LIVE.res[key];
+          if (curKeyRes && curKeyRes.loading && !curKeyRes.songs) {
+            const prelim = { songs: [], albums: [], artists: [], playlists: [], loading: true, _prelim: true };
+            _setLiveRes(key, prelim);
+            LIVE.search.res = prelim;
+          } else if (!LIVE.search.res) {
+            const prelim = { songs: [], albums: [], artists: [], playlists: [], loading: true, _prelim: true };
+            LIVE.search.res = prelim;
+            if (curKeyRes && curKeyRes.loading) _setLiveRes(key, prelim);
+          }
+          let changed = false;
+          const targetKeyRes = LIVE.res[key];
+          if (targetKeyRes && targetKeyRes.songs) {
+            if (_mergeLyricTracksIntoRes(targetKeyRes, lyTracks)) changed = true;
+            if (LIVE.search.res && LIVE.search.res !== targetKeyRes && LIVE.search.res === LIVE.lastSearch) {
+              LIVE.search.res = targetKeyRes;
+            }
+          }
+          if (LIVE.search && LIVE.search.q === rawQ && LIVE.search.res && LIVE.search.res !== targetKeyRes && LIVE.search.res.songs) {
+            if (_mergeLyricTracksIntoRes(LIVE.search.res, lyTracks)) changed = true;
+          }
+          const memEntry = _searchMemCache.get(key);
+          if (memEntry && memEntry !== targetKeyRes && memEntry !== LIVE.search.res && memEntry.songs) {
+            if (_mergeLyricTracksIntoRes(memEntry, lyTracks)) changed = true;
+          }
+          for (let i = 0; i < lyTracks.length; i++) _queueCanonicalPropagate(lyTracks[i], true);
+          if (changed) redraw();
+        })
+        .catch(() => {
+          if (_searchLyricsAbort === lyCtrl) _searchLyricsAbort = null;
+        });
+    }, 180);
   }
 }
 function liveStation(s) {
@@ -3994,10 +4578,25 @@ function liveChips(c, P, y) {
     hit(x, y, w, 36, () => liveChip(ch[1]), { pressKey: pk });
   }, { widths: ws });
 }
+function _chunkRailItems(items, rows) {
+  if (!Array.isArray(items) || !items.length) return [];
+  const prop = rows === 4 ? '_grp4' : '_grp2';
+  const cached = items[prop];
+  if (cached && cached._len === items.length && cached._first === items[0] && cached._last === items[items.length - 1]) {
+    return cached;
+  }
+  const cols = Math.ceil(items.length / rows);
+  const groups = new Array(cols);
+  for (let i = 0; i < cols; i++) groups[i] = items.slice(i * rows, i * rows + rows);
+  groups._len = items.length;
+  groups._first = items[0];
+  groups._last = items[items.length - 1];
+  items[prop] = groups;
+  return groups;
+}
 /* "Scelte rapide": colonne da 4 righe (copertina, titolo, artista); si scorre a pagine e si vede l'inizio della colonna dopo */
 function liveQuick(c, P, id, y, items) {
-  const rows = 4, rh = 66, cw = W - 42, cols = Math.ceil(items.length / rows), groups = [];
-  for (let i = 0; i < cols; i++) groups.push(items.slice(i * rows, i * rows + rows));
+  const rows = 4, rh = 66, cw = W - 42, groups = _chunkRailItems(items, rows);
   return rail(c, P, id, y, groups, cw, 14, rows * rh, (c, g, x, y, ci) => {
     g.forEach((it, k) => {
       const ry = y + k * rh, tr = isTr(it), cu = tr && isCur(it);
@@ -4023,8 +4622,7 @@ function artistSectionHead(c, P, y, titleText) {
 function liveArtistPills(c, P, id, y, items) {
   const rows = 2, ph = 48, rGap = 8;
   const pw = Math.min(210, Math.max(172, Math.floor((W - 48) * 0.52)));
-  const cols = Math.ceil(items.length / rows), groups = [];
-  for (let i = 0; i < cols; i++) groups.push(items.slice(i * rows, i * rows + rows));
+  const groups = _chunkRailItems(items, rows);
   return rail(c, P, id, y, groups, pw, 10, rows * ph + rGap, (c, g, x, y, ci) => {
     g.forEach((it, k) => {
       const ry = y + k * (ph + rGap);
@@ -4051,8 +4649,7 @@ function liveArtistPills(c, P, id, y, items) {
 function liveArtistReleases(c, P, id, y, items) {
   const rows = 2, rh = 56, rGap = 8;
   const rw = Math.min(270, Math.max(220, W - 60));
-  const cols = Math.ceil(items.length / rows), groups = [];
-  for (let i = 0; i < cols; i++) groups.push(items.slice(i * rows, i * rows + rows));
+  const groups = _chunkRailItems(items, rows);
   return rail(c, P, id, y, groups, rw, 10, rows * rh + rGap, (c, g, x, y, ci) => {
     g.forEach((it, k) => {
       const ry = y + k * (rh + rGap);
@@ -4079,9 +4676,24 @@ function liveArtistReleases(c, P, id, y, items) {
     });
   }) + 16;
 }
+let _classicsCache = { sig: '', at: 0, out: null };
+let _recentSliceCache = { sig: '', out: null };
 function getRediscoverClassics(maxCount) {
   const limit = maxCount || 12;
-  const recentHead = new Set((LIVE.recent || []).slice(0, 6).map(x => x && x.id).filter(Boolean));
+  const recent = LIVE.recent || [];
+  let headKey = '';
+  for (let i = 0; i < 6 && i < recent.length; i++) {
+    if (recent[i] && recent[i].id) headKey += (headKey ? ',' : '') + recent[i].id;
+  }
+  const nowMs = performance.now();
+  const sig = limit + '|' + _libVersion + '|' + headKey;
+  if (_classicsCache.out && _classicsCache.sig === sig && (nowMs - _classicsCache.at) < 15000) {
+    return _classicsCache.out;
+  }
+  const recentHead = new Set();
+  for (let i = 0; i < 6 && i < recent.length; i++) {
+    if (recent[i] && recent[i].id) recentHead.add(recent[i].id);
+  }
   const playCounts = Object.create(null);
   const recTrackFallback = Object.create(null);
   if (typeof REC_HIST !== 'undefined' && REC_HIST) {
@@ -4151,6 +4763,7 @@ function getRediscoverClassics(maxCount) {
     if (tk) seenKey.add(tk);
     out.push(tr);
   }
+  _classicsCache = { sig, at: nowMs, out };
   return out;
 }
 if (typeof window !== 'undefined') window.getRediscoverClassics = getRediscoverClassics;
@@ -4168,29 +4781,28 @@ LIVEPAGES.home = (c, P) => {
   }
   return _drawLoadedWithFade(c, P, 'home', y, typeof drawHomeSkeleton === 'function' ? drawHomeSkeleton : null, (dc) => {
     let yy = y;
-    LIVE.home.forEach((r, i) => {
-      const quickTracks = r.items.filter(isTr);
-      const isQuick = (r.sectionKey === 'quick_picks' || i === 0 || /scelte rapide|quick picks/i.test(r.title)) && quickTracks.length >= 4 &&
-        (r.sectionKey === 'quick_picks' || /scelte rapide|quick picks/i.test(r.title) || r.items.every(isTr));
-      const isTrend = (r.sectionKey === 'charts' || /in tendenza|trending|charts/i.test(r.title)) && quickTracks.length >= 4;
-      const isSimilar = r.sectionKey === 'similar_artists' || r.type === 'similar_artists' || /^simile a|^similar to/i.test(r.title);
-      const isReleases = r.sectionKey === 'artist_releases' || r.type === 'artist_releases' || /^altro da|^more from/i.test(r.title);
-
-      if (isQuick || isTrend) {
+    for (let i = 0; i < LIVE.home.length; i++) {
+      const r = LIVE.home[i];
+      if (!r._kind) _classifyHomeRow(r, i);
+      if (r._kind === 'quick') {
         yy = section(dc, P, yy, r.title, 'big');
-        yy = liveQuick(dc, P, 'h' + i, yy + 4, quickTracks.slice(0, 20)) + 14;
-      } else if (isSimilar) {
+        yy = liveQuick(dc, P, 'h' + i, yy + 4, r._quickTracks) + 14;
+      } else if (r._kind === 'similar') {
         yy = artistSectionHead(dc, P, yy, r.title);
         yy = liveArtistPills(dc, P, 'h' + i, yy + 2, r.items) + 14;
-      } else if (isReleases) {
+      } else if (r._kind === 'releases') {
         yy = artistSectionHead(dc, P, yy, r.title);
         yy = liveArtistReleases(dc, P, 'h' + i, yy + 2, r.items) + 16;
       } else {
         yy = liveShelf(dc, P, 'h' + i, yy, r.title, r.items);
       }
-    });
+    }
     if (LIVE.recent && LIVE.recent.length) {
-      yy = liveShelf(dc, P, 'recent', yy, window.t('home.recent'), LIVE.recent.slice(0, 12), 138);
+      const rSig = LIVE.recent.length + '|' + (LIVE.recent[0] && LIVE.recent[0].id);
+      if (!_recentSliceCache.out || _recentSliceCache.sig !== rSig) {
+        _recentSliceCache = { sig: rSig, out: LIVE.recent.slice(0, 12) };
+      }
+      yy = liveShelf(dc, P, 'recent', yy, window.t('home.recent'), _recentSliceCache.out, 138);
     }
     const classics = typeof getRediscoverClassics === 'function' ? getRediscoverClassics(12) : [];
     if (classics.length >= 3) {
@@ -4281,10 +4893,26 @@ function radioCard(c, it, x, y, s) {
   hit(x, y, s, s + 52, () => open(it), { pressKey: pk });
 }
 function genreChips(c, P, y, cats) {
-  c.font = F(600, 15.5);
-  let x = 20, row = 0; const h = 40, gap = 10, pos = [];
-  cats.forEach(m => { const w = Math.ceil(c.measureText(m.title).width) + 34; if (x + w > W - 20 && x > 20) { x = 20; row++; } pos.push([x, row, w]); x += w + gap; });
-  cats.forEach((m, i) => {
+  const h = 40, gap = 10;
+  const sig = W + '|' + cats.length + '|' + (cats[0] && cats[0].title || '');
+  let layout = cats._chipLayout;
+  if (!layout || layout.sig !== sig) {
+    c.font = F(600, 15.5);
+    let x = 20, row = 0;
+    const pos = new Array(cats.length);
+    for (let i = 0; i < cats.length; i++) {
+      const m = cats[i];
+      const w = Math.ceil(c.measureText(m.title).width) + 34;
+      if (x + w > W - 20 && x > 20) { x = 20; row++; }
+      pos[i] = [x, row, w];
+      x += w + gap;
+    }
+    layout = { sig, pos, totalH: (pos.length ? pos[pos.length - 1][1] + 1 : 0) * (h + gap) };
+    cats._chipLayout = layout;
+  }
+  const pos = layout.pos;
+  for (let i = 0; i < cats.length; i++) {
+    const m = cats[i];
     const [px, r, w] = pos[i], py = y + r * (h + gap), pk = 'gchip:' + (m.id || m.title || i);
     if (vis(P, py, h)) {
       const hu = m.hue != null ? m.hue : (i * 47) % 360;
@@ -4297,8 +4925,8 @@ function genreChips(c, P, y, cats) {
       });
     }
     hit(px, py, w, h, () => openMood(m), { pressKey: pk });
-  });
-  return y + (pos.length ? pos[pos.length - 1][1] + 1 : 0) * (h + gap);
+  }
+  return y + layout.totalH;
 }
 LIVEPAGES.radio = (c, P) => {
   bigTitle(c, window.t('radio.title')); let y = TOP + 74;
@@ -4401,8 +5029,7 @@ let _libFilterWs = null;
 let _libAutoCache = { sig: '', data: null };
 let _libListCache = { sig: '', curF: '', sIdx: -1, lqLow: '', list: null };
 function _getLibSig() {
-  let favCnt = 0;
-  for (const k in PL.fav) if (PL.fav[k] && LIVE.known[k]) favCnt++;
+  const favCnt = favList().length;
   const uLen = LIVE.userPlaylists ? LIVE.userPlaylists.length : 0;
   const rLen = LIVE.recent ? LIVE.recent.length : 0;
   const sLen = LIVE.saved ? LIVE.saved.length : 0;
@@ -4411,7 +5038,8 @@ function _getLibSig() {
 function libAutoItems() {
   const sig = _getLibSig();
   if (_libAutoCache.data && _libAutoCache.sig === sig) return _libAutoCache.data;
-  const seen = new Set(PINS.map(p => p.id)), albums = [], artists = [], playlists = [];
+  const pinIds = new Set(PINS.map(p => p.id));
+  const seen = new Set(pinIds), albums = [], artists = [], playlists = [];
   PINS.forEach(p => {
     if (p.kind === 'playlist') playlists.push(p);
     else if (p.kind === 'artist') artists.push(p);
@@ -4444,7 +5072,7 @@ function libAutoItems() {
       artists.push(ar);
     }
   });
-  const data = { playlists, artists, albums, all: PINS.concat(playlists.filter(p => !isPinned(p)), albums.filter(a => !isPinned(a)), artists.filter(a => !isPinned(a))) };
+  const data = { playlists, artists, albums, all: PINS.concat(playlists.filter(p => !pinIds.has(p.id)), albums.filter(a => !pinIds.has(a.id)), artists.filter(a => !pinIds.has(a.id))) };
   _libAutoCache = { sig, data };
   return data;
 }
@@ -4459,6 +5087,23 @@ function libBadgeRow(c, P, y, bgCol, icoCol, ico, title, sub, fn) {
   }
   hit(0, y, W, h, fn, { pressKey: pk });
   return y + h;
+}
+let _libBadgeGradCache = new Map();
+let _libBadgeGradCtx = null;
+function _getLibBadgeGrad(c, bx, by, col) {
+  if (_libBadgeGradCtx !== c || _libBadgeGradCache.size > 32) {
+    _libBadgeGradCache.clear();
+    _libBadgeGradCtx = c;
+  }
+  const key = bx + ',' + by + ',' + col;
+  let g = _libBadgeGradCache.get(key);
+  if (!g) {
+    g = c.createLinearGradient(bx, by, bx, by + 34);
+    g.addColorStop(0, col);
+    g.addColorStop(1, col + 'cc');
+    _libBadgeGradCache.set(key, g);
+  }
+  return g;
 }
 const _libChipAnim = { x: null, w: null, t: 0 };
 const _libContAnim = { key: null, t0: 0, sortIdx: null, sortT0: 0 };
@@ -4637,7 +5282,7 @@ LIVEPAGES.library = (c, P) => {
         rows.forEach((r, i) => {
           const ry = y + i * rh, bx = gx + 14, by = ry + (rh - 34) / 2;
           drawRowPressTint(c, 'lib_in:' + r.title, gx, ry, gw, rh, 0);
-          const g = c.createLinearGradient(bx, by, bx, by + 34); g.addColorStop(0, r.col); g.addColorStop(1, r.col + 'cc');
+          const g = _getLibBadgeGrad(c, bx, by, r.col);
           rrPath(c, bx, by, 34, 34, 9); c.fillStyle = g; c.fill();
           icon(c, r.ico, bx + 17, by + 17, 19, '#fff', { lw: 2 });
           txt(c, r.title, gx + 62, ry + rh / 2 + 6, F(500, 17), pal.fg, 'left', gw - 62 - 70);
@@ -4819,8 +5464,14 @@ $q.addEventListener('input', () => {
   if (!LIVE.on) return;
   const P = topPage(); if ((hasPill(P) && P.qOpen) || (NAV.tab === 'library' && stackOf().length === 1 && P.libQOpen)) return;
   clearTimeout(liveTimer);
-  _searchPendingInput = performance.now() + 85;
-  liveTimer = setTimeout(() => { _searchPendingInput = 0; liveSearch($q.value); }, 75);
+  const key = String($q.value || '').trim().toLowerCase();
+  if (key && _searchMemCache.has(key)) {
+    _searchPendingInput = 0;
+    liveSearch($q.value);
+    return;
+  }
+  _searchPendingInput = performance.now() + 260;
+  liveTimer = setTimeout(() => { _searchPendingInput = 0; liveSearch($q.value); }, 240);
 });
 $q.addEventListener('keydown', e => { if (LIVE.on && e.key === 'Enter') { clearTimeout(liveTimer); _searchPendingInput = 0; liveSearch($q.value); } });
 let _startupSecondaryIdleId = 0;
@@ -4845,6 +5496,11 @@ function liveEnable() {
   if (LIVE.on) return;
   LIVE.on = true;
   ALBUMS.length = TRACKS.length = ARTISTS.length = PLAYLISTS.length = 0; Object.keys(BYID).forEach(k => delete BYID[k]); PINS.length = 0;
+  _byArtistId.clear(); _byAlbumId.clear(); _byAlbumKey.clear(); _propPendingMap.clear();
+  _cancelStaleLyPolls(null); _lyLru.clear();
+  _favListCache = null; _favListVer = -1;
+  _localSearchMemo = { sig: '', res: null };
+  _classicsCache = { sig: '', at: 0, out: null };
   PL.queue = []; PL.qi = 0; PL.pos = 0; PL.playing = false; if (PL.audio) { PL.audio.pause(); PL.audio = null; }
   [ARTC, PALC, TINTC, SHAD_PALC].forEach(o => Object.keys(o).forEach(k => delete o[k])); if (FLU) FLU.key = null;
   clearLiveCoverCache();
@@ -4869,8 +5525,33 @@ let _promptKeepOpenOnConfirm = false;
 let _promptDownBackdrop = false;
 let _promptOpenTime = 0;
 let _promptGlassRaf = 0;
+let _promptOpenRaf = 0;
 let _promptCloseTimer = 0;
 let _promptFocusGuardUntil = 0;
+let _promptDom = null;
+
+function _getPromptDom() {
+  if (_promptDom && _promptDom.el && _promptDom.el.isConnected) return _promptDom;
+  const el = document.getElementById('sonoraPrompt');
+  if (!el) return null;
+  _promptDom = {
+    el,
+    titleEl: document.getElementById('promptTitle'),
+    subEl: document.getElementById('promptSub'),
+    notesEl: document.getElementById('promptNotes'),
+    progressWrap: document.getElementById('promptProgressWrap'),
+    progressFill: document.getElementById('promptProgressFill'),
+    progressLabel: document.getElementById('promptProgressLabel'),
+    btnsEl: document.getElementById('promptBtns'),
+    badgeEl: el.querySelector('.prompt-badge'),
+    inp: document.getElementById('promptInput'),
+    cancelBtn: document.getElementById('promptCancel'),
+    confirmBtn: document.getElementById('promptConfirm'),
+    sheet: el.querySelector('.prompt-sheet'),
+    out: document.getElementById('out')
+  };
+  return _promptDom;
+}
 
 function stopPromptGlass() {
   if (_promptGlassRaf) {
@@ -4887,32 +5568,43 @@ function isPromptGlassRunning(el) {
 
 function pumpPromptGlass(ms) {
   stopPromptGlass();
-  const el = document.getElementById('sonoraPrompt');
+  const dom = _getPromptDom();
+  const el = dom && dom.el;
   if (!isPromptGlassRunning(el)) {
     if (typeof D !== 'undefined') D.gl = true;
+    _liveWakeFrame();
     return;
   }
   const until = performance.now() + (ms || 360);
   const step = () => {
     _promptGlassRaf = 0;
-    const curEl = document.getElementById('sonoraPrompt');
+    const curDom = _getPromptDom();
+    const curEl = curDom && curDom.el;
     if (!isPromptGlassRunning(curEl)) {
       if (typeof D !== 'undefined') D.gl = true;
+      _liveWakeFrame();
       return;
     }
     if (typeof D !== 'undefined') D.gl = true;
+    _liveWakeFrame();
     if (typeof FALLBACK !== 'undefined' && FALLBACK && typeof redraw === 'function') redraw();
     if (performance.now() < until) {
       _promptGlassRaf = requestAnimationFrame(step);
     }
   };
+  _liveWakeFrame();
   _promptGlassRaf = requestAnimationFrame(step);
 }
 
 function closePromptModal(force, skipCancelCb) {
-  const el = document.getElementById('sonoraPrompt');
+  const dom = _getPromptDom();
+  const el = dom && dom.el;
   if (!el) return;
   if (!force && el.dataset && el.dataset.locked === '1') return;
+  if (_promptOpenRaf) {
+    cancelAnimationFrame(_promptOpenRaf);
+    _promptOpenRaf = 0;
+  }
   _promptFocusGuardUntil = 0;
   _promptKeepOpenOnConfirm = false;
   const cancelCb = (!skipCancelCb && typeof _promptOnCancel === 'function') ? _promptOnCancel : null;
@@ -4920,7 +5612,7 @@ function closePromptModal(force, skipCancelCb) {
   el.dataset.locked = '0';
   el.classList.remove('visible', 'active');
   el.setAttribute('aria-hidden', 'true');
-  const inp = document.getElementById('promptInput');
+  const inp = dom.inp;
   if (inp) {
     inp.blur();
     inp.value = '';
@@ -4939,6 +5631,7 @@ function closePromptModal(force, skipCancelCb) {
       el.style.display = 'none';
       window._promptGlassAlpha = 0;
       if (typeof D !== 'undefined') D.gl = true;
+      _liveWakeFrame();
       if (typeof FALLBACK !== 'undefined' && FALLBACK && typeof redraw === 'function') redraw();
     }
   }, 260);
@@ -4958,24 +5651,18 @@ function showConfirmModal(opts) {
 function showPromptModal(opts) {
   opts = opts || {};
   initPromptModal();
-  const el = document.getElementById('sonoraPrompt');
-  if (!el) return;
+  const dom = _getPromptDom();
+  if (!dom || !dom.el) return;
+  const { el, titleEl, subEl, notesEl, progressWrap, progressFill, progressLabel, btnsEl, badgeEl, inp, cancelBtn, confirmBtn, out } = dom;
   if (_promptCloseTimer) {
     clearTimeout(_promptCloseTimer);
     _promptCloseTimer = 0;
   }
+  if (_promptOpenRaf) {
+    cancelAnimationFrame(_promptOpenRaf);
+    _promptOpenRaf = 0;
+  }
   stopPromptGlass();
-  const titleEl = document.getElementById('promptTitle');
-  const subEl = document.getElementById('promptSub');
-  const notesEl = document.getElementById('promptNotes');
-  const progressWrap = document.getElementById('promptProgressWrap');
-  const progressFill = document.getElementById('promptProgressFill');
-  const progressLabel = document.getElementById('promptProgressLabel');
-  const btnsEl = document.getElementById('promptBtns');
-  const badgeEl = el.querySelector('.prompt-badge');
-  const inp = document.getElementById('promptInput');
-  const cancelBtn = document.getElementById('promptCancel');
-  const confirmBtn = document.getElementById('promptConfirm');
   const confirmOnly = Boolean(opts.confirmOnly);
   el.dataset.confirmOnly = confirmOnly ? '1' : '0';
   el.dataset.locked = opts.locked ? '1' : '0';
@@ -5036,7 +5723,6 @@ function showPromptModal(opts) {
   _promptOpenTime = Date.now();
 
   // Release any pointer capture on $out so touch/mouse interactions belong to the modal
-  const out = document.getElementById('out');
   if (out) {
     try {
       if (typeof out.releasePointerCapture === 'function' && window.INP && window.INP.id != null) {
@@ -5056,10 +5742,17 @@ function showPromptModal(opts) {
   }
 
   el.style.display = 'flex';
-  void el.offsetWidth;
-  el.classList.add('visible', 'active');
   el.removeAttribute('aria-hidden');
-  pumpPromptGlass(360);
+  _liveWakeFrame();
+  _promptOpenRaf = requestAnimationFrame(() => {
+    _promptOpenRaf = 0;
+    if (el.style.display !== 'flex') return;
+    el.classList.add('visible', 'active');
+    pumpPromptGlass(360);
+    if (inp && !confirmOnly && document.activeElement !== inp) {
+      try { inp.focus({ preventScroll: true }); } catch (_) { inp.focus(); }
+    }
+  });
 
   _promptFocusGuardUntil = 0;
   if (inp && !confirmOnly) {
@@ -5069,23 +5762,16 @@ function showPromptModal(opts) {
       const len = inp.value.length;
       try { inp.setSelectionRange(0, len); } catch (_) {}
     }
-    requestAnimationFrame(() => {
-      if (el.classList.contains('visible') && !confirmOnly && document.activeElement !== inp) {
-        try { inp.focus({ preventScroll: true }); } catch (_) { inp.focus(); }
-      }
-    });
   }
 }
 
 function initPromptModal() {
-  const el = document.getElementById('sonoraPrompt');
+  const dom = _getPromptDom();
+  const el = dom && dom.el;
   if (!el || el._promptInited) return;
   el._promptInited = true;
 
-  const inp = document.getElementById('promptInput');
-  const cancelBtn = document.getElementById('promptCancel');
-  const confirmBtn = document.getElementById('promptConfirm');
-  const sheet = el.querySelector('.prompt-sheet');
+  const { inp, cancelBtn, confirmBtn, sheet } = dom;
 
   if (sheet) {
     sheet.addEventListener('click', e => e.stopPropagation());
@@ -5185,7 +5871,8 @@ window.closePromptModal = closePromptModal;
 
 const _origOnSonoraBackPressed = window.onSonoraBackPressed;
 window.onSonoraBackPressed = function() {
-  const promptEl = document.getElementById('sonoraPrompt');
+  const dom = _getPromptDom();
+  const promptEl = dom && dom.el;
   const isOpen = promptEl && (promptEl.classList.contains('visible') || promptEl.classList.contains('active') || (promptEl.style.display === 'flex' && promptEl.getAttribute('aria-hidden') !== 'true'));
   if (isOpen) {
     if (!promptEl.dataset || promptEl.dataset.locked !== '1') {
@@ -5271,19 +5958,17 @@ function formatUpdateBytes(bytes) {
 }
 
 function isUpdateModalOpen() {
-  const el = document.getElementById('sonoraPrompt');
+  const dom = _getPromptDom();
+  const el = dom && dom.el;
   if (!el || !el.classList.contains('update-modal')) return false;
   return el.classList.contains('visible') || el.classList.contains('active') || (el.style.display === 'flex' && el.getAttribute('aria-hidden') !== 'true');
 }
 
 function setUpdateProgressDom(upd) {
-  const el = document.getElementById('sonoraPrompt');
-  if (!el) return;
+  const dom = _getPromptDom();
+  if (!dom || !dom.el) return;
+  const { el, btnsEl, progressWrap, progressFill, progressLabel } = dom;
   el.dataset.locked = '1';
-  const btnsEl = document.getElementById('promptBtns');
-  const progressWrap = document.getElementById('promptProgressWrap');
-  const progressFill = document.getElementById('promptProgressFill');
-  const progressLabel = document.getElementById('promptProgressLabel');
   if (btnsEl) btnsEl.style.display = 'none';
   if (progressWrap) progressWrap.style.display = '';
   if (progressFill) {
@@ -5346,12 +6031,16 @@ window.onSonoraUpdateState = function(raw) {
   if (!upd || typeof upd !== 'object') return;
   const prev = _lastUpdateState;
   const next = upd.state || 'idle';
+  const prevReason = window.SONORA_UPDATE && window.SONORA_UPDATE.reason;
+  const prevVersion = window.SONORA_UPDATE && window.SONORA_UPDATE.version;
   _lastUpdateState = next;
   window.SONORA_UPDATE = upd;
 
+  let domOnlyProgress = false;
+  const dom = _getPromptDom();
   if (next === 'downloading') {
     if (isUpdateModalOpen()) {
-      const subEl = document.getElementById('promptSub');
+      const subEl = dom && dom.subEl;
       const sizeText = formatUpdateBytes(upd.bytes);
       if (subEl) {
         subEl.textContent = sizeText;
@@ -5359,6 +6048,7 @@ window.onSonoraUpdateState = function(raw) {
       }
       setUpdateProgressDom(upd);
       if (prev !== 'downloading') pumpPromptGlass(260);
+      else domOnlyProgress = true;
     } else {
       showUpdateModal(upd);
     }
@@ -5371,11 +6061,8 @@ window.onSonoraUpdateState = function(raw) {
       showUpdateModal(upd);
     }
   } else if (next === 'failed') {
-    if (isUpdateModalOpen()) {
-      const el = document.getElementById('sonoraPrompt');
-      const btnsEl = document.getElementById('promptBtns');
-      const progressWrap = document.getElementById('promptProgressWrap');
-      const subEl = document.getElementById('promptSub');
+    if (isUpdateModalOpen() && dom) {
+      const { el, btnsEl, progressWrap, subEl } = dom;
       if (el) el.dataset.locked = '0';
       if (btnsEl) btnsEl.style.display = '';
       if (progressWrap) progressWrap.style.display = 'none';
@@ -5392,6 +6079,12 @@ window.onSonoraUpdateState = function(raw) {
     }
   }
 
+  const tp = typeof topPage === 'function' ? topPage() : null;
+  const settingsVisible = Boolean(tp && (tp.kind === 'settings' || tp.name === 'settings'));
+  const stateChanged = next !== prev || upd.reason !== prevReason || upd.version !== prevVersion;
+  if (next === 'idle' && !stateChanged) return;
+  if (domOnlyProgress && !settingsVisible) return;
+  _liveWakeFrame();
   if (typeof redraw === 'function') redraw();
 };
 
@@ -5456,7 +6149,12 @@ window.onSonoraUpdateRowTap = function() {
   setTimeout(() => {
     try {
       const raw = window.SonoraNative.getUpdateState();
-      if (raw) window.onSonoraUpdateState(raw);
+      if (raw) {
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (parsed && typeof parsed === 'object' && ((parsed.state || 'idle') !== 'idle' || _lastUpdateState !== 'idle')) {
+          window.onSonoraUpdateState(parsed);
+        }
+      }
     } catch (_) {}
     runAutoUpdateCheck();
   }, 900);
@@ -5481,12 +6179,17 @@ function clearLiveCachesAndRefresh() {
   }
   if (typeof _searchMemCache !== 'undefined') _searchMemCache.clear();
   if (typeof _resKeys !== 'undefined') _resKeys.length = 0;
+  _localSearchMemo = { sig: '', res: null };
   if (LIVE && LIVE.on) {
-    if (typeof liveHome === 'function') liveHome(true);
-    if (typeof liveCharts === 'function') liveCharts();
-    if (typeof liveRadio === 'function') liveRadio();
-    if (typeof NAV !== 'undefined' && NAV.tab === 'search' && NAV.query && typeof liveSearch === 'function') {
+    const activeTab = typeof NAV !== 'undefined' && NAV ? NAV.tab : 'home';
+    if (activeTab === 'new' && typeof liveCharts === 'function') {
+      liveCharts();
+    } else if (activeTab === 'radio' && typeof liveRadio === 'function') {
+      liveRadio();
+    } else if (activeTab === 'search' && typeof NAV !== 'undefined' && NAV.query && typeof liveSearch === 'function') {
       liveSearch(NAV.query);
+    } else if (typeof liveHome === 'function') {
+      liveHome(true);
     }
   }
 }

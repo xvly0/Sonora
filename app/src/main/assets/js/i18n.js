@@ -214,6 +214,9 @@
       'queue.smart_shuffle_sub': 'Smart Shuffle ✦ · 1 consiglio ogni 3 brani',
       'queue.autoplay_sub': 'Continua con brani simili',
       'queue.end_sub': 'Fine della coda',
+      'queue.infinity_off_prefix': 'La coda infinita',
+      'queue.infinity_off_suffix': 'è disattivata.',
+      'queue.infinity_off_hint': 'Attivala in alto per continuare con brani simili',
 
       // Home page
       'home.title': 'Home',
@@ -477,7 +480,7 @@
       'update.installing': 'Aspetto la tua conferma',
       'update.needs_permission': 'Consenti l’installazione — tocca',
       'update.failed': 'Non adesso — tocca per riprovare',
-      'settings.version_label': 'Sonora v1.0.1-beta · LiquidGlass',
+      'settings.version_label': 'Sonora v1.0.2-beta · LiquidGlass',
 
       // Language & Region settings
       'settings.lang_section_app': 'LINGUA INTERFACCIA',
@@ -676,6 +679,9 @@
       'queue.smart_shuffle_sub': 'Smart Shuffle ✦ · 1 recommendation every 3 songs',
       'queue.autoplay_sub': 'Continuing with similar songs',
       'queue.end_sub': 'End of queue',
+      'queue.infinity_off_prefix': 'Infinite queue',
+      'queue.infinity_off_suffix': 'is turned off.',
+      'queue.infinity_off_hint': 'Turn it on above to continue with similar songs',
 
       // Home page
       'home.title': 'Home',
@@ -939,7 +945,7 @@
       'update.installing': 'Waiting for you to confirm',
       'update.needs_permission': 'Allow installing — tap',
       'update.failed': 'Not now — tap to retry',
-      'settings.version_label': 'Sonora v1.0.1-beta · LiquidGlass',
+      'settings.version_label': 'Sonora v1.0.2-beta · LiquidGlass',
 
       // Language & Region settings
       'settings.lang_section_app': 'INTERFACE LANGUAGE',
@@ -1015,6 +1021,11 @@
     return null;
   }
 
+  const _COUNTRY_BY_CODE = Object.create(null);
+  for (let i = 0; i < I18N_COUNTRIES.length; i++) {
+    _COUNTRY_BY_CODE[I18N_COUNTRIES[i].code] = I18N_COUNTRIES[i];
+  }
+
   let _localeState = {
     lang: 'auto',
     country: 'auto',
@@ -1022,6 +1033,13 @@
     resolvedCountry: 'US',
     storefront: 'us'
   };
+  let _activeDict = I18N_DICT.en;
+  let _staticI18nLang = null;
+  let _staticI18nDomReady = false;
+
+  function _syncActiveDict() {
+    _activeDict = I18N_DICT[_localeState.resolvedLang] || I18N_DICT.en;
+  }
 
   function _computeLocaleState(preferNative) {
     const stored = _readStoredPrefs();
@@ -1060,6 +1078,7 @@
       resolvedCountry,
       storefront: resolvedCountry.toLowerCase()
     };
+    _syncActiveDict();
     return _localeState;
   }
 
@@ -1067,7 +1086,9 @@
 
   function _syncHtmlLang() {
     if (typeof document !== 'undefined' && document.documentElement) {
-      document.documentElement.lang = _localeState.resolvedLang;
+      if (document.documentElement.lang !== _localeState.resolvedLang) {
+        document.documentElement.lang = _localeState.resolvedLang;
+      }
     }
   }
 
@@ -1077,30 +1098,50 @@
 
   function getConfiguredLang() {
     if (typeof PREFS !== 'undefined' && PREFS && typeof PREFS.lang === 'string') {
-      return _normalizeLangPref(PREFS.lang);
+      const p = PREFS.lang;
+      if (p === 'auto' || p === 'it' || p === 'en') return p;
+      return _normalizeLangPref(p);
     }
     return _localeState.lang;
   }
 
   function getConfiguredCountry() {
     if (typeof PREFS !== 'undefined' && PREFS && typeof PREFS.country === 'string') {
-      return _normalizeCountryPref(PREFS.country);
+      const c = PREFS.country;
+      if (c === 'auto' || (c.length === 2 && _COUNTRY_BY_CODE[c])) return c;
+      return _normalizeCountryPref(c);
     }
     return _localeState.country;
   }
 
   function getResolvedLang() {
-    const cfg = getConfiguredLang();
-    if (cfg === 'it' || cfg === 'en') {
-      _localeState.resolvedLang = cfg;
-      return cfg;
+    if (typeof PREFS !== 'undefined' && PREFS) {
+      const p = PREFS.lang;
+      if (p === 'it' || p === 'en') {
+        if (_localeState.resolvedLang !== p) {
+          _localeState.resolvedLang = p;
+          _activeDict = I18N_DICT[p];
+        }
+        return p;
+      }
+      if (p === 'auto' || p == null) {
+        return _localeState.resolvedLang || _detectBrowserLang();
+      }
+      const cfg = _normalizeLangPref(p);
+      if (cfg === 'it' || cfg === 'en') {
+        if (_localeState.resolvedLang !== cfg) {
+          _localeState.resolvedLang = cfg;
+          _activeDict = I18N_DICT[cfg];
+        }
+        return cfg;
+      }
     }
     return _localeState.resolvedLang || _detectBrowserLang();
   }
 
   function getResolvedCountry() {
     const cfg = getConfiguredCountry();
-    if (/^[A-Z]{2}$/.test(cfg)) {
+    if (cfg !== 'auto' && /^[A-Z]{2}$/.test(cfg)) {
       _localeState.resolvedCountry = cfg;
       _localeState.storefront = cfg.toLowerCase();
       return cfg;
@@ -1122,19 +1163,34 @@
   }
 
   function t(key, params) {
-    const lang = getResolvedLang();
-    const dict = I18N_DICT[lang] || I18N_DICT.en;
+    const pLang = (typeof PREFS !== 'undefined' && PREFS) ? PREFS.lang : null;
+    let dict;
+    if (pLang === 'auto' || pLang == null) {
+      dict = _activeDict;
+    } else if (pLang === 'it' || pLang === 'en') {
+      if (_localeState.resolvedLang !== pLang) {
+        _localeState.resolvedLang = pLang;
+        _activeDict = I18N_DICT[pLang];
+      }
+      dict = _activeDict;
+    } else {
+      dict = I18N_DICT[getResolvedLang()] || I18N_DICT.en;
+    }
     let raw = dict[key];
     if (raw === undefined) raw = I18N_DICT.en[key];
     if (raw === undefined) raw = I18N_DICT.it[key];
     if (raw === undefined) return String(key);
-    return _format(raw, params);
+    return params ? _format(raw, params) : raw;
   }
 
   function tPlural(count, oneKey, manyKey, params) {
     const n = Number(count);
     const key = Math.abs(n) === 1 ? oneKey : manyKey;
-    const merged = Object.assign({ count: n }, params || {});
+    if (!params) {
+      const raw = t(key);
+      return raw.indexOf('{count}') >= 0 ? raw.replace('{count}', String(n)) : raw;
+    }
+    const merged = Object.assign({ count: n }, params);
     return t(key, merged);
   }
 
@@ -1155,16 +1211,24 @@
 
   function getCountryLabel(code, lang) {
     const l = lang === 'it' || lang === 'en' ? lang : getResolvedLang();
-    const norm = _normalizeCountryPref(code);
-    const hit = I18N_COUNTRIES.find(c => c.code === norm);
-    if (hit) return hit[l] || hit.en;
-    return norm;
+    let hit = _COUNTRY_BY_CODE[code];
+    if (!hit) {
+      const norm = _normalizeCountryPref(code);
+      hit = _COUNTRY_BY_CODE[norm];
+      if (!hit) return norm;
+    }
+    return hit[l] || hit.en;
   }
 
   function applyStaticI18n(root) {
     _syncHtmlLang();
     if (typeof document === 'undefined') return;
-    const scope = root && typeof root.querySelectorAll === 'function' ? root : document;
+    const isFullDoc = !root || typeof root.querySelectorAll !== 'function';
+    const domReady = document.readyState !== 'loading';
+    if (isFullDoc && _staticI18nLang === _localeState.resolvedLang && (_staticI18nDomReady || !domReady)) {
+      return;
+    }
+    const scope = isFullDoc ? document : root;
     scope.querySelectorAll('[data-i18n]').forEach(el => {
       const k = el.getAttribute('data-i18n');
       if (k) el.textContent = t(k);
@@ -1181,6 +1245,10 @@
       const k = el.getAttribute('data-i18n-title');
       if (k) el.setAttribute('title', t(k));
     });
+    if (isFullDoc) {
+      _staticI18nLang = _localeState.resolvedLang;
+      _staticI18nDomReady = domReady;
+    }
   }
 
   function _notifyLocaleCaches(langChanged, countryChanged) {
@@ -1241,6 +1309,7 @@
         storefront: String(nativeRes.storefront || '').toLowerCase()
       };
       if (!_localeState.storefront) _localeState.storefront = _localeState.resolvedCountry.toLowerCase();
+      _syncActiveDict();
     } else {
       _computeLocaleState(false);
       if (typeof fetch === 'function' && (!opts || !opts.skipHttp)) {
@@ -1288,6 +1357,7 @@
       resolvedCountry,
       storefront: String(parsed.storefront || resolvedCountry.toLowerCase()).toLowerCase()
     };
+    _syncActiveDict();
 
     if (typeof PREFS !== 'undefined' && PREFS && typeof PREFS === 'object') {
       PREFS.lang = nextLang;

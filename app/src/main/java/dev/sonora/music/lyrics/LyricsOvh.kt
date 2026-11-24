@@ -2,6 +2,7 @@ package dev.sonora.music.lyrics
 
 import dev.sonora.music.LyricLine
 import dev.sonora.music.Lyrics
+import dev.sonora.music.SonoraHttpPool
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -13,11 +14,13 @@ import java.util.concurrent.TimeUnit
 /** Unsynced fallback lyrics client using the Lyrics.ovh REST API. */
 object LyricsOvh {
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .callTimeout(10, TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient by lazy {
+        SonoraHttpPool.baseClient.newBuilder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
 
     private const val BASE_URL = "https://api.lyrics.ovh/v1"
     private const val USER_AGENT = "SonoraMusicApp/1.0"

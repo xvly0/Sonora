@@ -68,6 +68,12 @@ object SonoraLocaleManager {
     private var prefs: android.content.SharedPreferences? = null
 
     @Volatile
+    private var cachedResLang: String? = null
+
+    @Volatile
+    private var cachedRes: android.content.res.Resources? = null
+
+    @Volatile
     var configuredLang: String = "auto"
         private set
 
@@ -238,14 +244,23 @@ object SonoraLocaleManager {
     }
 
     fun getString(context: Context, resId: Int): String {
-        val targetLocale = if (resolvedLang == "it") java.util.Locale.ITALIAN else java.util.Locale.ENGLISH
-        val cfg = android.content.res.Configuration(context.resources.configuration)
-        cfg.setLocale(targetLocale)
-        return runCatching {
-            context.createConfigurationContext(cfg).resources.getString(resId)
-        }.getOrElse {
-            context.getString(resId)
+        val lang = resolvedLang
+        val existing = if (cachedResLang == lang) cachedRes else null
+        val res = existing ?: run {
+            val appCtx = context.applicationContext ?: context
+            val targetLocale = if (lang == "it") java.util.Locale.ITALIAN else java.util.Locale.ENGLISH
+            val cfg = android.content.res.Configuration(appCtx.resources.configuration)
+            cfg.setLocale(targetLocale)
+            runCatching {
+                appCtx.createConfigurationContext(cfg).resources
+            }.getOrElse {
+                appCtx.resources
+            }.also { built ->
+                cachedRes = built
+                cachedResLang = lang
+            }
         }
+        return runCatching { res.getString(resId) }.getOrElse { context.getString(resId) }
     }
 
     private fun applyToClientsLocked() {
@@ -506,29 +521,71 @@ object HomeSubCache {
 }
 
 internal object SonoraHttpPool {
-    val connectionPool = ConnectionPool(24, 5, TimeUnit.MINUTES)
+    val connectionPool = ConnectionPool(32, 5, TimeUnit.MINUTES)
     val dispatcher = okhttp3.Dispatcher().apply {
         maxRequests = 64
         maxRequestsPerHost = 16
     }
+    val coverDispatcher = okhttp3.Dispatcher().apply {
+        maxRequests = 48
+        maxRequestsPerHost = 12
+    }
+    val baseClient: OkHttpClient = OkHttpClient.Builder()
+        .connectionPool(connectionPool)
+        .dispatcher(dispatcher)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .build()
+}
+
+private val HEX_CHARS = "0123456789abcdef".toCharArray()
+private val SHA256_LOCAL = object : ThreadLocal<MessageDigest>() {
+    override fun initialValue(): MessageDigest = MessageDigest.getInstance("SHA-256")
+}
+
+private fun sha256Hex(input: String, takeBytes: Int = 32): String {
+    val md = SHA256_LOCAL.get()!!
+    md.reset()
+    val digest = md.digest(input.toByteArray(Charsets.UTF_8))
+    val len = minOf(takeBytes, digest.size)
+    val out = CharArray(len * 2)
+    for (i in 0 until len) {
+        val v = digest[i].toInt() and 0xFF
+        out[i * 2] = HEX_CHARS[v ushr 4]
+        out[i * 2 + 1] = HEX_CHARS[v and 0x0F]
+    }
+    return String(out)
 }
 
 object SnapshotDiskCache {
     private const val PREFIX = "it_v5_"
     private const val MAX_STALE_MS = 7L * 24 * 60 * 60 * 1000L
+    private val UNSAFE_KEY_REGEX = Regex("[^A-Za-z0-9_-]")
 
     data class Snapshot(val data: String, val isFresh: Boolean)
 
     @Volatile
     private var dir: File? = null
     private val inFlight = ConcurrentHashMap<String, Boolean>()
+    private val fileSizes = ConcurrentHashMap<String, Long>()
+    @Volatile
+    private var indexReady = false
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun attach(context: Context) {
         val target = File(context.cacheDir, "sonora_api_snapshots")
         dir = target
         bgScope.launch {
-            runCatching { target.mkdirs() }
+            runCatching {
+                if (!target.exists()) target.mkdirs()
+                target.listFiles()?.forEach { f ->
+                    if (f.isFile && f.name.endsWith(".snap")) {
+                        fileSizes[f.name] = f.length()
+                    }
+                }
+                indexReady = true
+            }
         }
     }
 
@@ -537,18 +594,19 @@ object SnapshotDiskCache {
         val safe = if (key.length <= 48 && key.all { it.isLetterOrDigit() || it == '_' || it == '-' }) {
             key
         } else {
-            val digest = java.security.MessageDigest.getInstance("SHA-256")
-                .digest(key.toByteArray(Charsets.UTF_8))
-                .take(12)
-                .joinToString("") { "%02x".format(it) }
-            "${key.take(20).replace(Regex("[^A-Za-z0-9_-]"), "_")}_$digest"
+            val digest = sha256Hex(key, takeBytes = 12)
+            "${key.take(20).replace(UNSAFE_KEY_REGEX, "_")}_$digest"
         }
         return File(base, "$PREFIX$safe.snap")
     }
 
     fun get(key: String, freshTtlMs: Long): Snapshot? {
         val file = fileFor(key) ?: return null
-        if (!file.exists()) return null
+        if (indexReady && !fileSizes.containsKey(file.name)) return null
+        if (!file.exists()) {
+            fileSizes.remove(file.name)
+            return null
+        }
         return runCatching {
             val raw = file.readText(Charsets.UTF_8)
             val nl = raw.indexOf('\n')
@@ -557,6 +615,7 @@ object SnapshotDiskCache {
             val age = System.currentTimeMillis() - writtenMs
             if (age < 0L || age > MAX_STALE_MS) {
                 file.delete()
+                fileSizes.remove(file.name)
                 return@runCatching null
             }
             val payload = raw.substring(nl + 1)
@@ -569,12 +628,14 @@ object SnapshotDiskCache {
         val file = fileFor(key) ?: return
         runCatching {
             file.parentFile?.mkdirs()
-            val tmp = File(file.parentFile, "${file.name}.tmp")
-            tmp.writeText("${System.currentTimeMillis()}\n$data", Charsets.UTF_8)
+            val bytes = "${System.currentTimeMillis()}\n$data".toByteArray(Charsets.UTF_8)
+            val tmp = File(file.parentFile, "${file.name}.${Thread.currentThread().id}.tmp")
+            tmp.writeBytes(bytes)
             if (!tmp.renameTo(file)) {
-                file.writeText("${System.currentTimeMillis()}\n$data", Charsets.UTF_8)
+                file.writeBytes(bytes)
                 tmp.delete()
             }
+            fileSizes[file.name] = bytes.size.toLong()
         }
     }
 
@@ -596,6 +657,11 @@ object SnapshotDiskCache {
     }
 
     fun sizeBytes(): Long {
+        if (indexReady) {
+            var sum = 0L
+            for (v in fileSizes.values) sum += v
+            return sum
+        }
         val base = dir ?: return 0L
         if (!base.exists()) return 0L
         return base.listFiles()?.sumOf { if (it.isFile) it.length() else 0L } ?: 0L
@@ -603,9 +669,12 @@ object SnapshotDiskCache {
 
     fun clear() {
         inFlight.clear()
+        fileSizes.clear()
         val base = dir ?: return
-        runCatching {
-            base.listFiles()?.forEach { it.delete() }
+        bgScope.launch {
+            runCatching {
+                base.listFiles()?.forEach { it.delete() }
+            }
         }
     }
 }
@@ -670,8 +739,16 @@ object CoverCache {
 private object CoverDiskCache {
     class DiskCover(val mime: String, val bytes: ByteArray)
     private const val MAX_STALE_MS = 14L * 24 * 60 * 60 * 1000L
+    private const val MAX_DISK_BYTES = 128L * 1024L * 1024L
+    private const val PRUNE_TARGET_BYTES = 96L * 1024L * 1024L
+    private const val MAX_DISK_FILES = 2000
+    private const val PRUNE_TARGET_FILES = 1600
     @Volatile
     private var dir: File? = null
+    private val fileSizes = ConcurrentHashMap<String, Long>()
+    @Volatile
+    private var indexReady = false
+    private val pruneRunning = java.util.concurrent.atomic.AtomicBoolean(false)
     private val writeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun attach(cacheRootDir: File?) {
@@ -679,24 +756,35 @@ private object CoverDiskCache {
         val target = File(base, "sonora_covers_v1")
         dir = target
         writeScope.launch {
-            runCatching { target.mkdirs() }
+            runCatching {
+                if (!target.exists()) target.mkdirs()
+                target.listFiles()?.forEach { f ->
+                    if (f.isFile && f.name.endsWith(".cov")) {
+                        fileSizes[f.name] = f.length()
+                    }
+                }
+                indexReady = true
+            }
         }
     }
 
-    fun keyFor(id: String, url: String, size: Int): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-            .digest("$id:$url:$size".toByteArray(Charsets.UTF_8))
-        return digest.joinToString("") { "%02x".format(it) }
-    }
+    fun keyFor(id: String, url: String, size: Int): String =
+        sha256Hex("$id:$url:$size")
 
     fun get(cacheKey: String): DiskCover? {
         val base = dir ?: return null
-        val file = File(base, "$cacheKey.cov")
-        if (!file.exists()) return null
+        val fileName = "$cacheKey.cov"
+        if (indexReady && !fileSizes.containsKey(fileName)) return null
+        val file = File(base, fileName)
+        if (!file.exists()) {
+            fileSizes.remove(fileName)
+            return null
+        }
         return runCatching {
             val age = System.currentTimeMillis() - file.lastModified()
             if (age < 0L || age > MAX_STALE_MS) {
                 file.delete()
+                fileSizes.remove(fileName)
                 return@runCatching null
             }
             val totalLen = file.length()
@@ -747,27 +835,60 @@ private object CoverDiskCache {
                 val out = ByteArray(header.size + bytes.size)
                 System.arraycopy(header, 0, out, 0, header.size)
                 System.arraycopy(bytes, 0, out, header.size, bytes.size)
-                val file = File(base, "$cacheKey.cov")
+                val fileName = "$cacheKey.cov"
+                val file = File(base, fileName)
                 val tmp = File(base, "$cacheKey.${Thread.currentThread().id}.tmp")
                 tmp.writeBytes(out)
                 if (!tmp.renameTo(file)) {
                     file.writeBytes(out)
                     tmp.delete()
                 }
+                fileSizes[fileName] = out.size.toLong()
+                if ((fileSizes.size > MAX_DISK_FILES || sizeBytes() > MAX_DISK_BYTES) &&
+                    pruneRunning.compareAndSet(false, true)
+                ) {
+                    try {
+                        val files = base.listFiles { f -> f.isFile && f.name.endsWith(".cov") }
+                        if (files != null && files.isNotEmpty()) {
+                            files.sortBy { it.lastModified() }
+                            var remainingFiles = files.size
+                            var remainingBytes = files.sumOf { it.length() }
+                            for (f in files) {
+                                if (remainingFiles <= PRUNE_TARGET_FILES && remainingBytes <= PRUNE_TARGET_BYTES) break
+                                val len = f.length()
+                                if (f.delete()) {
+                                    fileSizes.remove(f.name)
+                                    remainingFiles--
+                                    remainingBytes -= len
+                                }
+                            }
+                        }
+                    } finally {
+                        pruneRunning.set(false)
+                    }
+                }
             }
         }
     }
 
     fun sizeBytes(): Long {
+        if (indexReady) {
+            var sum = 0L
+            for (v in fileSizes.values) sum += v
+            return sum
+        }
         val base = dir ?: return 0L
         if (!base.exists()) return 0L
         return base.listFiles()?.sumOf { if (it.isFile) it.length() else 0L } ?: 0L
     }
 
     fun clear() {
+        fileSizes.clear()
         val base = dir ?: return
-        runCatching {
-            base.listFiles()?.forEach { it.delete() }
+        writeScope.launch {
+            runCatching {
+                base.listFiles()?.forEach { it.delete() }
+            }
         }
     }
 }
@@ -781,12 +902,11 @@ object SonoraApiInterceptor {
     }
 
     @Volatile
-    private var okHttp: OkHttpClient = OkHttpClient.Builder()
-        .connectionPool(SonoraHttpPool.connectionPool)
-        .dispatcher(SonoraHttpPool.dispatcher)
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
+    private var okHttp: OkHttpClient = SonoraHttpPool.baseClient
+
+    @Volatile
+    private var coverOkHttp: OkHttpClient = SonoraHttpPool.baseClient.newBuilder()
+        .dispatcher(SonoraHttpPool.coverDispatcher)
         .build()
 
     @Volatile
@@ -797,6 +917,37 @@ object SonoraApiInterceptor {
 
     private val attachScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    private data class ApiOutcome(val status: Int, val body: String)
+    private val inFlightApi = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<ApiOutcome>>()
+    private val completeHomeSnapshots = ConcurrentHashMap<String, Boolean>()
+
+    private fun coalescedApi(
+        key: String,
+        timeoutSec: Long = 15L,
+        compute: suspend () -> ApiOutcome
+    ): WebResourceResponse {
+        val created = java.util.concurrent.CompletableFuture<ApiOutcome>()
+        val existing = inFlightApi.putIfAbsent(key, created)
+        if (existing != null) {
+            val outcome = try {
+                existing.get(timeoutSec, TimeUnit.SECONDS)
+            } catch (_: Exception) {
+                runBlocking { compute() }
+            }
+            return if (outcome.status == 200) jsonResponse(outcome.body) else errorResponse(outcome.status, outcome.body)
+        }
+        return try {
+            val outcome = runBlocking { compute() }
+            created.complete(outcome)
+            if (outcome.status == 200) jsonResponse(outcome.body) else errorResponse(outcome.status, outcome.body)
+        } catch (t: Throwable) {
+            created.completeExceptionally(t)
+            throw t
+        } finally {
+            inFlightApi.remove(key, created)
+        }
+    }
+
     fun attach(context: Context) {
         val appCtx = context.applicationContext ?: context
         appContext = appCtx
@@ -804,20 +955,21 @@ object SonoraApiInterceptor {
         SonoraDownloadManager.attach(appCtx)
         SnapshotDiskCache.attach(appCtx)
         CoverDiskCache.attach(appCtx.cacheDir)
-        try {
-            val cacheDir = File(appCtx.cacheDir, "sonora_http_cache")
-            httpCacheDir = cacheDir
-            val cache = Cache(cacheDir, 64L * 1024L * 1024L)
-            okHttp = OkHttpClient.Builder()
-                .connectionPool(SonoraHttpPool.connectionPool)
-                .dispatcher(SonoraHttpPool.dispatcher)
-                .connectTimeout(12, TimeUnit.SECONDS)
-                .readTimeout(15, TimeUnit.SECONDS)
-                .retryOnConnectionFailure(true)
-                .cache(cache)
-                .build()
-        } catch (e: Exception) {
-            android.util.Log.w("SonoraApi", "Failed to attach disk cache: ${e.message}")
+        val cacheDir = File(appCtx.cacheDir, "sonora_http_cache")
+        httpCacheDir = cacheDir
+        attachScope.launch {
+            try {
+                val cache = Cache(cacheDir, 64L * 1024L * 1024L)
+                val cachedApi = SonoraHttpPool.baseClient.newBuilder()
+                    .cache(cache)
+                    .build()
+                okHttp = cachedApi
+                coverOkHttp = cachedApi.newBuilder()
+                    .dispatcher(SonoraHttpPool.coverDispatcher)
+                    .build()
+            } catch (e: Exception) {
+                android.util.Log.w("SonoraApi", "Failed to attach disk cache: ${e.message}")
+            }
         }
     }
 
@@ -844,6 +996,8 @@ object SonoraApiInterceptor {
         HomeSubCache.clear()
         PlaylistSeedCache.clear()
         AppleCatalog.clearMemoryCache()
+        AppleCatalog.clearDiskCache()
+        completeHomeSnapshots.clear()
         homeWarmScheduled.set(false)
         CoverCache.clear()
         CoverDiskCache.clear()
@@ -851,8 +1005,10 @@ object SonoraApiInterceptor {
         LyricsLibrary.clearCache()
         canonicalSongMetaCache.clear()
         canonicalSongMissUntil.clear()
-        runCatching {
-            okHttp.cache?.evictAll()
+        attachScope.launch {
+            runCatching {
+                okHttp.cache?.evictAll()
+            }
         }
     }
 
@@ -908,7 +1064,7 @@ object SonoraApiInterceptor {
         return gl.equals("IT", ignoreCase = true) && normalizedName in ITALIAN_POPULAR_ARTISTS
     }
 
-    private val COUNTRY_CHART_LABEL_TOKENS: List<Pair<String, List<String>>> = listOf(
+    private val COUNTRY_CHART_LABEL_REGEXES: List<Pair<String, List<Regex>>> = listOf(
         "IT" to listOf("italia", "italy", "italian"),
         "US" to listOf("united states", "stati uniti", "usa"),
         "GB" to listOf("united kingdom", "regno unito"),
@@ -917,15 +1073,15 @@ object SonoraApiInterceptor {
         "ES" to listOf("spain", "spagna", "espana"),
         "JP" to listOf("japan", "giappone"),
         "BR" to listOf("brazil", "brasile", "brasil")
-    )
+    ).map { (code, tokens) -> code to tokens.map { tok -> Regex("""\b${Regex.escape(tok)}\b""") } }
 
     internal fun isMismatchedCountryPlaylist(title: String, gl: String): Boolean {
         val low = title.trim().lowercase()
         if (low.isEmpty()) return false
         val upperGl = gl.trim().uppercase()
-        for ((code, tokens) in COUNTRY_CHART_LABEL_TOKENS) {
+        for ((code, regexes) in COUNTRY_CHART_LABEL_REGEXES) {
             if (code == upperGl) continue
-            if (tokens.any { tok -> Regex("""\b${Regex.escape(tok)}\b""").containsMatchIn(low) }) {
+            if (regexes.any { it.containsMatchIn(low) }) {
                 return true
             }
         }
@@ -1009,6 +1165,31 @@ object SonoraApiInterceptor {
         """\b(soundtrack|colonna\s+sonora|motion\s+picture|original\s+score|original\s+soundtrack)\b""",
         RegexOption.IGNORE_CASE
     )
+    private val SEARCH_BAD_TERMS_Q = listOf("karaoke", "tribute", "cover", "8d", "nightcore", "parodia")
+    private val SEARCH_BAD_TERMS_NOQ = listOf("karaoke", "tribute", "8d audio", "nightcore", "parodia", "(cover)", "[cover]", "cover version")
+    private val KARAOKE_SPAM_TERMS = listOf("karaoke", "tribute", "nightcore", "8d audio", "parodia", "parody")
+    private val CLEAN_ARTIST_TOPIC_RE = Regex("(?i)\\s*-\\s*topic$")
+    private val CLEAN_ARTIST_FEAT_RE = Regex("(?i)\\b(feat|ft)\\.?.*$")
+    private val COVER_SIZE_PARAM_RE = Regex("([?&])s=\\d+\\b")
+    private val NORM_NON_ALNUM_RE = Regex("""[^a-z0-9]+""")
+    private val ITUNES_DIM_RE = Regex("""\d+x\d+bb""")
+    private val RSS_DIM_RE = Regex("""/\d+x\d+bb(-\d+)?\.""")
+    private val EP_WORD_RE = Regex("""\bep\b""")
+    private val YT_COVER_VI_RE = Regex("""^https?://i\.ytimg\.com/vi/([^/]+)/""")
+
+    @Volatile
+    private var cachedYearValue: Int = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR)
+    @Volatile
+    private var cachedYearAtMs: Long = android.os.SystemClock.elapsedRealtime()
+
+    private fun currentYearCached(): Int {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - cachedYearAtMs > 3_600_000L) {
+            cachedYearValue = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR)
+            cachedYearAtMs = now
+        }
+        return cachedYearValue
+    }
 
     private fun shouldRejectNewReleaseMetadata(
         title: String,
@@ -1021,7 +1202,7 @@ object SonoraApiInterceptor {
         if (isReissueAlbumTitle(title)) return true
         if (ALBUM_SOUNDTRACK_REGEX.containsMatchIn(title)) return true
         if (isLikelyCompilationAlbum(title, artistName = artistNames)) return true
-        val minRecentYear = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR) - 1
+        val minRecentYear = currentYearCached() - 1
         if (releaseYear != null && releaseYear in 1900 until minRecentYear) return true
         if (hasArchivalYearInTitle(title, minRecentYear)) return true
         return false
@@ -1037,11 +1218,7 @@ object SonoraApiInterceptor {
     private fun shouldFilterTrack(item: SongItem, query: String = ""): Boolean {
         val titleLow = item.title.lowercase()
         val qLow = query.lowercase()
-        val badTerms = if (qLow.isNotBlank()) {
-            listOf("karaoke", "tribute", "cover", "8d", "nightcore", "parodia")
-        } else {
-            listOf("karaoke", "tribute", "8d audio", "nightcore", "parodia", "(cover)", "[cover]", "cover version")
-        }
+        val badTerms = if (qLow.isNotBlank()) SEARCH_BAD_TERMS_Q else SEARCH_BAD_TERMS_NOQ
         if (badTerms.any { it in titleLow && (qLow.isEmpty() || it !in qLow) }) return true
         val validArtists = cleanArtistsList(item.artists)
         val combined = "${item.title} ${validArtists.joinToString(" ") { it.name }}"
@@ -1397,7 +1574,7 @@ object SonoraApiInterceptor {
             if (trackName.isBlank() || artistName.isBlank() || rawArt.isBlank()) continue
 
             val trackLow = trackName.lowercase()
-            if (listOf("karaoke", "tribute", "nightcore", "8d audio", "parodia", "parody").any {
+            if (KARAOKE_SPAM_TERMS.any {
                     it in trackLow && it !in titleLow && it !in cleanTitle.lowercase()
                 }
             ) {
@@ -1554,7 +1731,7 @@ object SonoraApiInterceptor {
         }
 
         val chosen = bestItem?.takeIf { bestScore > 0 } ?: return null
-        val artHq = chosen.raw.artworkUrl100.trim().replace(Regex("""\d+x\d+bb"""), "1200x1200bb")
+        val artHq = chosen.raw.artworkUrl100.trim().replace(ITUNES_DIM_RE, "1200x1200bb")
         val coverUrl = "/api/cover?u=${URLEncoder.encode(artHq, "UTF-8")}&s=544"
         val rawAlbum = chosen.raw.collectionName.trim()
         val cleanAlbum = rawAlbum.replace(SINGLE_OR_EP_SUFFIX_REGEX, "").trim().ifBlank { rawAlbum }
@@ -1744,15 +1921,15 @@ object SonoraApiInterceptor {
     }
 
     private fun cleanArtistKey(name: String): String = name
-        .replace(Regex("(?i)\\s*-\\s*topic$"), "")
-        .replace(Regex("(?i)\\b(feat|ft)\\.?.*$"), "")
+        .replace(CLEAN_ARTIST_TOPIC_RE, "")
+        .replace(CLEAN_ARTIST_FEAT_RE, "")
         .trim()
 
     private fun upgradeArtistThumbSize(url: String, size: Int = 544): String =
-        url.replace(Regex("([?&])s=\\d+\\b"), "$1s=$size")
+        url.replace(COVER_SIZE_PARAM_RE, "$1s=$size")
 
     internal fun resizeCoverApiUrl(url: String, size: Int): String =
-        url.replace(Regex("([?&])s=\\d+\\b"), "$1s=$size")
+        url.replace(COVER_SIZE_PARAM_RE, "$1s=$size")
 
     private val ALBUM_CLEAN_RE = Regex(
         """\s*[(\[][^)\]]*(?:deluxe|expanded|remaster|bonus|edition|version|anniversary|explicit|clean)[^)\]]*[)\]]""",
@@ -1805,10 +1982,10 @@ object SonoraApiInterceptor {
         val canonical = upgradeArtistThumbSize(thumbUrl, 544)
         val primary = clean.ifEmpty { rawTrim }
         HomeSubCache.putArtistThumb(primary, canonical)
-        SnapshotDiskCache.put("artthumb:${primary.lowercase()}", canonical)
+        SnapshotDiskCache.putAsync("artthumb:${primary.lowercase()}", canonical)
         if (rawTrim.isNotEmpty() && !rawTrim.equals(primary, ignoreCase = true)) {
             HomeSubCache.putArtistThumb(rawTrim, canonical)
-            SnapshotDiskCache.put("artthumb:${rawTrim.lowercase()}", canonical)
+            SnapshotDiskCache.putAsync("artthumb:${rawTrim.lowercase()}", canonical)
         }
     }
 
@@ -1997,11 +2174,25 @@ object SonoraApiInterceptor {
         if (SonoraLocaleManager.resolvedLang == "it") itMsg else enMsg
 
     fun handle(uri: Uri, requestHeaders: Map<String, String> = emptyMap()): WebResourceResponse {
-        ensureLocale()
         val path = uri.path ?: ""
+        if (path == "/api/cover") {
+            return try {
+                handleCover(
+                    uri.getQueryParameter("u").orEmpty(),
+                    uri.getQueryParameter("s")?.toIntOrNull() ?: 544,
+                    uri.getQueryParameter("id").orEmpty(),
+                )
+            } catch (e: Exception) {
+                android.util.Log.e("SonoraApi", "Error handling $path: ${e.message}", e)
+                errorResponse(500, e.message ?: localizedMsg("Errore interno", "Internal error"))
+            }
+        }
+        if (path == "/api/health") {
+            return handleHealth()
+        }
+        ensureLocale()
         return try {
             when {
-                path == "/api/health" -> handleHealth()
                 path == "/api/locale" -> handleLocale(uri, requestHeaders)
                 path == "/api/home" -> handleHome(uri)
                 path == "/api/search" -> handleSearch(
@@ -2037,11 +2228,6 @@ object SonoraApiInterceptor {
                 path.startsWith("/api/radio/") -> handleRadio(path.removePrefix("/api/radio/"))
                 path == "/api/charts" -> handleCharts()
                 path.startsWith("/api/lyrics/") -> handleLyrics(path.removePrefix("/api/lyrics/"), uri)
-                path == "/api/cover" -> handleCover(
-                    uri.getQueryParameter("u").orEmpty(),
-                    uri.getQueryParameter("s")?.toIntOrNull() ?: 544,
-                    uri.getQueryParameter("id").orEmpty(),
-                )
                 path.startsWith("/api/prefetch/") -> handlePrefetch(path.removePrefix("/api/prefetch/"))
                 path.startsWith("/api/download_track/") -> handleDownloadTrack(path.removePrefix("/api/download_track/"), uri)
                 path.startsWith("/api/remove_download/") -> handleRemoveDownload(path.removePrefix("/api/remove_download/"))
@@ -2361,70 +2547,56 @@ object SonoraApiInterceptor {
         val releaseDate: String? = null,
     )
 
-    private fun fetchAppleMarketingEntries(url: String, limit: Int): List<StorefrontRssEntry> {
+    private suspend fun fetchAppleMarketingEntries(url: String, limit: Int): List<StorefrontRssEntry> {
+        val (body, ok) = fetchItunesSearchJson(url)
+        if (!ok || body.isNullOrBlank()) return emptyList()
         return runCatching {
-            val req = Request.Builder()
-                .url(url)
-                .header("Accept", "application/json")
-                .build()
-            okHttp.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use emptyList()
-                val body = resp.body?.string().orEmpty()
-                if (body.isBlank()) return@use emptyList()
-                val results = JSONObject(body).optJSONObject("feed")?.optJSONArray("results")
-                    ?: return@use emptyList()
-                val out = ArrayList<StorefrontRssEntry>(minOf(limit, results.length()))
-                for (i in 0 until minOf(limit, results.length())) {
-                    val e = results.optJSONObject(i) ?: continue
-                    val title = e.optString("name").trim()
-                    val artist = e.optString("artistName").trim()
-                    if (title.isEmpty() || artist.isEmpty()) continue
-                    val rawArt = e.optString("artworkUrl100").trim()
-                    val hqArt = rawArt.takeIf { it.isNotBlank() }
-                        ?.replace(Regex("""/\d+x\d+bb(-\d+)?\."""), "/544x544bb$1.")
-                    val releaseDate = e.optString("releaseDate").trim().takeIf { it.isNotEmpty() }
-                    out.add(StorefrontRssEntry(title, artist, hqArt, releaseDate))
-                }
-                out
+            val results = JSONObject(body).optJSONObject("feed")?.optJSONArray("results")
+                ?: return@runCatching emptyList()
+            val out = ArrayList<StorefrontRssEntry>(minOf(limit, results.length()))
+            for (i in 0 until minOf(limit, results.length())) {
+                val e = results.optJSONObject(i) ?: continue
+                val title = e.optString("name").trim()
+                val artist = e.optString("artistName").trim()
+                if (title.isEmpty() || artist.isEmpty()) continue
+                val rawArt = e.optString("artworkUrl100").trim()
+                val hqArt = rawArt.takeIf { it.isNotBlank() }
+                    ?.replace(RSS_DIM_RE, "/544x544bb$1.")
+                val releaseDate = e.optString("releaseDate").trim().takeIf { it.isNotEmpty() }
+                out.add(StorefrontRssEntry(title, artist, hqArt, releaseDate))
             }
+            out
         }.getOrDefault(emptyList())
     }
 
-    private fun fetchItunesRssEntries(url: String, limit: Int): List<StorefrontRssEntry> {
+    private suspend fun fetchItunesRssEntries(url: String, limit: Int): List<StorefrontRssEntry> {
+        val (body, ok) = fetchItunesSearchJson(url)
+        if (!ok || body.isNullOrBlank()) return emptyList()
         return runCatching {
-            val req = Request.Builder()
-                .url(url)
-                .header("Accept", "application/json")
-                .build()
-            okHttp.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use emptyList()
-                val body = resp.body?.string().orEmpty()
-                if (body.isBlank()) return@use emptyList()
-                val feed = JSONObject(body).optJSONObject("feed") ?: return@use emptyList()
-                val rawObj = feed.opt("entry")
-                val entries = when (rawObj) {
-                    is JSONArray -> rawObj
-                    is JSONObject -> JSONArray().apply { put(rawObj) }
-                    else -> return@use emptyList()
-                }
-                val out = ArrayList<StorefrontRssEntry>(minOf(limit, entries.length()))
-                for (i in 0 until minOf(limit, entries.length())) {
-                    val e = entries.optJSONObject(i) ?: continue
-                    val title = e.optJSONObject("im:name")?.optString("label")?.trim().orEmpty()
-                    val artist = e.optJSONObject("im:artist")?.optString("label")?.trim().orEmpty()
-                    if (title.isEmpty() || artist.isEmpty()) continue
-                    val imgs = e.optJSONArray("im:image")
-                    val rawArt = if (imgs != null && imgs.length() > 0) {
-                        imgs.optJSONObject(imgs.length() - 1)?.optString("label")?.trim()
-                    } else null
-                    val hqArt = rawArt?.takeIf { it.isNotBlank() }
-                        ?.replace(Regex("""/\d+x\d+bb(-\d+)?\."""), "/544x544bb$1.")
-                    val releaseDate = e.optJSONObject("im:releaseDate")?.optString("label")?.trim()
-                        ?.takeIf { it.isNotEmpty() }
-                    out.add(StorefrontRssEntry(title, artist, hqArt, releaseDate))
-                }
-                out
+            val feed = JSONObject(body).optJSONObject("feed") ?: return@runCatching emptyList()
+            val rawObj = feed.opt("entry")
+            val entries = when (rawObj) {
+                is JSONArray -> rawObj
+                is JSONObject -> JSONArray().apply { put(rawObj) }
+                else -> return@runCatching emptyList()
             }
+            val out = ArrayList<StorefrontRssEntry>(minOf(limit, entries.length()))
+            for (i in 0 until minOf(limit, entries.length())) {
+                val e = entries.optJSONObject(i) ?: continue
+                val title = e.optJSONObject("im:name")?.optString("label")?.trim().orEmpty()
+                val artist = e.optJSONObject("im:artist")?.optString("label")?.trim().orEmpty()
+                if (title.isEmpty() || artist.isEmpty()) continue
+                val imgs = e.optJSONArray("im:image")
+                val rawArt = if (imgs != null && imgs.length() > 0) {
+                    imgs.optJSONObject(imgs.length() - 1)?.optString("label")?.trim()
+                } else null
+                val hqArt = rawArt?.takeIf { it.isNotBlank() }
+                    ?.replace(RSS_DIM_RE, "/544x544bb$1.")
+                val releaseDate = e.optJSONObject("im:releaseDate")?.optString("label")?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                out.add(StorefrontRssEntry(title, artist, hqArt, releaseDate))
+            }
+            out
         }.getOrDefault(emptyList())
     }
 
@@ -2812,7 +2984,7 @@ object SonoraApiInterceptor {
         }
         val aids = artistsParam.split(',', ' ', ';')
             .map { it.trim() }
-            .filter { it.matches(Regex("UC[\\w-]{10,40}")) }
+            .filter { YT_ARTIST_ID_REGEX.matches(it) }
             .take(3)
 
         val explicitForeign = SonoraLocaleManager.isExplicitForeignRegion()
@@ -2855,7 +3027,7 @@ object SonoraApiInterceptor {
                 }
             }
         } else null
-        val seedDeferred = if (!explicitForeign && seed.isNotBlank() && seed.matches(Regex("^[A-Za-z0-9_-]{11}$"))) {
+        val seedDeferred = if (!explicitForeign && seed.isNotBlank() && YT_VIDEO_ID_REGEX.matches(seed)) {
             async(Dispatchers.IO) {
                 YouTube.next(WatchEndpoint(videoId = seed)).getOrNull()
             }
@@ -3024,6 +3196,12 @@ object SonoraApiInterceptor {
             )
         }
 
+        val quickArrDef = if (finalQuickSongs.isNotEmpty()) {
+            async(Dispatchers.IO) {
+                enrichSongsToJson(finalQuickSongs, maxResolve = 20, thumbSize = HOME_THUMB_SIZE, budgetMs = 1800L)
+            }
+        } else null
+
         run {
             val seenAlbKeys = HashSet<String>()
             val pendingHomeAlbums = mutableListOf<Pair<String, String>>()
@@ -3047,7 +3225,7 @@ object SonoraApiInterceptor {
                 val aName = artistRes.artist.title
                 for (sec in artistRes.sections) {
                     val secTitle = sec.title.lowercase()
-                    if (secTitle.contains("album") || secTitle.contains("single") || secTitle.contains("singol") || Regex("""\bep\b""").containsMatchIn(secTitle)) {
+                    if (secTitle.contains("album") || secTitle.contains("single") || secTitle.contains("singol") || EP_WORD_RE.containsMatchIn(secTitle)) {
                         for (item in sec.items) {
                             if (item is AlbumItem) {
                                 val itemArt = cleanArtistsList(item.artists).firstOrNull()?.name ?: item.artists?.firstOrNull()?.name ?: aName
@@ -3077,22 +3255,25 @@ object SonoraApiInterceptor {
             }
             if (pendingHomeAlbums.isNotEmpty() || pendingHomeArtists.isNotEmpty()) {
                 val sem = Semaphore(6)
+                // Launch in attachScope so stragglers continue warming cache even after the 1800ms response budget.
                 val albDefs = pendingHomeAlbums.map { (title, artist) ->
-                    async(Dispatchers.IO) {
+                    attachScope.async {
                         sem.withPermit {
                             withTimeoutOrNull(2200L) { resolveAlbumThumb(title, artist, HOME_THUMB_SIZE) }
                         }
                     }
                 }
                 val artDefs = pendingHomeArtists.map { art ->
-                    async(Dispatchers.IO) {
+                    attachScope.async {
                         sem.withPermit {
                             withTimeoutOrNull(1500L) { resolveArtistThumb(art.title) }
                         }
                     }
                 }
-                albDefs.awaitAll()
-                artDefs.awaitAll()
+                withTimeoutOrNull(1800L) {
+                    albDefs.awaitAll()
+                    artDefs.awaitAll()
+                }
             }
         }
 
@@ -3130,8 +3311,8 @@ object SonoraApiInterceptor {
             }
         }
 
-        if (finalQuickSongs.isNotEmpty()) {
-            val quickArr = enrichSongsToJson(finalQuickSongs, maxResolve = 20, thumbSize = HOME_THUMB_SIZE)
+        if (quickArrDef != null) {
+            val quickArr = quickArrDef.await()
             for (i in 0 until quickArr.length()) {
                 quickArr.optJSONObject(i)?.put("kind", "track")
             }
@@ -3197,7 +3378,7 @@ object SonoraApiInterceptor {
             val albArr = JSONArray()
             for (sec in artistRes.sections) {
                 val secTitle = sec.title.lowercase()
-                if (secTitle.contains("album") || secTitle.contains("single") || secTitle.contains("singol") || Regex("""\bep\b""").containsMatchIn(secTitle)) {
+                if (secTitle.contains("album") || secTitle.contains("single") || secTitle.contains("singol") || EP_WORD_RE.containsMatchIn(secTitle)) {
                     for (item in sec.items) {
                         if (item is AlbumItem && albArr.length() < 14) {
                             val hqAlb = peekCachedAlbumThumb(item.title, name, HOME_THUMB_SIZE)
@@ -3260,7 +3441,7 @@ object SonoraApiInterceptor {
         true
     }.getOrDefault(true)
 
-    private fun handleHome(uri: Uri): WebResourceResponse = runBlocking {
+    private fun handleHome(uri: Uri): WebResourceResponse {
         val noSeed = uri.getQueryParameter("noSeed") == "1"
         val seed = if (noSeed) "" else uri.getQueryParameter("seed").orEmpty()
         val artistsParam = uri.getQueryParameter("artists").orEmpty()
@@ -3271,7 +3452,7 @@ object SonoraApiInterceptor {
         val cacheKey = "home_v15:$locKey:$seed:$artistsParam"
 
         if (!forceRefresh) {
-            ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
+            ApiCache.get(cacheKey)?.let { return jsonResponse(it) }
         }
 
         val normalizedArtists = artistsParam.split(',', ' ', ';')
@@ -3287,7 +3468,8 @@ object SonoraApiInterceptor {
         if (!forceRefresh) {
             val disk = SnapshotDiskCache.get(snapshotKey, freshTtlMs = 600_000L)
             if (disk != null) {
-                val completeDisk = homeHasAppleNewReleases(disk.data)
+                val completeDisk = completeHomeSnapshots[snapshotKey]
+                    ?: homeHasAppleNewReleases(disk.data).also { completeHomeSnapshots[snapshotKey] = it }
                 val needsImmediateHeal = !completeDisk
                 if (disk.isFresh && !needsImmediateHeal) {
                     ApiCache.put(cacheKey, disk.data, 300)
@@ -3302,18 +3484,21 @@ object SonoraApiInterceptor {
                         if (valid && SonoraLocaleManager.cacheTag() == locKey) {
                             ApiCache.put(cacheKey, fresh, if (completeFresh) 600 else 20)
                             if (completeFresh) {
+                                completeHomeSnapshots[snapshotKey] = true
+                                completeHomeSnapshots[lastGoodKey] = true
                                 SnapshotDiskCache.put(snapshotKey, fresh)
                                 SnapshotDiskCache.put(lastGoodKey, fresh)
                             }
                         }
                     }
                 }
-                return@runBlocking jsonResponse(disk.data)
+                return jsonResponse(disk.data)
             }
 
             val lastGood = SnapshotDiskCache.get(lastGoodKey, freshTtlMs = 600_000L)
             if (lastGood != null) {
-                val completeLast = homeHasAppleNewReleases(lastGood.data)
+                val completeLast = completeHomeSnapshots[lastGoodKey]
+                    ?: homeHasAppleNewReleases(lastGood.data).also { completeHomeSnapshots[lastGoodKey] = it }
                 val needsImmediateHeal = !completeLast
                 ApiCache.put(cacheKey, lastGood.data, if (needsImmediateHeal) 15 else 60)
                 if (!lastGood.isFresh || normalizedArtists.isNotEmpty() || needsImmediateHeal) {
@@ -3326,28 +3511,39 @@ object SonoraApiInterceptor {
                         if (valid && SonoraLocaleManager.cacheTag() == locKey) {
                             ApiCache.put(cacheKey, fresh, if (completeFresh) 600 else 20)
                             if (completeFresh) {
+                                completeHomeSnapshots[snapshotKey] = true
+                                completeHomeSnapshots[lastGoodKey] = true
                                 SnapshotDiskCache.put(snapshotKey, fresh)
                                 SnapshotDiskCache.put(lastGoodKey, fresh)
                             }
                         }
                     }
                 }
-                return@runBlocking jsonResponse(lastGood.data)
+                return jsonResponse(lastGood.data)
             }
         } else {
             HomeSubCache.clearLocaleKey(locKey, gl)
+            completeHomeSnapshots.remove(snapshotKey)
         }
 
-        val (rootStr, valid) = buildHomeJson(seed, artistsParam, locKey, gl, hl)
-        if (valid && SonoraLocaleManager.cacheTag() == locKey) {
-            val completeFresh = homeHasAppleNewReleases(rootStr)
-            ApiCache.put(cacheKey, rootStr, if (completeFresh) 600 else 20)
-            if (completeFresh) {
-                SnapshotDiskCache.putAsync(snapshotKey, rootStr)
-                SnapshotDiskCache.putAsync(lastGoodKey, rootStr)
+        val flightKey = if (forceRefresh) "home_refresh:$cacheKey" else "home:$cacheKey"
+        return coalescedApi(flightKey) {
+            if (!forceRefresh) {
+                ApiCache.get(cacheKey)?.let { return@coalescedApi ApiOutcome(200, it) }
             }
+            val (rootStr, valid) = buildHomeJson(seed, artistsParam, locKey, gl, hl)
+            if (valid && SonoraLocaleManager.cacheTag() == locKey) {
+                val completeFresh = homeHasAppleNewReleases(rootStr)
+                ApiCache.put(cacheKey, rootStr, if (completeFresh) 600 else 20)
+                if (completeFresh) {
+                    completeHomeSnapshots[snapshotKey] = true
+                    completeHomeSnapshots[lastGoodKey] = true
+                    SnapshotDiskCache.putAsync(snapshotKey, rootStr)
+                    SnapshotDiskCache.putAsync(lastGoodKey, rootStr)
+                }
+            }
+            ApiOutcome(200, rootStr)
         }
-        jsonResponse(rootStr)
     }
 
     private suspend fun resolveArtistThumb(name: String, rawThumb: String? = null, size: Int = 544): String? {
@@ -3371,9 +3567,9 @@ object SonoraApiInterceptor {
 
     private fun normSearchKey(s: String): String {
         val nfd = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
-        return nfd.replace(Regex("""\p{InCombiningDiacriticalMarks}+"""), "")
+        return nfd.replace(COMBINING_MARKS_REGEX, "")
             .lowercase()
-            .replace(Regex("""[^a-z0-9]+"""), " ")
+            .replace(NORM_NON_ALNUM_RE, " ")
             .trim()
     }
 
@@ -3561,86 +3757,60 @@ object SonoraApiInterceptor {
             val artistName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
             peekCachedAlbumThumb(alb.title, artistName, 544) == null
         }
-        val songFallbackThumbs = HashMap<Int, String>()
-        val (canonicalOverrides, resolvedArtistThumbs, resolvedAlbumThumbs) =
-            if (canonicalTargets.isEmpty() && artistThumbTargets.isEmpty() && albumThumbTargets.isEmpty()) {
-                Triple(emptyMap<Int, CanonicalSongMeta>(), emptyMap<String, String>(), emptyMap<String, String>())
-            } else {
-                coroutineScope {
-                    val songSem = Semaphore(8)
-                    val songDefs = canonicalTargets.map { (idx, triple) ->
-                        async(Dispatchers.IO) {
-                            val (song, firstArtist, hintAlb) = triple
-                            val meta = songSem.withPermit {
-                                withTimeoutOrNull(3000L) {
-                                    resolveCanonicalSongMeta(song.title, firstArtist, hintAlb)
-                                }
-                            }
-                            if (meta != null) {
-                                idx to (meta to null)
-                            } else if (hintAlb.isNotBlank()) {
-                                val fallbackAlb = songSem.withPermit {
-                                    withTimeoutOrNull(1200L) {
-                                        resolveAlbumThumb(hintAlb, firstArtist, 544)
-                                    }
-                                }
-                                fallbackAlb?.let { idx to (null to it) }
-                            } else {
-                                null
-                            }
+        val songFallbackThumbs = ConcurrentHashMap<Int, String>()
+        val canonMap = ConcurrentHashMap<Int, CanonicalSongMeta>()
+        val resolvedArtistThumbs = ConcurrentHashMap<String, String>()
+        val resolvedAlbumThumbs = ConcurrentHashMap<String, String>()
+        if (canonicalTargets.isNotEmpty() || artistThumbTargets.isNotEmpty() || albumThumbTargets.isNotEmpty()) {
+            val songSem = Semaphore(8)
+            val songDefs = canonicalTargets.map { (idx, triple) ->
+                attachScope.async {
+                    val (song, firstArtist, hintAlb) = triple
+                    val meta = songSem.withPermit {
+                        withTimeoutOrNull(3000L) {
+                            resolveCanonicalSongMeta(song.title, firstArtist, hintAlb)
                         }
                     }
-                    val artistDefs = artistThumbTargets.map { artistItem ->
-                        async(Dispatchers.IO) {
-                            val thumb = withTimeoutOrNull(1400L) {
-                                resolveArtistThumb(artistItem.title, size = 544)
+                    if (meta != null) {
+                        canonMap[idx] = meta
+                    } else if (hintAlb.isNotBlank()) {
+                        val fallbackAlb = songSem.withPermit {
+                            withTimeoutOrNull(1200L) {
+                                resolveAlbumThumb(hintAlb, firstArtist, 544)
                             }
-                            thumb?.let { artistItem.id to it }
                         }
+                        if (fallbackAlb != null) songFallbackThumbs[idx] = fallbackAlb
                     }
-                    val albumDefs = albumThumbTargets.map { alb ->
-                        val artistName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
-                        async(Dispatchers.IO) {
-                            val thumb = withTimeoutOrNull(1400L) {
-                                resolveAlbumThumb(alb.title, artistName, 544)
-                            }
-                            thumb?.let { alb.browseId to it }
-                        }
-                    }
-                    val canonMap = HashMap<Int, CanonicalSongMeta>()
-                    for (entry in songDefs.awaitAll().filterNotNull()) {
-                        val (idx, pair) = entry
-                        pair.first?.let { canonMap[idx] = it }
-                        pair.second?.let { songFallbackThumbs[idx] = it }
-                    }
-                    Triple(
-                        canonMap,
-                        artistDefs.awaitAll().filterNotNull().toMap(),
-                        albumDefs.awaitAll().filterNotNull().toMap()
-                    )
                 }
             }
+            val artistDefs = artistThumbTargets.map { artistItem ->
+                attachScope.async {
+                    val thumb = withTimeoutOrNull(1400L) {
+                        resolveArtistThumb(artistItem.title, size = 544)
+                    }
+                    if (thumb != null) resolvedArtistThumbs[artistItem.id] = thumb
+                }
+            }
+            val albumDefs = albumThumbTargets.map { alb ->
+                val artistName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
+                attachScope.async {
+                    val thumb = withTimeoutOrNull(1400L) {
+                        resolveAlbumThumb(alb.title, artistName, 544)
+                    }
+                    if (thumb != null) resolvedAlbumThumbs[alb.browseId] = thumb
+                }
+            }
+            withTimeoutOrNull(1800L) {
+                songDefs.awaitAll()
+                artistDefs.awaitAll()
+                albumDefs.awaitAll()
+            }
+        }
         val songsArr = JSONArray()
         topSongs.forEachIndexed { idx, song ->
-            val obj = song.toJson()
-            val override = canonicalOverrides[idx]
-            if (override != null) {
-                obj.put("thumb", resizeCoverApiUrl(override.coverUrl, 544))
-                val curAlb = song.album?.name?.trim().orEmpty()
-                val firstArtist = primaryArtistName(song)
-                val albumReplaced = override.albumName.isNotBlank() && (
-                    curAlb.isEmpty() ||
-                        isLikelyCompilationAlbum(curAlb, song.title, firstArtist) ||
-                        normAlbumCacheKey(curAlb, firstArtist) != normAlbumCacheKey(override.albumName, firstArtist)
-                    )
-                if (albumReplaced) {
-                    obj.put("album", override.albumName)
-                    if (curAlb.isNotEmpty()) obj.put("albumId", JSONObject.NULL)
-                } else if (curAlb.isNotEmpty() && isLikelyCompilationAlbum(curAlb, song.title, firstArtist)) {
-                    obj.put("albumId", JSONObject.NULL)
-                }
-                obj.put("canonicalCover", true)
-            } else {
+            val override = canonMap[idx]
+            val obj = song.toJson(preResolvedCanonical = override, skipCanonicalPeek = override != null)
+            if (override == null) {
                 val fbThumb = songFallbackThumbs[idx] ?: run {
                     val albName = song.album?.name?.trim().orEmpty()
                     val firstArtist = primaryArtistName(song)
@@ -3684,10 +3854,10 @@ object SonoraApiInterceptor {
         return root.toString() to valid
     }
 
-    private fun handleSearch(q: String, typeParam: String = "all"): WebResourceResponse = runBlocking {
+    private fun handleSearch(q: String, typeParam: String = "all"): WebResourceResponse {
         val cleanQ = q.trim()
         val type = if (typeParam.isBlank()) "all" else typeParam
-        if (cleanQ.isBlank()) return@runBlocking jsonResponse(JSONObject().apply {
+        if (cleanQ.isBlank()) return jsonResponse(JSONObject().apply {
             put("q", cleanQ)
             put("topKind", "songs")
             put("songs", JSONArray())
@@ -3698,7 +3868,7 @@ object SonoraApiInterceptor {
 
         val locKey = SonoraLocaleManager.cacheTag()
         val cacheKey = "search_v14:$locKey:$type:${cleanQ.lowercase()}"
-        ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
+        ApiCache.get(cacheKey)?.let { return jsonResponse(it) }
 
         val disk = SnapshotDiskCache.get(cacheKey, freshTtlMs = 1_800_000L)
         if (disk != null) {
@@ -3716,19 +3886,22 @@ object SonoraApiInterceptor {
                     }
                 }
             }
-            return@runBlocking jsonResponse(disk.data)
+            return jsonResponse(disk.data)
         }
 
-        val (rootStr, valid) = buildSearchJson(cleanQ, type)
-        if (valid && SonoraLocaleManager.cacheTag() == locKey) {
-            if (AppleCatalog.hasReadyToken()) {
-                ApiCache.put(cacheKey, rootStr, 600)
-                SnapshotDiskCache.put(cacheKey, rootStr)
-            } else {
-                ApiCache.put(cacheKey, rootStr, 10)
+        return coalescedApi("search:$cacheKey") {
+            ApiCache.get(cacheKey)?.let { return@coalescedApi ApiOutcome(200, it) }
+            val (rootStr, valid) = buildSearchJson(cleanQ, type)
+            if (valid && SonoraLocaleManager.cacheTag() == locKey) {
+                if (AppleCatalog.hasReadyToken()) {
+                    ApiCache.put(cacheKey, rootStr, 600)
+                    SnapshotDiskCache.putAsync(cacheKey, rootStr)
+                } else {
+                    ApiCache.put(cacheKey, rootStr, 10)
+                }
             }
+            ApiOutcome(200, rootStr)
         }
-        jsonResponse(rootStr)
     }
 
     private fun handleSuggest(q: String): WebResourceResponse = runBlocking {
@@ -3748,228 +3921,239 @@ object SonoraApiInterceptor {
         jsonResponse(rootStr)
     }
 
-    private fun handleAlbum(id: String, uri: Uri): WebResourceResponse = runBlocking {
+    private fun handleAlbum(id: String, uri: Uri): WebResourceResponse {
         val locKey = SonoraLocaleManager.cacheTag()
         val cacheKey = "album_v4:$locKey:$id"
-        ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
+        ApiCache.get(cacheKey)?.let { return jsonResponse(it) }
 
         val hintTitle = uri.getQueryParameter("title")?.trim().orEmpty()
         val hintArtist = uri.getQueryParameter("artist")?.trim().orEmpty()
 
-        val (albumResult, hintAppleAlbum) = coroutineScope {
-            val albumDeferred = async(Dispatchers.IO) { YouTube.album(id).getOrNull() }
-            val appleDeferred = if (hintTitle.isNotBlank()) {
-                async(Dispatchers.IO) { AppleCatalog.album(hintTitle, hintArtist) }
-            } else null
-            albumDeferred.await() to appleDeferred?.await()
-        }
+        return coalescedApi("album:$cacheKey") {
+            ApiCache.get(cacheKey)?.let { return@coalescedApi ApiOutcome(200, it) }
+            val (albumResult, hintAppleAlbum) = coroutineScope {
+                val albumDeferred = async(Dispatchers.IO) { YouTube.album(id).getOrNull() }
+                val appleDeferred = if (hintTitle.isNotBlank()) {
+                    async(Dispatchers.IO) { AppleCatalog.album(hintTitle, hintArtist) }
+                } else null
+                albumDeferred.await() to appleDeferred?.await()
+            }
 
-        if (albumResult != null) {
-            val artistName = albumResult.album.artists?.joinToString(", ") { it.name }.orEmpty()
-            val json = albumResult.album.toJson(withTracks = true, songs = albumResult.songs, thumbSize = 1200)
-            val resolvedApple = hintAppleAlbum ?: run {
-                val exactMatch = hintTitle.equals(albumResult.album.title, ignoreCase = true) &&
-                    (hintArtist.isNotBlank() || artistName.isBlank())
-                if (hintTitle.isNotBlank() && exactMatch) null
-                else AppleCatalog.album(albumResult.album.title, artistName)
-            }
-            val appleCover = resolvedApple?.coverUrl
-            val cachedApple = if (appleCover == null) {
-                peekCachedAlbumThumb(albumResult.album.title, artistName, 1200)
-                    ?: (if (hintTitle.isNotBlank()) peekCachedAlbumThumb(hintTitle, hintArtist, 1200) else null)
-            } else null
-            val albumThumb = if (appleCover != null) {
-                "/api/cover?u=${URLEncoder.encode(appleCover, "UTF-8")}&s=1200".also { u ->
-                    rememberResolvedAlbumThumb(albumResult.album.title, artistName, u)
-                    if (hintTitle.isNotBlank()) rememberResolvedAlbumThumb(hintTitle, hintArtist, u)
+            if (albumResult != null) {
+                val artistName = albumResult.album.artists?.joinToString(", ") { it.name }.orEmpty()
+                val json = albumResult.album.toJson(withTracks = true, songs = albumResult.songs, thumbSize = 1200)
+                val resolvedApple = hintAppleAlbum ?: run {
+                    val exactMatch = hintTitle.equals(albumResult.album.title, ignoreCase = true) &&
+                        (hintArtist.isNotBlank() || artistName.isBlank())
+                    if (hintTitle.isNotBlank() && exactMatch) null
+                    else AppleCatalog.album(albumResult.album.title, artistName)
                 }
-            } else {
-                cachedApple ?: upgradeThumb(albumResult.album.thumbnail, 1200) ?: json.optString("thumb")
-            }
-            val isAppleAlb = appleCover != null || cachedApple != null
-            if (albumThumb.isNotBlank()) {
-                json.put("thumb", albumThumb)
-                val tracks = json.optJSONArray("tracks")
-                if (tracks != null) {
-                    val trackThumb = resizeCoverApiUrl(albumThumb, 544)
-                    val hue = json.optInt("hue", 100)
-                    val style = json.optInt("style", 1)
-                    for (i in 0 until tracks.length()) {
-                        val tr = tracks.optJSONObject(i)
-                        if (tr != null) {
-                            tr.put("thumb", trackThumb)
-                            tr.put("hue", hue)
-                            tr.put("style", style)
-                            if (isAppleAlb) tr.put("canonicalCover", true)
+                val appleCover = resolvedApple?.coverUrl
+                val cachedApple = if (appleCover == null) {
+                    peekCachedAlbumThumb(albumResult.album.title, artistName, 1200)
+                        ?: (if (hintTitle.isNotBlank()) peekCachedAlbumThumb(hintTitle, hintArtist, 1200) else null)
+                } else null
+                val albumThumb = if (appleCover != null) {
+                    "/api/cover?u=${URLEncoder.encode(appleCover, "UTF-8")}&s=1200".also { u ->
+                        rememberResolvedAlbumThumb(albumResult.album.title, artistName, u)
+                        if (hintTitle.isNotBlank()) rememberResolvedAlbumThumb(hintTitle, hintArtist, u)
+                    }
+                } else {
+                    cachedApple ?: upgradeThumb(albumResult.album.thumbnail, 1200) ?: json.optString("thumb")
+                }
+                val isAppleAlb = appleCover != null || cachedApple != null
+                if (albumThumb.isNotBlank()) {
+                    json.put("thumb", albumThumb)
+                    val tracks = json.optJSONArray("tracks")
+                    if (tracks != null) {
+                        val trackThumb = resizeCoverApiUrl(albumThumb, 544)
+                        val hue = json.optInt("hue", 100)
+                        val style = json.optInt("style", 1)
+                        for (i in 0 until tracks.length()) {
+                            val tr = tracks.optJSONObject(i)
+                            if (tr != null) {
+                                tr.put("thumb", trackThumb)
+                                tr.put("hue", hue)
+                                tr.put("style", style)
+                                if (isAppleAlb) tr.put("canonicalCover", true)
+                            }
                         }
                     }
                 }
+                val jsonStr = json.toString()
+                ApiCache.put(cacheKey, jsonStr, if (AppleCatalog.hasReadyToken()) 1800 else 15)
+                ApiOutcome(200, jsonStr)
+            } else {
+                ApiOutcome(404, localizedMsg("Album non trovato", "Album not found"))
             }
-            val jsonStr = json.toString()
-            ApiCache.put(cacheKey, jsonStr, if (AppleCatalog.hasReadyToken()) 1800 else 15)
-            jsonResponse(jsonStr)
-        } else {
-            errorResponse(404, localizedMsg("Album non trovato", "Album not found"))
         }
     }
 
-    private fun handleArtist(id: String, uri: Uri): WebResourceResponse = runBlocking {
+    private fun handleArtist(id: String, uri: Uri): WebResourceResponse {
         val locKey = SonoraLocaleManager.cacheTag()
         val hl = SonoraLocaleManager.resolvedLang
         val cacheKey = "artist_v6:$locKey:$id"
-        ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
+        ApiCache.get(cacheKey)?.let { return jsonResponse(it) }
 
         val hintName = uri.getQueryParameter("name")?.trim()?.takeIf { it.isNotBlank() }
             ?: uri.getQueryParameter("title")?.trim().orEmpty()
-        val cleanHint = hintName.replace(Regex("(?i)\\s*-\\s*topic$"), "")
-            .replace(Regex("(?i)\\b(feat|ft)\\.?.*$"), "")
-            .trim()
+        val cleanHint = cleanArtistKey(hintName)
 
-        val (artistResult, hintAppleArtist) = coroutineScope {
-            val artistDeferred = async(Dispatchers.IO) { YouTube.artist(id).getOrNull() }
-            val appleDeferred = if (cleanHint.isNotBlank()) {
-                async(Dispatchers.IO) { AppleCatalog.artist(hintName).takeIf { it?.heroUrl != null } }
-            } else null
-            artistDeferred.await() to appleDeferred?.await()
-        }
-
-        if (artistResult != null) {
-            val songsArr = JSONArray()
-            val albumsArr = JSONArray()
-            val singlesArr = JSONArray()
-            val relatedArr = JSONArray()
-            val relatedItems = mutableListOf<ArtistItem>()
-            val pendingAlbumItems = mutableListOf<Pair<Boolean, AlbumItem>>()
-
-            val (hue, style) = SonoraColors.look(artistResult.artist.id)
-            val cleanTitle = artistResult.artist.title.replace(Regex("(?i)\\s*-\\s*topic$"), "")
-                .replace(Regex("(?i)\\b(feat|ft)\\.?.*$"), "")
-                .trim()
-            val appleArtist = if (cleanTitle.equals(cleanHint, ignoreCase = true) && hintAppleArtist != null) {
-                hintAppleArtist
-            } else if (
-                cleanTitle.equals(cleanHint, ignoreCase = true) &&
-                artistResult.artist.title.equals(hintName, ignoreCase = true) &&
-                cleanHint.isNotBlank()
-            ) {
-                null
-            } else {
-                AppleCatalog.artist(artistResult.artist.title).takeIf { it?.heroUrl != null }
-            }
-            val thumb = appleArtist?.heroUrl?.let {
-                val coverUrl = "/api/cover?u=${URLEncoder.encode(it, "UTF-8")}&s=1200"
-                rememberResolvedArtistThumb(artistResult.artist.title, coverUrl)
-                coverUrl
-            } ?: peekCachedArtistThumb(artistResult.artist.title, 1200)
-                ?: upgradeThumb(artistResult.artist.thumbnail, 1200)
-
-            val pendingSongItems = mutableListOf<SongItem>()
-            for (sec in artistResult.sections) {
-                val secTitle = sec.title.lowercase()
-                val isSingleSec = secTitle.contains("single") || secTitle.contains("singol") || Regex("""\bep\b""").containsMatchIn(secTitle)
-                for (item in sec.items) {
-                    when (item) {
-                        is SongItem -> pendingSongItems.add(item)
-                        is AlbumItem -> pendingAlbumItems.add(isSingleSec to item)
-                        is ArtistItem -> relatedItems.add(item)
-                        else -> {}
-                    }
-                }
+        return coalescedApi("artist:$cacheKey") {
+            ApiCache.get(cacheKey)?.let { return@coalescedApi ApiOutcome(200, it) }
+            val (artistResult, hintAppleArtist) = coroutineScope {
+                val artistDeferred = async(Dispatchers.IO) { YouTube.artist(id).getOrNull() }
+                val appleDeferred = if (cleanHint.isNotBlank()) {
+                    async(Dispatchers.IO) { AppleCatalog.artist(hintName).takeIf { it?.heroUrl != null } }
+                } else null
+                artistDeferred.await() to appleDeferred?.await()
             }
 
-            val resolvedAlbMap = if (AppleCatalog.hasReadyToken() && pendingAlbumItems.isNotEmpty()) {
-                val targets = pendingAlbumItems.map { it.second }.distinctBy { it.browseId }.filter { alb ->
-                    val artName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name ?: cleanTitle
-                    peekCachedAlbumThumb(alb.title, artName, 544) == null
-                }.take(24)
+            if (artistResult != null) {
+                val songsArr = JSONArray()
+                val albumsArr = JSONArray()
+                val singlesArr = JSONArray()
+                val relatedArr = JSONArray()
+                val relatedItems = mutableListOf<ArtistItem>()
+                val pendingAlbumItems = mutableListOf<Pair<Boolean, AlbumItem>>()
 
-                if (targets.isNotEmpty()) {
-                    coroutineScope {
-                        val albDefs = targets.map { alb ->
-                            val artName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name ?: cleanTitle
-                            async(Dispatchers.IO) {
-                                val resolved = withTimeoutOrNull(1500L) {
-                                    resolveAlbumThumb(alb.title, artName, 544)
-                                }
-                                resolved?.let { alb.browseId to it }
-                            }
-                        }
-                        albDefs.awaitAll().filterNotNull().toMap()
-                    }
-                } else emptyMap()
-            } else emptyMap()
-
-            val songArtistThumb = thumb?.let { resizeCoverApiUrl(it, 544) }
-            val enrichedSongs = enrichSongsToJson(
-                pendingSongItems,
-                maxResolve = 12,
-                thumbSize = 544,
-                artistThumbFor = { songArtistThumb }
-            )
-            for (i in 0 until enrichedSongs.length()) {
-                songsArr.put(enrichedSongs.getJSONObject(i))
-            }
-
-            val seenAlbumIds = HashSet<String>()
-            val seenSingleIds = HashSet<String>()
-            for ((isSingleSec, item) in pendingAlbumItems) {
-                if (isSingleSec && !seenSingleIds.add(item.browseId)) continue
-                if (!isSingleSec && !seenAlbumIds.add(item.browseId)) continue
-                val itemArtist = cleanArtistsList(item.artists).firstOrNull()?.name ?: item.artists?.firstOrNull()?.name ?: cleanTitle
-                val hqAlb = resolvedAlbMap[item.browseId] ?: peekCachedAlbumThumb(item.title, itemArtist, 544)
-                val albJson = item.toJson(thumbSize = 544, hqThumb = hqAlb)
-                if (isSingleSec) {
-                    albJson.put("type", if (hl == "it") "Singolo" else "Single")
-                    albJson.put("typeKey", "single")
+                val (hue, style) = SonoraColors.look(artistResult.artist.id)
+                val cleanTitle = cleanArtistKey(artistResult.artist.title)
+                val appleArtist = if (cleanTitle.equals(cleanHint, ignoreCase = true) && hintAppleArtist != null) {
+                    hintAppleArtist
+                } else if (
+                    cleanTitle.equals(cleanHint, ignoreCase = true) &&
+                    artistResult.artist.title.equals(hintName, ignoreCase = true) &&
+                    cleanHint.isNotBlank()
+                ) {
+                    null
                 } else {
-                    albJson.put("typeKey", "album")
+                    AppleCatalog.artist(artistResult.artist.title).takeIf { it?.heroUrl != null }
                 }
-                if (albJson.optString("artist").isBlank() && cleanTitle.isNotBlank()) {
-                    albJson.put("artist", cleanTitle)
-                }
-                if (albJson.optString("artistId").isBlank()) {
-                    albJson.put("artistId", artistResult.artist.id)
-                }
-                if (isSingleSec) singlesArr.put(albJson) else albumsArr.put(albJson)
-            }
+                val thumb = appleArtist?.heroUrl?.let {
+                    val coverUrl = "/api/cover?u=${URLEncoder.encode(it, "UTF-8")}&s=1200"
+                    rememberResolvedArtistThumb(artistResult.artist.title, coverUrl)
+                    coverUrl
+                } ?: peekCachedArtistThumb(artistResult.artist.title, 1200)
+                    ?: upgradeThumb(artistResult.artist.thumbnail, 1200)
 
-            for (item in relatedItems.take(14)) {
-                val relThumb = peekCachedArtistThumb(item.title, 544) ?: upgradeThumb(item.thumbnail, 544)
-                relatedArr.put(item.toJson(relThumb))
-            }
+                val pendingSongItems = mutableListOf<SongItem>()
+                for (sec in artistResult.sections) {
+                    val secTitle = sec.title.lowercase()
+                    val isSingleSec = secTitle.contains("single") || secTitle.contains("singol") || EP_WORD_RE.containsMatchIn(secTitle)
+                    for (item in sec.items) {
+                        when (item) {
+                            is SongItem -> pendingSongItems.add(item)
+                            is AlbumItem -> pendingAlbumItems.add(isSingleSec to item)
+                            is ArtistItem -> relatedItems.add(item)
+                            else -> {}
+                        }
+                    }
+                }
 
-            val root = JSONObject().apply {
-                put("kind", "artist")
-                put("id", artistResult.artist.id)
-                put("title", artistResult.artist.title)
-                put("subscribers", artistResult.subscriberCountText ?: JSONObject.NULL)
-                put("monthly", artistResult.monthlyListenerCount ?: JSONObject.NULL)
-                put("thumb", thumb ?: JSONObject.NULL)
-                put("bio", appleArtist?.bio ?: artistResult.description.orEmpty())
-                put("hue", hue)
-                put("style", style)
-                put("songs", songsArr)
-                put("albums", albumsArr)
-                put("singles", singlesArr)
-                put("related", relatedArr)
+                // Parallelize album thumb enrichment and top-song canonical enrichment under a shared 1800ms budget.
+                val resolvedAlbMap = ConcurrentHashMap<String, String>()
+                val songArtistThumb = thumb?.let { resizeCoverApiUrl(it, 544) }
+                val enrichedSongs = coroutineScope {
+                    val albWarmJob = if (AppleCatalog.hasReadyToken() && pendingAlbumItems.isNotEmpty()) {
+                        val targets = pendingAlbumItems.map { it.second }.distinctBy { it.browseId }.filter { alb ->
+                            val artName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name ?: cleanTitle
+                            peekCachedAlbumThumb(alb.title, artName, 544) == null
+                        }.take(24)
+                        if (targets.isNotEmpty()) {
+                            async(Dispatchers.IO) {
+                                val sem = Semaphore(6)
+                                val defs = targets.map { alb ->
+                                    val artName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name ?: cleanTitle
+                                    attachScope.async {
+                                        sem.withPermit {
+                                            val resolved = withTimeoutOrNull(1500L) {
+                                                resolveAlbumThumb(alb.title, artName, 544)
+                                            }
+                                            if (resolved != null) resolvedAlbMap[alb.browseId] = resolved
+                                        }
+                                    }
+                                }
+                                withTimeoutOrNull(1800L) { defs.awaitAll() }
+                            }
+                        } else null
+                    } else null
+
+                    val songsDef = async(Dispatchers.IO) {
+                        enrichSongsToJson(
+                            pendingSongItems,
+                            maxResolve = 12,
+                            thumbSize = 544,
+                            artistThumbFor = { songArtistThumb },
+                            budgetMs = 1800L
+                        )
+                    }
+                    albWarmJob?.await()
+                    songsDef.await()
+                }
+                for (i in 0 until enrichedSongs.length()) {
+                    songsArr.put(enrichedSongs.getJSONObject(i))
+                }
+
+                val seenAlbumIds = HashSet<String>()
+                val seenSingleIds = HashSet<String>()
+                for ((isSingleSec, item) in pendingAlbumItems) {
+                    if (isSingleSec && !seenSingleIds.add(item.browseId)) continue
+                    if (!isSingleSec && !seenAlbumIds.add(item.browseId)) continue
+                    val itemArtist = cleanArtistsList(item.artists).firstOrNull()?.name ?: item.artists?.firstOrNull()?.name ?: cleanTitle
+                    val hqAlb = resolvedAlbMap[item.browseId] ?: peekCachedAlbumThumb(item.title, itemArtist, 544)
+                    val albJson = item.toJson(thumbSize = 544, hqThumb = hqAlb)
+                    if (isSingleSec) {
+                        albJson.put("type", if (hl == "it") "Singolo" else "Single")
+                        albJson.put("typeKey", "single")
+                    } else {
+                        albJson.put("typeKey", "album")
+                    }
+                    if (albJson.optString("artist").isBlank() && cleanTitle.isNotBlank()) {
+                        albJson.put("artist", cleanTitle)
+                    }
+                    if (albJson.optString("artistId").isBlank()) {
+                        albJson.put("artistId", artistResult.artist.id)
+                    }
+                    if (isSingleSec) singlesArr.put(albJson) else albumsArr.put(albJson)
+                }
+
+                for (item in relatedItems.take(14)) {
+                    val relThumb = peekCachedArtistThumb(item.title, 544) ?: upgradeThumb(item.thumbnail, 544)
+                    relatedArr.put(item.toJson(relThumb))
+                }
+
+                val root = JSONObject().apply {
+                    put("kind", "artist")
+                    put("id", artistResult.artist.id)
+                    put("title", artistResult.artist.title)
+                    put("subscribers", artistResult.subscriberCountText ?: JSONObject.NULL)
+                    put("monthly", artistResult.monthlyListenerCount ?: JSONObject.NULL)
+                    put("thumb", thumb ?: JSONObject.NULL)
+                    put("bio", appleArtist?.bio ?: artistResult.description.orEmpty())
+                    put("hue", hue)
+                    put("style", style)
+                    put("songs", songsArr)
+                    put("albums", albumsArr)
+                    put("singles", singlesArr)
+                    put("related", relatedArr)
+                }
+                val rootStr = root.toString()
+                ApiCache.put(cacheKey, rootStr, if (AppleCatalog.hasReadyToken()) 1800 else 15)
+                ApiOutcome(200, rootStr)
+            } else {
+                ApiOutcome(404, localizedMsg("Artista non trovato", "Artist not found"))
             }
-            val rootStr = root.toString()
-            ApiCache.put(cacheKey, rootStr, if (AppleCatalog.hasReadyToken()) 1800 else 15)
-            jsonResponse(rootStr)
-        } else {
-            errorResponse(404, localizedMsg("Artista non trovato", "Artist not found"))
         }
     }
 
-    private fun handleArtistArt(name: String, id: String, sizeParam: Int = 544): WebResourceResponse = runBlocking {
-        val clean = name.replace(Regex("(?i)\\s*-\\s*topic$"), "")
-            .replace(Regex("(?i)\\b(feat|ft)\\.?.*$"), "")
-            .trim()
-        if (clean.isBlank()) return@runBlocking jsonResponse("{\"ok\":false}")
+    private fun handleArtistArt(name: String, id: String, sizeParam: Int = 544): WebResourceResponse {
+        val clean = cleanArtistKey(name)
+        if (clean.isBlank()) return jsonResponse("{\"ok\":false}")
 
         val size = sizeParam.coerceIn(120, 1400)
         val cacheKey = "art_fast:$clean:$size"
-        ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
+        ApiCache.get(cacheKey)?.let { return jsonResponse(it) }
 
         peekCachedArtistThumb(clean, size)?.let { cachedThumb ->
             val resp = JSONObject().apply {
@@ -3978,12 +4162,12 @@ object SonoraApiInterceptor {
                 put("thumb", cachedThumb)
             }.toString()
             ApiCache.put(cacheKey, resp, 86400)
-            return@runBlocking jsonResponse(resp)
+            return jsonResponse(resp)
         }
 
         // Never stall WebView shouldInterceptRequest threads on cold Apple Music token scraping.
         if (!AppleCatalog.hasReadyToken()) {
-            return@runBlocking jsonResponse(
+            return jsonResponse(
                 JSONObject().apply {
                     put("ok", false)
                     put("cold", true)
@@ -3993,30 +4177,33 @@ object SonoraApiInterceptor {
             )
         }
 
-        val resThumb = resolveArtistThumb(name, size = size)
+        return coalescedApi("artist_art:$cacheKey", timeoutSec = 8L) {
+            ApiCache.get(cacheKey)?.let { return@coalescedApi ApiOutcome(200, it) }
+            val resThumb = resolveArtistThumb(name, size = size)
 
-        val resp = JSONObject().apply {
-            put("ok", resThumb != null)
-            put("name", name)
-            put("thumb", resThumb ?: JSONObject.NULL)
-        }.toString()
+            val resp = JSONObject().apply {
+                put("ok", resThumb != null)
+                put("name", name)
+                put("thumb", resThumb ?: JSONObject.NULL)
+            }.toString()
 
-        if (resThumb != null) {
-            ApiCache.put(cacheKey, resp, 86400)
-        } else {
-            ApiCache.put(cacheKey, resp, 120)
+            if (resThumb != null) {
+                ApiCache.put(cacheKey, resp, 86400)
+            } else {
+                ApiCache.put(cacheKey, resp, 120)
+            }
+            ApiOutcome(200, resp)
         }
-        jsonResponse(resp)
     }
 
-    private fun handleAlbumArt(title: String, artist: String, id: String, sizeParam: Int = 544): WebResourceResponse = runBlocking {
+    private fun handleAlbumArt(title: String, artist: String, id: String, sizeParam: Int = 544): WebResourceResponse {
         val cleanTitle = title.trim()
-        if (cleanTitle.isBlank()) return@runBlocking jsonResponse("{\"ok\":false}")
+        if (cleanTitle.isBlank()) return jsonResponse("{\"ok\":false}")
 
         val size = sizeParam.coerceIn(120, 1400)
         val keyNorm = normAlbumCacheKey(cleanTitle, artist)
         val cacheKey = "alb_fast_v2:$keyNorm:$size"
-        ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
+        ApiCache.get(cacheKey)?.let { return jsonResponse(it) }
 
         peekCachedAlbumThumb(cleanTitle, artist, size)?.let { cachedThumb ->
             val resp = JSONObject().apply {
@@ -4027,39 +4214,43 @@ object SonoraApiInterceptor {
                 put("thumb", cachedThumb)
             }.toString()
             ApiCache.put(cacheKey, resp, 86400)
-            return@runBlocking jsonResponse(resp)
+            return jsonResponse(resp)
         }
 
-        val hasToken = AppleCatalog.hasReadyToken()
-        val resThumb = resolveAlbumThumb(cleanTitle, artist, size)
+        return coalescedApi("album_art:$cacheKey", timeoutSec = 8L) {
+            ApiCache.get(cacheKey)?.let { return@coalescedApi ApiOutcome(200, it) }
+            val hasToken = AppleCatalog.hasReadyToken()
+            val resThumb = resolveAlbumThumb(cleanTitle, artist, size)
 
-        if (resThumb == null && !hasToken) {
-            return@runBlocking jsonResponse(
-                JSONObject().apply {
-                    put("ok", false)
-                    put("cold", true)
-                    put("id", id)
-                    put("title", title)
-                    put("artist", artist)
-                    put("thumb", JSONObject.NULL)
-                }.toString()
-            )
+            if (resThumb == null && !hasToken) {
+                return@coalescedApi ApiOutcome(
+                    200,
+                    JSONObject().apply {
+                        put("ok", false)
+                        put("cold", true)
+                        put("id", id)
+                        put("title", title)
+                        put("artist", artist)
+                        put("thumb", JSONObject.NULL)
+                    }.toString()
+                )
+            }
+
+            val resp = JSONObject().apply {
+                put("ok", resThumb != null)
+                put("id", id)
+                put("title", title)
+                put("artist", artist)
+                put("thumb", resThumb ?: JSONObject.NULL)
+            }.toString()
+
+            if (resThumb != null) {
+                ApiCache.put(cacheKey, resp, 86400)
+            } else {
+                ApiCache.put(cacheKey, resp, 120)
+            }
+            ApiOutcome(200, resp)
         }
-
-        val resp = JSONObject().apply {
-            put("ok", resThumb != null)
-            put("id", id)
-            put("title", title)
-            put("artist", artist)
-            put("thumb", resThumb ?: JSONObject.NULL)
-        }.toString()
-
-        if (resThumb != null) {
-            ApiCache.put(cacheKey, resp, 86400)
-        } else {
-            ApiCache.put(cacheKey, resp, 120)
-        }
-        jsonResponse(resp)
     }
 
     private fun handleTrackArt(
@@ -4068,12 +4259,12 @@ object SonoraApiInterceptor {
         album: String,
         id: String,
         sizeParam: Int = 544,
-    ): WebResourceResponse = runBlocking {
+    ): WebResourceResponse {
         val cleanTitle = title.trim()
         val cleanArtist = artist.trim()
         val cleanAlbum = album.trim()
         if (cleanTitle.isBlank() || cleanArtist.isBlank()) {
-            return@runBlocking jsonResponse("{\"ok\":false}")
+            return jsonResponse("{\"ok\":false}")
         }
 
         val size = sizeParam.coerceIn(120, 1400)
@@ -4081,67 +4272,70 @@ object SonoraApiInterceptor {
         val artCore = normCompactKey(cleanArtist)
         val albCore = if (cleanAlbum.isNotBlank()) normTitleCore(cleanAlbum) else ""
         val cacheKey = "trk_art_v4:$titleCore|$artCore|$albCore:$size"
-        ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
+        ApiCache.get(cacheKey)?.let { return jsonResponse(it) }
 
-        val nonCompAlbum = cleanAlbum.isNotEmpty() && !isLikelyCompilationAlbum(cleanAlbum, cleanTitle, cleanArtist)
-        val meta = resolveCanonicalSongMeta(cleanTitle, cleanArtist, if (nonCompAlbum) cleanAlbum else "")
-        if (meta != null) {
-            val resThumb = resizeCoverApiUrl(meta.coverUrl, size)
-            val resolvedAlb = meta.albumName.takeIf { it.isNotBlank() } ?: cleanAlbum
-            val resp = JSONObject().apply {
-                put("ok", true)
-                put("id", id)
-                put("title", title)
-                put("artist", artist)
-                put("album", resolvedAlb)
-                put("thumb", resThumb)
-                put("canonicalCover", true)
-            }.toString()
-            ApiCache.put(cacheKey, resp, 86400)
-            return@runBlocking jsonResponse(resp)
-        }
-
-        if (nonCompAlbum) {
-            peekCachedAlbumThumb(cleanAlbum, cleanArtist, size)?.let { cachedAlb ->
+        return coalescedApi("track_art:$cacheKey", timeoutSec = 8L) {
+            ApiCache.get(cacheKey)?.let { return@coalescedApi ApiOutcome(200, it) }
+            val nonCompAlbum = cleanAlbum.isNotEmpty() && !isLikelyCompilationAlbum(cleanAlbum, cleanTitle, cleanArtist)
+            val meta = resolveCanonicalSongMeta(cleanTitle, cleanArtist, if (nonCompAlbum) cleanAlbum else "")
+            if (meta != null) {
+                val resThumb = resizeCoverApiUrl(meta.coverUrl, size)
+                val resolvedAlb = meta.albumName.takeIf { it.isNotBlank() } ?: cleanAlbum
                 val resp = JSONObject().apply {
                     put("ok", true)
                     put("id", id)
                     put("title", title)
                     put("artist", artist)
-                    put("album", cleanAlbum)
-                    put("thumb", cachedAlb)
-                    put("canonicalCover", false)
+                    put("album", resolvedAlb)
+                    put("thumb", resThumb)
+                    put("canonicalCover", true)
                 }.toString()
-                ApiCache.put(cacheKey, resp, 600)
-                return@runBlocking jsonResponse(resp)
+                ApiCache.put(cacheKey, resp, 86400)
+                return@coalescedApi ApiOutcome(200, resp)
             }
-            if (AppleCatalog.hasReadyToken()) {
-                val albThumb = resolveAlbumThumb(cleanAlbum, cleanArtist, size)
-                if (albThumb != null) {
+
+            if (nonCompAlbum) {
+                peekCachedAlbumThumb(cleanAlbum, cleanArtist, size)?.let { cachedAlb ->
                     val resp = JSONObject().apply {
                         put("ok", true)
                         put("id", id)
                         put("title", title)
                         put("artist", artist)
                         put("album", cleanAlbum)
-                        put("thumb", albThumb)
+                        put("thumb", cachedAlb)
                         put("canonicalCover", false)
                     }.toString()
                     ApiCache.put(cacheKey, resp, 600)
-                    return@runBlocking jsonResponse(resp)
+                    return@coalescedApi ApiOutcome(200, resp)
+                }
+                if (AppleCatalog.hasReadyToken()) {
+                    val albThumb = resolveAlbumThumb(cleanAlbum, cleanArtist, size)
+                    if (albThumb != null) {
+                        val resp = JSONObject().apply {
+                            put("ok", true)
+                            put("id", id)
+                            put("title", title)
+                            put("artist", artist)
+                            put("album", cleanAlbum)
+                            put("thumb", albThumb)
+                            put("canonicalCover", false)
+                        }.toString()
+                        ApiCache.put(cacheKey, resp, 600)
+                        return@coalescedApi ApiOutcome(200, resp)
+                    }
                 }
             }
-        }
 
-        val resp = JSONObject().apply {
-            put("ok", false)
-            put("id", id)
-            put("title", title)
-            put("artist", artist)
-            put("thumb", JSONObject.NULL)
-        }.toString()
-        ApiCache.put(cacheKey, resp, 120)
-        jsonResponse(resp)
+            val resp = JSONObject().apply {
+                put("ok", false)
+                put("id", id)
+                put("title", title)
+                put("artist", artist)
+                put("thumb", JSONObject.NULL)
+            }.toString()
+            ApiCache.put(cacheKey, resp, 120)
+            ApiOutcome(200, resp)
+        }
     }
 
     private suspend fun enrichSongsToJson(
@@ -4150,12 +4344,14 @@ object SonoraApiInterceptor {
         thumbSize: Int = 544,
         withTrackNo: Boolean = false,
         artistThumbFor: ((SongItem) -> String?)? = null,
+        budgetMs: Long = 1800L,
     ): JSONArray = coroutineScope {
         if (songs.isEmpty()) return@coroutineScope JSONArray()
+        val startedAtMs = android.os.SystemClock.elapsedRealtime()
         val resolveLimit = maxResolve.coerceIn(0, songs.size)
         val sem = Semaphore(8)
 
-        val canonicalMap = HashMap<Int, CanonicalSongMeta>()
+        val canonicalMap = ConcurrentHashMap<Int, CanonicalSongMeta>()
         val needCanonical = ArrayList<Pair<Int, Triple<SongItem, String, String>>>()
         songs.forEachIndexed { idx, s ->
             val firstArt = primaryArtistName(s)
@@ -4170,22 +4366,26 @@ object SonoraApiInterceptor {
             }
         }
         if (needCanonical.isNotEmpty()) {
-            needCanonical.map { (idx, target) ->
-                async(Dispatchers.IO) {
+            // Launch on attachScope so stragglers continue warming cache even if the response budget expires.
+            val defs = needCanonical.map { (idx, target) ->
+                attachScope.async {
                     val (song, firstArt, hintAlb) = target
                     val meta = sem.withPermit {
                         withTimeoutOrNull(3000L) {
                             resolveCanonicalSongMeta(song.title, firstArt, hintAlb)
                         }
                     }
-                    meta?.let { idx to it }
+                    if (meta != null) canonicalMap[idx] = meta
                 }
-            }.awaitAll().filterNotNull().forEach { (idx, meta) -> canonicalMap[idx] = meta }
+            }
+            withTimeoutOrNull(budgetMs) {
+                defs.awaitAll()
+            }
         }
 
         val fallbackAlbums = LinkedHashMap<String, Pair<String, String>>()
         for (idx in 0 until resolveLimit) {
-            if (idx in canonicalMap) continue
+            if (canonicalMap.containsKey(idx)) continue
             val s = songs[idx]
             val albName = s.album?.name?.trim().orEmpty()
             val firstArt = primaryArtistName(s)
@@ -4197,42 +4397,33 @@ object SonoraApiInterceptor {
             }
         }
         if (fallbackAlbums.isNotEmpty()) {
-            fallbackAlbums.values.map { (albName, firstArt) ->
-                async(Dispatchers.IO) {
+            val remainingMs = (budgetMs - (android.os.SystemClock.elapsedRealtime() - startedAtMs)).coerceAtLeast(0L)
+            val fbDefs = fallbackAlbums.values.map { (albName, firstArt) ->
+                attachScope.async {
                     sem.withPermit {
                         withTimeoutOrNull(1800L) {
                             resolveAlbumThumb(albName, firstArt, thumbSize)
                         }
                     }
                 }
-            }.awaitAll()
+            }
+            if (remainingMs >= 200L) {
+                withTimeoutOrNull(remainingMs) {
+                    fbDefs.awaitAll()
+                }
+            }
         }
 
         val arr = JSONArray()
         songs.forEachIndexed { idx, song ->
+            val meta = canonicalMap[idx]
             val obj = song.toJson(
                 no = if (withTrackNo) idx + 1 else null,
                 artistThumb = artistThumbFor?.invoke(song),
-                thumbSize = thumbSize
+                thumbSize = thumbSize,
+                preResolvedCanonical = meta,
+                skipCanonicalPeek = true,
             )
-            val meta = canonicalMap[idx]
-            if (meta != null) {
-                obj.put("thumb", resizeCoverApiUrl(meta.coverUrl, thumbSize))
-                obj.put("canonicalCover", true)
-                val curAlb = song.album?.name?.trim().orEmpty()
-                val firstArt = primaryArtistName(song)
-                val albumReplaced = meta.albumName.isNotBlank() && (
-                    curAlb.isEmpty() ||
-                        isLikelyCompilationAlbum(curAlb, song.title, firstArt) ||
-                        normAlbumCacheKey(curAlb, firstArt) != normAlbumCacheKey(meta.albumName, firstArt)
-                    )
-                if (albumReplaced) {
-                    obj.put("album", meta.albumName)
-                    if (curAlb.isNotEmpty()) obj.put("albumId", JSONObject.NULL)
-                } else if (curAlb.isNotEmpty() && isLikelyCompilationAlbum(curAlb, song.title, firstArt)) {
-                    obj.put("albumId", JSONObject.NULL)
-                }
-            }
             arr.put(obj)
         }
         arr
@@ -5138,10 +5329,7 @@ object SonoraApiInterceptor {
             append("lim:").append(req.limit).append('\n')
             append("ref:").append(req.refreshSalt)
         }
-        val sigHash = MessageDigest.getInstance("SHA-256")
-            .digest(sigInput.toByteArray(Charsets.UTF_8))
-            .take(12)
-            .joinToString("") { "%02x".format(it) }
+        val sigHash = sha256Hex(sigInput, takeBytes = 12)
         val locKey = SonoraLocaleManager.cacheTag()
         val cacheKey = "pl_recs_v2:$locKey:$sigHash"
 
@@ -5337,7 +5525,7 @@ object SonoraApiInterceptor {
         val (rootStr, valid) = buildRadioFeedJson(hl)
         if (valid && SonoraLocaleManager.cacheTag() == locKey) {
             ApiCache.put(cacheKey, rootStr, 900)
-            SnapshotDiskCache.put(cacheKey, rootStr)
+            SnapshotDiskCache.putAsync(cacheKey, rootStr)
         }
         jsonResponse(rootStr)
     }
@@ -5456,13 +5644,15 @@ object SonoraApiInterceptor {
                 }
             } else null
 
+            val chartArtistResolved = ConcurrentHashMap<String, String>()
             val artistJobs = if (useChartArtists) {
+                val sem = Semaphore(6)
                 chartArtists.take(16).map { artist ->
-                    async(Dispatchers.IO) {
-                        val json = artist.toJson()
-                        val artThumb = resolveArtistThumb(artist)
-                        if (artThumb != null) json.put("thumb", artThumb)
-                        json
+                    attachScope.async {
+                        sem.withPermit {
+                            val artThumb = withTimeoutOrNull(1400L) { resolveArtistThumb(artist) }
+                            if (artThumb != null) chartArtistResolved[artist.id] = artThumb
+                        }
                     }
                 }
             } else null
@@ -5528,23 +5718,28 @@ object SonoraApiInterceptor {
                 preSelectedAlbums
             }
             val topChartAlbums = selectedChartAlbums.take(16)
-            val resolvedChartAlbs = if (AppleCatalog.hasReadyToken() && topChartAlbums.isNotEmpty()) {
+            val resolvedChartAlbs = ConcurrentHashMap<String, String>()
+            if (AppleCatalog.hasReadyToken() && topChartAlbums.isNotEmpty()) {
                 val pendingAlbs = topChartAlbums.filter { alb ->
                     val artName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
                     peekCachedAlbumThumb(alb.title, artName, 544) == null
                 }.take(10)
                 if (pendingAlbs.isNotEmpty()) {
-                    pendingAlbs.map { alb ->
+                    val sem = Semaphore(6)
+                    val albDefs = pendingAlbs.map { alb ->
                         val artName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
-                        async(Dispatchers.IO) {
-                            val resolved = withTimeoutOrNull(1400L) {
-                                resolveAlbumThumb(alb.title, artName, 544)
+                        attachScope.async {
+                            sem.withPermit {
+                                val resolved = withTimeoutOrNull(1400L) {
+                                    resolveAlbumThumb(alb.title, artName, 544)
+                                }
+                                if (resolved != null) resolvedChartAlbs[alb.browseId] = resolved
                             }
-                            resolved?.let { alb.browseId to it }
                         }
-                    }.awaitAll().filterNotNull().toMap()
-                } else emptyMap()
-            } else emptyMap()
+                    }
+                    withTimeoutOrNull(1800L) { albDefs.awaitAll() }
+                }
+            }
             topChartAlbums.forEach { alb ->
                 val artName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
                 val hqAlb = resolvedChartAlbs[alb.browseId] ?: peekCachedAlbumThumb(alb.title, artName, 544)
@@ -5577,17 +5772,27 @@ object SonoraApiInterceptor {
 
             // 5. Artists ("Artisti in tendenza" / "Trending artists")
             if (artistJobs != null) {
-                artistJobs.awaitAll().forEach { artistsArr.put(it) }
+                withTimeoutOrNull(1800L) { artistJobs.awaitAll() }
+                chartArtists.take(16).forEach { artist ->
+                    val json = artist.toJson(chartArtistResolved[artist.id])
+                    artistsArr.put(json)
+                }
             } else {
                 val fallbackArtists = fallbackArtistsDeferred?.await().orEmpty().take(16)
-                fallbackArtists.map { artist ->
-                    async(Dispatchers.IO) {
-                        val json = artist.toJson()
-                        val artThumb = resolveArtistThumb(artist)
-                        if (artThumb != null) json.put("thumb", artThumb)
-                        json
+                val fbResolved = ConcurrentHashMap<String, String>()
+                val sem = Semaphore(6)
+                val fbDefs = fallbackArtists.map { artist ->
+                    attachScope.async {
+                        sem.withPermit {
+                            val artThumb = withTimeoutOrNull(1400L) { resolveArtistThumb(artist) }
+                            if (artThumb != null) fbResolved[artist.id] = artThumb
+                        }
                     }
-                }.awaitAll().forEach { artistsArr.put(it) }
+                }
+                withTimeoutOrNull(1800L) { fbDefs.awaitAll() }
+                fallbackArtists.forEach { artist ->
+                    artistsArr.put(artist.toJson(fbResolved[artist.id]))
+                }
             }
         }
 
@@ -5603,12 +5808,12 @@ object SonoraApiInterceptor {
         return root.toString() to valid
     }
 
-    private fun handleCharts(): WebResourceResponse = runBlocking {
+    private fun handleCharts(): WebResourceResponse {
         val locKey = SonoraLocaleManager.cacheTag()
         val gl = SonoraLocaleManager.resolvedCountry
         val hl = SonoraLocaleManager.resolvedLang
         val cacheKey = "charts_v6:$locKey"
-        ApiCache.get(cacheKey)?.let { return@runBlocking jsonResponse(it) }
+        ApiCache.get(cacheKey)?.let { return jsonResponse(it) }
 
         val disk = SnapshotDiskCache.get(cacheKey, freshTtlMs = 900_000L)
         if (disk != null) {
@@ -5625,15 +5830,18 @@ object SonoraApiInterceptor {
                     }
                 }
             }
-            return@runBlocking jsonResponse(disk.data)
+            return jsonResponse(disk.data)
         }
 
-        val (rootStr, valid) = buildChartsJson(locKey, gl, hl)
-        if (valid && SonoraLocaleManager.cacheTag() == locKey) {
-            ApiCache.put(cacheKey, rootStr, 900)
-            SnapshotDiskCache.put(cacheKey, rootStr)
+        return coalescedApi("charts:$cacheKey") {
+            ApiCache.get(cacheKey)?.let { return@coalescedApi ApiOutcome(200, it) }
+            val (rootStr, valid) = buildChartsJson(locKey, gl, hl)
+            if (valid && SonoraLocaleManager.cacheTag() == locKey) {
+                ApiCache.put(cacheKey, rootStr, 900)
+                SnapshotDiskCache.putAsync(cacheKey, rootStr)
+            }
+            ApiOutcome(200, rootStr)
         }
-        jsonResponse(rootStr)
     }
 
     private fun handleLyrics(videoId: String, uri: Uri): WebResourceResponse = runBlocking {
@@ -5910,8 +6118,7 @@ object SonoraApiInterceptor {
         val candidates = ArrayList<String>(3).apply {
             add(hqUrl)
             if (decoded != hqUrl) add(decoded)
-            val ytMatch = Regex("""^https?://i\.ytimg\.com/vi/([^/]+)/""").find(decoded)
-                ?: Regex("""^https?://i\.ytimg\.com/vi/([^/]+)/""").find(hqUrl)
+            val ytMatch = YT_COVER_VI_RE.find(decoded) ?: YT_COVER_VI_RE.find(hqUrl)
             val ytFallback = ytMatch?.groupValues?.getOrNull(1)?.let {
                 "https://i.ytimg.com/vi/$it/hqdefault.jpg"
             }
@@ -5922,7 +6129,7 @@ object SonoraApiInterceptor {
         var lastError = "Cover fetch failed"
         for (candidate in candidates) {
             try {
-                okHttp.newCall(Request.Builder().url(candidate).build()).execute().use { r ->
+                coverOkHttp.newCall(Request.Builder().url(candidate).build()).execute().use { r ->
                     if (!r.isSuccessful) {
                         lastStatus = r.code.takeIf { it >= 400 } ?: 404
                         lastError = "Cover upstream error (${r.code})"
@@ -5959,8 +6166,17 @@ object SonoraApiInterceptor {
             return MZSTATIC_DIM_REGEX.replace(baseSized) { m ->
                 val curW = m.groupValues[1].toIntOrNull() ?: effSize
                 val curH = m.groupValues[2].toIntOrNull() ?: effSize
-                if (curW == curH && effSize < curW) {
-                    "/${effSize}x${effSize}${m.groupValues[3]}"
+                if (curW > 0 && curH > 0 && effSize < maxOf(curW, curH)) {
+                    val newW: Int
+                    val newH: Int
+                    if (curW >= curH) {
+                        newW = effSize
+                        newH = maxOf(1, (curH.toLong() * effSize / curW).toInt())
+                    } else {
+                        newH = effSize
+                        newW = maxOf(1, (curW.toLong() * effSize / curH).toInt())
+                    }
+                    "/${newW}x${newH}${m.groupValues[3]}"
                 } else {
                     m.value
                 }
@@ -6002,7 +6218,7 @@ object SonoraApiInterceptor {
             add(cacheKey)
             if (id.isNotEmpty()) add(CoverDiskCache.keyFor("", decoded, size))
             for (altSize in intArrayOf(1400, 1200, 544, 288)) {
-                if (altSize >= size && altSize != size) {
+                if (altSize >= size && altSize != size && altSize <= size * 2) {
                     add(CoverDiskCache.keyFor(id, decoded, altSize))
                     if (id.isNotEmpty()) add(CoverDiskCache.keyFor("", decoded, altSize))
                 }
@@ -6038,7 +6254,7 @@ object SonoraApiInterceptor {
         val existing = inFlightCovers.putIfAbsent(cacheKey, created)
         if (existing != null) {
             return try {
-                existing.get()
+                existing.get(12, TimeUnit.SECONDS)
             } catch (e: Exception) {
                 CoverPayload("application/json", ByteArray(0), 502, "Cover fetch failed: ${e.message ?: "network error"}")
             }
@@ -6110,7 +6326,7 @@ object SonoraApiInterceptor {
         }
 
         val ok = runBlocking {
-            SonoraDownloadManager.downloadAndAwait(ctx, id, timeoutMs = 90_000L)
+            SonoraDownloadManager.downloadAndAwait(ctx, id, timeoutMs = 25_000L)
         }
         return if (ok) {
             jsonResponse(
@@ -6164,8 +6380,6 @@ object SonoraApiInterceptor {
     }
 
     private fun handleStream(videoId: String, requestHeaders: Map<String, String> = emptyMap()): WebResourceResponse = runBlocking {
-        SonoraAudioResolver.ensureNewPipe()
-
         val streamUrl = SonoraPlaybackService.instance?.extractAudioUrl(videoId)
             ?: SonoraAudioResolver.resolve(videoId)
 
@@ -6236,25 +6450,39 @@ object SonoraApiInterceptor {
     }
 }
 
+private val CLEAN_ARTIST_JOINERS = setOf("e", "and", "&", ",", "feat", "feat.", "ft", "ft.")
+private val CLEAN_ARTIST_TYPES = setOf("brano", "canzone", "singolo", "album", "video", "song", "single", "track", "ep", "podcast", "episodio")
+private val CLEAN_ARTIST_STATS_RE = Regex("""(?i).*\d[\d.,]*\s*(?:k|m|b|mln|mila|milioni|mrd)?\s*(?:riproduzioni?|visualizzazioni?|ascolti?|iscritti?|views?|plays?|subscribers?).*""")
+private val CLEAN_ARTIST_NUM_RE = Regex("""(?i)\d[\d.,]*\s*(?:k|m|b|mln|mila|milioni|mrd)""")
+private val CLEAN_ARTIST_TIME_RE = Regex("""\d{1,2}[:.]\d{2}(?:[:.]\d{2})?""")
+private val BANNER_INDICATORS = listOf("w2160", "-h900", "w1920", "-h800", "w1440", "-h600", "w816", "-h340", "w540", "-h225")
+private val BANNER_DIM_RE = Regex("""[=\-]w(\d+)-h(\d+)""")
+
 fun cleanArtistsList(artists: List<Artist>?): List<Artist> {
     if (artists.isNullOrEmpty()) return emptyList()
     return artists.filter { artist ->
         val name = artist.name.trim()
         val lower = name.lowercase().replace('\u00a0', ' ')
         if (lower.isBlank()) false
-        else if (lower in setOf("e", "and", "&", ",", "feat", "feat.", "ft", "ft.")) false
-        else if (lower in setOf("brano", "canzone", "singolo", "album", "video", "song", "single", "track", "ep", "podcast", "episodio")) false
+        else if (lower in CLEAN_ARTIST_JOINERS) false
+        else if (lower in CLEAN_ARTIST_TYPES) false
         else if (lower.contains("riproduzion") || lower.contains("visualizzazion") || lower.contains("ascolt") ||
             lower.contains("iscritt") || lower.contains("views") || lower.contains("plays") ||
             lower.contains("subscribers") || lower.contains("likes") || lower.contains("monthly audience")) false
-        else if (lower.matches(Regex("""(?i).*\d[\d.,]*\s*(?:k|m|b|mln|mila|milioni|mrd)?\s*(?:riproduzioni?|visualizzazioni?|ascolti?|iscritti?|views?|plays?|subscribers?).*"""))) false
-        else if (lower.matches(Regex("""(?i)\d[\d.,]*\s*(?:k|m|b|mln|mila|milioni|mrd)"""))) false
-        else if (lower.matches(Regex("""\d{1,2}[:.]\d{2}(?:[:.]\d{2})?"""))) false
+        else if (CLEAN_ARTIST_STATS_RE.matches(lower)) false
+        else if (CLEAN_ARTIST_NUM_RE.matches(lower)) false
+        else if (CLEAN_ARTIST_TIME_RE.matches(lower)) false
         else true
     }
 }
 
-fun SongItem.toJson(no: Int? = null, artistThumb: String? = null, thumbSize: Int = 544): JSONObject {
+internal fun SongItem.toJson(
+    no: Int? = null,
+    artistThumb: String? = null,
+    thumbSize: Int = 544,
+    preResolvedCanonical: SonoraApiInterceptor.CanonicalSongMeta? = null,
+    skipCanonicalPeek: Boolean = false,
+): JSONObject {
     val (hue, style) = SonoraColors.look(id)
     val validArtists = cleanArtistsList(artists)
     val artistName = validArtists.joinToString(", ") { it.name }.ifEmpty {
@@ -6264,7 +6492,8 @@ fun SongItem.toJson(no: Int? = null, artistThumb: String? = null, thumbSize: Int
     val artistId = validArtists.firstOrNull { it.id != null }?.id ?: artists.firstOrNull { it.id != null }?.id
     val rawAlbName = album?.name?.trim().orEmpty()
     val leadArtistName = validArtists.firstOrNull()?.name ?: artists.firstOrNull { it.name.isNotBlank() }?.name.orEmpty()
-    val cachedCanon = SonoraApiInterceptor.peekCachedCanonicalSongMeta(title, leadArtistName, rawAlbName)
+    val cachedCanon = preResolvedCanonical
+        ?: if (skipCanonicalPeek) null else SonoraApiInterceptor.peekCachedCanonicalSongMeta(title, leadArtistName, rawAlbName)
     val cachedAlbThumb = cachedCanon?.coverUrl?.let { SonoraApiInterceptor.resizeCoverApiUrl(it, thumbSize) }
         ?: if (rawAlbName.isNotEmpty() && !SonoraApiInterceptor.isLikelyCompilationAlbum(rawAlbName, title, leadArtistName)) {
             SonoraApiInterceptor.peekCachedAlbumThumb(rawAlbName, leadArtistName, thumbSize)
@@ -6347,9 +6576,8 @@ fun AlbumItem.toJson(withTracks: Boolean = false, songs: List<SongItem> = emptyL
 
 internal fun isBannerUrl(u: String?): Boolean {
     if (u.isNullOrBlank()) return false
-    val bannerIndicators = listOf("w2160", "-h900", "w1920", "-h800", "w1440", "-h600", "w816", "-h340", "w540", "-h225")
-    if (bannerIndicators.any { u.contains(it) }) return true
-    val match = Regex("""[=\-]w(\d+)-h(\d+)""").find(u)
+    if (BANNER_INDICATORS.any { u.contains(it) }) return true
+    val match = BANNER_DIM_RE.find(u)
     if (match != null) {
         val w = match.groupValues[1].toIntOrNull() ?: 0
         val h = match.groupValues[2].toIntOrNull() ?: 1

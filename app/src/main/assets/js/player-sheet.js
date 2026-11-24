@@ -1,8 +1,19 @@
 const _hasLetterSpacing = typeof sc !== 'undefined' && sc && ('letterSpacing' in sc);
-let SHITS = [], OV_SHITS = [];
+let SHITS = [], OV_SHITS = [], _curShY = null;
 const shY = () => (1 - SH.t) * H + SH.drag;
-function shit(x, y, w, h, fn, tag, extra) { const o = { x, y: y + shY(), w, h, fn, tag }; if (extra) Object.assign(o, extra); SHITS.push(o); return o; }
-function ovShit(x, y, w, h, fn, tag, extra) { const o = { x, y: y + shY(), w, h, fn, tag }; if (extra) Object.assign(o, extra); OV_SHITS.push(o); return o; }
+function shit(x, y, w, h, fn, tag, extra) {
+  if (typeof REG !== 'undefined' && !REG) return null;
+  const o = { x, y: y + (_curShY != null ? _curShY : shY()), w, h, fn, tag };
+  if (extra) Object.assign(o, extra);
+  SHITS.push(o);
+  return o;
+}
+function ovShit(x, y, w, h, fn, tag, extra) {
+  const o = { x, y: y + (_curShY != null ? _curShY : shY()), w, h, fn, tag };
+  if (extra) Object.assign(o, extra);
+  OV_SHITS.push(o);
+  return o;
+}
 function shLay() {
   const bcy = H - (FRAME ? 58 : 48), vy = bcy - 48, tcy = vy - 94, sy = tcy - 96;
   const alRaw = (SH.mode === 'lyrics' && !SRCUI.open) ? clamp(SH.aloneT || 0, 0, 1) : 0;
@@ -67,21 +78,28 @@ function shInk(t, clOpt) {
   _SH_INK_CACHE.out = out;
   return out;
 }
+const _SH_ACC_CACHE = { key: '', out: '' };
 function shTrackAccent(t) {
   t = t || (typeof cur === 'function' ? cur() : null);
   const cl = (typeof SH !== 'undefined' && SH.cols) || (t && typeof shaderPalette === 'function' ? shaderPalette(t) : null);
   const c0 = (cl && cl[0]) ? cl[0] : [250, 46, 73];
+  const key = Math.round(c0[0]) + ',' + Math.round(c0[1]) + ',' + Math.round(c0[2]);
+  if (_SH_ACC_CACHE.key === key && _SH_ACC_CACHE.out) return _SH_ACC_CACHE.out;
   const [bh, bs, bl] = rgb2hsl(c0[0], c0[1], c0[2]);
   const bNeu = bs < .08;
   const trgb = bNeu
     ? hsl2rgb(bh, 0, clamp(bl * 1.45 + .22, .48, .72))
     : hsl2rgb(bh, clamp(bs * 1.15, .48, .95), clamp(bl * 1.2 + .08, .42, .58));
-  return 'rgb(' + Math.round(trgb[0]) + ',' + Math.round(trgb[1]) + ',' + Math.round(trgb[2]) + ')';
+  _SH_ACC_CACHE.key = key;
+  return (_SH_ACC_CACHE.out = 'rgb(' + Math.round(trgb[0]) + ',' + Math.round(trgb[1]) + ',' + Math.round(trgb[2]) + ')');
 }
+const _SH_DL_CACHE = { key: '', out: null };
 function shDlBadgeCols(t) {
   t = t || (typeof cur === 'function' ? cur() : null);
   const cl = (typeof SH !== 'undefined' && SH.cols) || (t && typeof shaderPalette === 'function' ? shaderPalette(t) : null);
   const c0 = (cl && cl[0]) ? cl[0] : [250, 46, 73];
+  const key = Math.round(c0[0]) + ',' + Math.round(c0[1]) + ',' + Math.round(c0[2]);
+  if (_SH_DL_CACHE.key === key && _SH_DL_CACHE.out) return _SH_DL_CACHE.out;
   const [bh, bs, bl] = rgb2hsl(c0[0], c0[1], c0[2]);
   const bNeu = bs < .08;
   const fillRgb = bNeu
@@ -90,16 +108,18 @@ function shDlBadgeCols(t) {
   const arrowRgb = bNeu
     ? [34, 34, 38]
     : hsl2rgb(bh, clamp(bs * .40, .18, .36), .18);
-  return {
+  _SH_DL_CACHE.key = key;
+  return (_SH_DL_CACHE.out = {
     fill: 'rgb(' + Math.round(fillRgb[0]) + ',' + Math.round(fillRgb[1]) + ',' + Math.round(fillRgb[2]) + ')',
     arrow: 'rgb(' + Math.round(arrowRgb[0]) + ',' + Math.round(arrowRgb[1]) + ',' + Math.round(arrowRgb[2]) + ')'
-  };
+  });
 }
 
 const FLU = { ok: null, cv: null, gl: null, loc: null };
+const _FLU_W = 112;
 function fluidInit() {
   try {
-    const cv = document.createElement('canvas'); cv.width = 160; cv.height = 340;
+    const cv = document.createElement('canvas'); cv.width = _FLU_W; cv.height = Math.round(_FLU_W * 2.15);
     const gl = cv.getContext('webgl', { antialias: false, alpha: false, preserveDrawingBuffer: false }); if (!gl) throw 0;
     const vs = 'attribute vec2 a;void main(){gl_Position=vec4(a,0.,1.);}';
     const fs = `#ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -154,17 +174,18 @@ const _FLU_C = [new Float32Array(3), new Float32Array(3), new Float32Array(3), n
 let _FLU_COLS = null, _fluCacheCv = null, _fluCacheCtx = null, _fluLastPh = NaN, _fluLastW = 0, _fluLastH = 0;
 function fluidPaint(c, cl, ph, w, h) {
   if (FLU.ok === null) fluidInit(); if (!FLU.ok) return false;
-  const gl = FLU.gl, cv = FLU.cv, L = FLU.loc, ch = Math.round(160 * h / w);
+  const gl = FLU.gl, cv = FLU.cv, L = FLU.loc, ch = Math.max(1, Math.round(_FLU_W * h / Math.max(1, w)));
+  if (cv.width !== _FLU_W) cv.width = _FLU_W;
   if (cv.height !== ch) cv.height = ch;
   let colsDirty = !_FLU_COLS || _FLU_COLS.length !== cl.length;
   if (!colsDirty) {
     for (let i = 0; i < cl.length; i++) {
-      if (_FLU_COLS[i][0] !== cl[i][0] || _FLU_COLS[i][1] !== cl[i][1] || _FLU_COLS[i][2] !== cl[i][2]) { colsDirty = true; break; }
+      if (Math.abs(_FLU_COLS[i][0] - cl[i][0]) > 0.25 || Math.abs(_FLU_COLS[i][1] - cl[i][1]) > 0.25 || Math.abs(_FLU_COLS[i][2] - cl[i][2]) > 0.25) { colsDirty = true; break; }
     }
   }
-  const samePh = !colsDirty && _fluCacheCv && _fluLastW === cv.width && _fluLastH === cv.height && Math.abs(ph - _fluLastPh) < 1e-5;
+  const samePh = !colsDirty && _fluCacheCv && _fluLastW === cv.width && _fluLastH === cv.height && Math.abs(ph - _fluLastPh) < 0.014;
   if (samePh) {
-    c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high'; c.drawImage(_fluCacheCv, 0, 0, w, h);
+    c.drawImage(_fluCacheCv, 0, 0, w, h);
     return true;
   }
   if (colsDirty) {
@@ -190,23 +211,25 @@ function fluidPaint(c, cl, ph, w, h) {
   if (_fluCacheCv.width !== cv.width || _fluCacheCv.height !== cv.height) { _fluCacheCv.width = cv.width; _fluCacheCv.height = cv.height; }
   _fluCacheCtx.drawImage(cv, 0, 0);
   _fluLastPh = ph; _fluLastW = cv.width; _fluLastH = cv.height;
-  c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high'; c.drawImage(_fluCacheCv, 0, 0, w, h);
+  c.drawImage(_fluCacheCv, 0, 0, w, h);
   return true;
 }
 
 let _shGrad = null, _shGradH = -1, _shGradCtx = null;
-let _artShadCv = null, _artShadCtx = null, _artShadKey = '', _artShadPad = 0, _artShadLw = 0, _artShadLh = 0;
+let _artShadCv = null, _artShadCtx = null, _artShadKey = '', _artShadPad = 0, _artShadLw = 0, _artShadLh = 0, _artShadRefS = 0;
 
 function drawSheet(c) {
   SH.lyStyleBtns = null;
-  if (SH.t < .002 && !SH.drag) return; const t = cur(), oy = shY(), L = shLay(), H0 = albumOf(t).hue, K = SH.t;
+  if (SH.t < .002 && !SH.drag) return; const t = cur(), oy = shY(), L = shLay(), K = SH.t;
+  _curShY = oy;
   SHITS = []; c.save(); c.translate(0, oy);
-  const rad = 46 * (1 - clamp((SH.t - .9) / .1, 0, 1)); rrPath(c, 0, 0, W, H + 80, rad); c.clip();
+  const rad = 46 * (1 - clamp((SH.t - .9) / .1, 0, 1));
+  if (rad > 0.25) { rrPath(c, 0, 0, W, H + 80, rad); c.clip(); }
   const cl = SH.cols || shaderPalette(t), ph = SH.phase, rgba = (q, al) => 'rgba(' + (q[0] | 0) + ',' + (q[1] | 0) + ',' + (q[2] | 0) + ',' + al + ')';
   const dark = cl.reduce((m, q) => (q[0] + q[1] + q[2] < m[0] + m[1] + m[2] ? q : m), cl[0]);
   const cutCol = rgba([dark[0] * .28, dark[1] * .28, dark[2] * .28], .96);
-  c.fillStyle = rgba([dark[0] * .32, dark[1] * .32, dark[2] * .32], 1); c.fillRect(0, 0, W, H + 80);
   if (!fluidPaint(c, cl, ph, W, H + 80)) {
+    c.fillStyle = rgba([dark[0] * .32, dark[1] * .32, dark[2] * .32], 1); c.fillRect(0, 0, W, H + 80);
     const R = Math.max(W, H);
     cl.forEach((q, i) => {
       const a1 = ph * (.55 + i * .13) + i * 1.9, a2 = ph * (.42 + i * .11) + i * 2.7, bx = W * (.5 + .52 * Math.sin(a1)), by = H * (.5 + .46 * Math.cos(a2)), br = R * (.5 + .14 * Math.sin(ph * .7 + i));
@@ -221,9 +244,10 @@ function drawSheet(c) {
   const ink = shInk(t, cl);
   const white = ink.rgba(.96), dim = ink.rgba(.66, true), dimSub = ink.rgba(.56, true);
   rrPath(c, W / 2 - 20, TOP - 8, 40, 5, 2.5); c.fillStyle = ink.rgba(.38, true); c.fill();
+  const _mtw = (fnt, s) => (typeof measureTw === 'function' ? measureTw(c, fnt, s) : (c.font = fnt, c.measureText(s).width));
   const drawEx = (tx, ty, shown, font) => {
     if (!t.ex) return;
-    c.font = font; const tw = c.measureText(shown).width, bx = tx + tw + 7, by = ty - 15;
+    const tw = _mtw(font, shown), bx = tx + tw + 7, by = ty - 15;
     rrPath(c, bx, by, 15.5, 15.5, 3.5); c.fillStyle = ink.rgba(.58, true); c.fill();
     txt(c, 'E', bx + 7.75, by + 11.4, F(800, 10), cutCol, 'center');
   };
@@ -235,37 +259,43 @@ function drawSheet(c) {
   if (p < .98) {
     const shK = clamp((sc - .82) / .18, 0, 1.2), shA = (.24 + .26 * shK) * (1 - p);
     if (shA > .01) {
-      const shAStr = (.24 + .26 * shK).toFixed(2);
-      const blur = 20 + 24 * shK, offY = 9 + 13 * shK;
-      const dpr = Math.max(1, (typeof S !== 'undefined' && W) ? S.width / W : 1);
-      const qS = Math.round(s0 * 2) / 2, qR = Math.round(r0 * 2) / 2, qB = Math.round(blur * 2) / 2, qY = Math.round(offY * 2) / 2;
-      const key = shAStr + '|' + qS + '|' + qR + '|' + qB + '|' + qY + '|' + dpr.toFixed(2);
+      const refS = Math.round(L.as_art), refR = 16, refBlur = 38;
+      const key = refS + '|' + refR + '|pure';
       if (!_artShadCv) { _artShadCv = document.createElement('canvas'); _artShadCtx = _artShadCv.getContext('2d'); }
       if (_artShadKey !== key) {
         _artShadKey = key;
-        const pad = Math.ceil(qB * 1.6 + Math.abs(qY) + 4);
-        const lw = Math.ceil(qS + pad * 2), lh = Math.ceil(qS + pad * 2);
-        const pw = Math.max(1, Math.ceil(lw * dpr)), ph2 = Math.max(1, Math.ceil(lh * dpr));
-        if (_artShadCv.width !== pw) _artShadCv.width = pw;
-        if (_artShadCv.height !== ph2) _artShadCv.height = ph2;
-        _artShadPad = pad; _artShadLw = lw; _artShadLh = lh;
+        const pad = Math.ceil(refBlur * 1.6 + 8);
+        const lw = Math.ceil(refS + pad * 2), lh = Math.ceil(refS + pad * 2);
+        if (_artShadCv.width !== lw) _artShadCv.width = lw;
+        if (_artShadCv.height !== lh) _artShadCv.height = lh;
+        _artShadPad = pad; _artShadLw = lw; _artShadLh = lh; _artShadRefS = refS;
         const ctx = _artShadCtx;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.clearRect(0, 0, lw, lh);
         ctx.save();
-        ctx.shadowColor = 'rgba(0,0,0,' + shAStr + ')';
-        ctx.shadowBlur = qB;
-        ctx.shadowOffsetX = 0;
-        ctx.shadowOffsetY = qY;
-        rrPath(ctx, pad, pad, qS, qS, qR);
-        ctx.fillStyle = '#000';
-        ctx.fill();
+        if ('filter' in ctx) {
+          ctx.filter = 'blur(' + (refBlur * 0.5) + 'px)';
+          rrPath(ctx, pad, pad, refS, refS, refR);
+          ctx.fillStyle = 'rgba(0,0,0,0.50)';
+          ctx.fill();
+          ctx.filter = 'none';
+        } else {
+          const castOff = lh + refBlur * 2 + 64;
+          ctx.shadowColor = 'rgba(0,0,0,0.50)';
+          ctx.shadowBlur = refBlur;
+          ctx.shadowOffsetX = 0;
+          ctx.shadowOffsetY = castOff;
+          rrPath(ctx, pad, pad - castOff, refS, refS, refR);
+          ctx.fillStyle = '#000';
+          ctx.fill();
+        }
         ctx.restore();
       }
-      const scaleSh = curS / Math.max(1, qS);
+      const scaleSh = curS / Math.max(1, _artShadRefS);
+      const shOffY = (9 + 13 * shK) * (1 - p);
       c.save();
-      c.globalAlpha *= (1 - p);
-      c.drawImage(_artShadCv, curX - _artShadPad * scaleSh, curY - _artShadPad * scaleSh, _artShadLw * scaleSh, _artShadLh * scaleSh);
+      c.globalAlpha *= clamp(shA / 0.50, 0, 1);
+      c.drawImage(_artShadCv, curX - _artShadPad * scaleSh, curY - _artShadPad * scaleSh + shOffY, _artShadLw * scaleSh, _artShadLh * scaleSh);
       c.restore();
     }
   }
@@ -308,8 +338,7 @@ function drawSheet(c) {
     drawEx(28, L.ty0_art + dy0, shownT0, F(700, 21));
     const shownA0 = txt(c, subOfTrack(t), 28, L.ty0_art + 23 + dy0, F(400, 19.5), dim, 'left', mwA0);
     if (pt < .5) {
-      c.font = F(400, 19.5);
-      const aw0 = Math.max(80, Math.min(mwA0, c.measureText(shownA0).width + 20));
+      const aw0 = Math.max(80, Math.min(mwA0, _mtw(F(400, 19.5), shownA0) + 20));
       shit(20, L.ty0_art + 4 + dy0, aw0, 28, () => openTrackArtist(t));
     }
     c.restore();
@@ -321,8 +350,7 @@ function drawSheet(c) {
     drawEx(92, TOP + 52 + dy1, shownT1, F(600, 18));
     const shownA1 = txt(c, subOfTrack(t), 92, TOP + 71 + dy1, F(400, 18), dim, 'left', mwA1);
     if (pt >= .5) {
-      c.font = F(400, 18);
-      const aw1 = Math.max(80, Math.min(mwA1, c.measureText(shownA1).width + 20));
+      const aw1 = Math.max(80, Math.min(mwA1, _mtw(F(400, 18), shownA1) + 20));
       shit(86, TOP + 54 + dy1, aw1, 26, () => openTrackArtist(t));
     }
     c.restore();
@@ -440,6 +468,7 @@ function drawSheet(c) {
     c.restore();
   }
   c.restore();
+  _curShY = null;
   if (K > .002) {  }
 }
 
@@ -447,15 +476,15 @@ const LY_FS = 31, LY_LH = 39, LY_GAP = 16, BG_FS = 22, BG_LH = 28;
 const _qFont = F(600, 10.5), _lyTransFont = F(500, 16);
 const _qBadge = { label: '', w: 0, badgeW: 80, fitted: '' };
 function lyChs(c, tx) {
-  const arr = Array.from(tx), n = arr.length, out = [];
+  const arr = Array.from(tx), n = arr.length, out = new Array(n);
   let acc = '', prevW = 0;
   for (let i = 0; i < n; i++) {
     const ch = arr[i], w = c.measureText(ch).width;
     acc += ch;
-    const nextW = c.measureText(acc).width;
+    const nextW = i === 0 ? w : c.measureText(acc).width;
     const x = i === 0 ? 0 : (w > 0 ? Math.max(prevW - w * 0.45, nextW - w) : prevW);
     prevW = nextW;
-    out.push({ ch, x, w, i, n });
+    out[i] = { ch, x, w, i, n };
   }
   return out;
 }
@@ -545,6 +574,37 @@ function lyProg(it, ln, pos, tf) {
   if (it.s != null && it.e != null) return it.e > it.s ? clamp((pos - it.s) / (it.e - it.s), 0, 1) : (pos >= it.s ? 1 : 0);
   return clamp((tf - it.a) / Math.max(.001, it.b - it.a), 0, 1);
 }
+const _lyGapOffsets = [];
+const _lyGapStates = [];
+const _LY_BLUR_PAD = 18;
+const _LY_BLUR_MAX = 18;
+const _lyBlurLru = [];
+function _touchLyBlurLru(b) {
+  const idx = _lyBlurLru.indexOf(b);
+  if (idx >= 0) _lyBlurLru.splice(idx, 1);
+  _lyBlurLru.push(b);
+}
+function _allocLyBlurCanvas(b) {
+  if (b._bCv) { _touchLyBlurLru(b); return b._bCv; }
+  let cv = null;
+  while (_lyBlurLru.length >= _LY_BLUR_MAX) {
+    const old = _lyBlurLru.shift();
+    if (old && old !== b && old._bCv) {
+      cv = old._bCv;
+      old._bCv = null;
+      old._bCtx = null;
+      old._bBlur = -1;
+      break;
+    }
+  }
+  if (!cv) cv = document.createElement('canvas');
+  b._bCv = cv;
+  _lyBlurLru.push(b);
+  return cv;
+}
+function _lyQuantBlur(blurPx) {
+  return Math.round(Math.max(.34, blurPx) * 1.5) / 1.5;
+}
 function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
   const sPos = PL.sPos != null ? PL.sPos : PL.pos;
   const objs = lyObjs(t);
@@ -566,11 +626,14 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
       introVis = introAlpha > .005;
     }
   }
-  const gapOffsets = new Array(blocks.length);
-  const gapStates = new Array(blocks.length);
+  const gapOffsets = _lyGapOffsets;
+  const gapStates = _lyGapStates;
+  gapOffsets.length = blocks.length;
+  gapStates.length = blocks.length;
   let dynShift = introH, gapVis = false;
   for (let i = 0; i < blocks.length; i++) {
     gapOffsets[i] = dynShift;
+    gapStates[i] = null;
     const b = blocks[i];
     if (b.isGap && sPos >= b.gapStart && sPos < b.gapEnd - LY_EXIT_END_S) {
       const uIn = clamp((sPos - b.gapStart) / 0.25, 0, 1), inE = uIn * uIn * (3 - 2 * uIn);
@@ -614,12 +677,15 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
       c.restore();
     }
   }
-  const dim = ink.rgba(.42, true), activeCol = ink.hi, fnt = F(700, LY_FS), fb = F(700, BG_FS);
+  const dim = ink.rgba(.42, true), activeCol = ink.hi, bgDim = ink.rgba(.26, true), bgHi = ink.rgba(.78), transCol = ink.rgba(.85, true);
+  const fnt = F(700, LY_FS), fb = F(700, BG_FS);
   const isAnim = (SRCUI.style || 'anim') === 'anim';
   const RISE = .14, FALL = .48, TOT = RISE + FALL;
   const morphing = L.p > 0.01 && L.p < 0.99;
+  const aloneAmt = L.alone || 0;
   let blurBuiltThisFrame = 0;
-  blocks.forEach((b, i) => {
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
     const yOff = gapOffsets[i] || 0;
     if (b.isGap) {
       const gs = gapStates[i];
@@ -633,8 +699,10 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
           c.restore();
         }
       }
-      return;
+      continue;
     }
+    const byTop = L.regTop + b.y + yOff - SH.lScroll, byBot = byTop + b.h;
+    if (byBot < L.regTop - 50 || byTop > L.regBot + 50) continue;
     const act = i === ci, ln = b.ln, lStart = times[i] || 0, end = ln.end != null ? ln.end : (times[i + 1] || t.dur);
     const lDur = Math.max(.4, end - lStart), tf = act ? clamp((sPos - lStart) / Math.max(.001, lDur), 0, 1) : (i < ci ? 1 : 0);
     const rawK = b.k != null ? b.k : (act ? 1 : 0);
@@ -643,28 +711,26 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
     const actK = isAnim ? smK : (act ? 1 : 0);
     const lineSc = isAnim ? (1 + .016 * actK) : 1;
     const rawDist = isAnim ? (b.df != null ? b.df : 1) : 1;
-    const distFade = mix(rawDist, Math.max(rawDist, .70), L.alone || 0);
+    const distFade = mix(rawDist, Math.max(rawDist, .70), aloneAmt);
     const rawBlur = isAnim ? (b.blur != null ? b.blur : (i === fci ? 0 : (i > fci ? clamp((i - fci) * .72, 0, 3.0) : clamp((fci - i) * .85, 0, 2.8)))) : 0;
-    const effBlur = rawBlur * mix(1, .80, L.alone || 0);
-    const blockMidY = L.regTop + b.y + yOff + b.h * .42 - SH.lScroll;
-    const byTop = L.regTop + b.y + yOff - SH.lScroll, byBot = byTop + b.h;
-    if (byBot < L.regTop - 50 || byTop > L.regBot + 50) return;
+    const effBlur = rawBlur * mix(1, .80, aloneAmt);
+    const blockMidY = byTop + b.h * .42;
     /* continuous weight for the blurred pass: rises with blur and fades with line activation so focus & blur crossfade smoothly */
     const blurW = (isAnim && !act) ? clamp(effBlur / .5, 0, 1) * (1 - actK) : 0;
     let paintK = 1 - blurW;
     if (blurW > .004) {
-      const qBlur = Math.round(Math.max(.34, effBlur) * 3) / 3;
-      const pad = Math.ceil(qBlur * 2.5) + 10;
-      const bh = Math.ceil(b.h + pad * 2);
+      const qBlur = _lyQuantBlur(effBlur);
+      const bh = Math.ceil(b.h + _LY_BLUR_PAD * 2);
       const needsBuild = !b._bCv || b._bBlur !== qBlur || b._bW !== W || b._bH !== bh || b._bTint !== ink.qKey;
       const maxBlurBuilds = morphing ? 1 : 2;
       if (needsBuild && blurBuiltThisFrame >= maxBlurBuilds) {
         paintK = 1;
-        if (typeof scheduleAnimRedraw === 'function') scheduleAnimRedraw();
+        if (typeof scheduleSceneAnimRedraw === 'function') scheduleSceneAnimRedraw();
+        else if (typeof scheduleAnimRedraw === 'function') scheduleAnimRedraw();
       } else {
         if (needsBuild) blurBuiltThisFrame++;
         const cv = drawBlurredLyBlock(c, b, Math.max(.34, effBlur), fnt, fb, ink);
-        const bw = b._bW || W, bPad = b._bPad || pad, bH = b._bH || bh, dy = byTop - bPad;
+        const bw = b._bW || W, bPad = b._bPad || _LY_BLUR_PAD, bH = b._bH || bh, dy = byTop - bPad;
         const al = distFade * fadeAlpha * blurW;
         if (al > .004) drawLyMasked(c, cv, dy, bw, bH, al, L);
         if (blurW >= .995 && actK < .02) {
@@ -672,103 +738,117 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
             const cy0 = Math.max(L.regTop, byTop), cy1 = Math.min(L.regBot, byBot);
             shit(0, cy0, W, cy1 - cy0, () => seek((times[i] || 0) + .2), 'lyrics');
           }
-          return;
+          continue;
         }
       }
     }
-    const baseAl = bCol => bCol === dim ? .42 : .26;
-    const hiAl = hCol => hCol === activeCol ? 1 : .78;
-    const paint = (rows, y0, lh, font, fs, base, hi, bgl) => rows.forEach((r, j) => {
-      const yy = L.regTop + b.y + yOff + y0 + (j + 1) * lh - 8 - SH.lScroll; if (yy < L.regTop - 50 || yy > L.regBot + 50) return;
-      /* match the exact edge fade curve of the cached blurred pass (lyEdgeY) to avoid any opacity jump on handoff */
-      const edge = isAnim ? lyEdgeY(L, yy - 12) : (clamp((yy - L.regTop) / 48, 0, 1) * clamp((L.regBot - yy + 30) / 70, 0, 1));
-      c.save();
-      c.globalAlpha = edge * distFade * fadeAlpha * paintK;
-      if (lineSc !== 1 && !bgl) { c.translate(24, blockMidY); c.scale(lineSc, lineSc); c.translate(-24, -blockMidY); }
-      const bA = baseAl(base), hA = hiAl(hi);
-      r.it.forEach(it => {
-        const x = 24 + r.ox + it.x;
-        let chs = it.chs;
-        if (!chs && isAnim && (act || (i < ci && actK > .01))) {
-          c.font = font;
-          chs = it.chs = lyChs(c, it.t);
-        }
-        if (isAnim && (act || (i < ci && actK > .01)) && chs && chs.length) {
-          const n = chs.length;
-          const wStart = (it.s != null && it.e != null) ? it.s : (lStart + it.a * lDur * .82);
-          const wDur = (it.s != null && it.e != null) ? Math.max(.06, it.e - it.s) : Math.max(.08, (it.b - it.a) * lDur * .82);
-          const step = n > 1 ? clamp((wDur * .78) / (n - 1), .028, .056) : 0;
-          const firstT0 = wStart - .03, lastEnd = wStart + (n - 1) * step - .03 + TOT;
-          if (sPos <= firstT0) {
-            txt(c, it.t, x, yy, font, base, 'left', 0, true);
-          } else if (sPos >= lastEnd) {
-            const al = bA + (hA - bA) * actK;
-            txt(c, it.t, x, yy, font, ink.rgba(al.toFixed(3)), 'left', 0, true);
-          } else {
-            c.font = font; c.textAlign = 'left'; c.textBaseline = 'alphabetic';
-            for (let ciCh = 0; ciCh < n; ciCh++) {
-              const ch = chs[ciCh];
-              if (ch.ch === ' ') continue;
-              const dtCh = sPos - (firstT0 + ciCh * step);
-              if (dtCh <= 0) {
-                c.fillStyle = base;
-                c.fillText(ch.ch, x + ch.x, yy);
-              } else if (dtCh >= TOT) {
-                const al = bA + (hA - bA) * actK;
-                c.fillStyle = ink.rgba(al.toFixed(3));
-                c.fillText(ch.ch, x + ch.x, yy);
-              } else {
-                const uCol = clamp(dtCh / .22, 0, 1), lps = uCol * uCol * (3 - 2 * uCol);
-                let env;
-                if (dtCh < RISE) {
-                  const u = dtCh / RISE;
-                  env = u * u * (3 - 2 * u);
+    const paint = (rows, y0, lh, font, fs, base, hi, bgl) => {
+      const bA = base === dim ? .42 : .26, hA = hi === activeCol ? 1 : .78;
+      const doneCol = ink.rgba((bA + (hA - bA) * actK).toFixed(3));
+      for (let j = 0; j < rows.length; j++) {
+        const r = rows[j];
+        const yy = byTop + y0 + (j + 1) * lh - 8; if (yy < L.regTop - 50 || yy > L.regBot + 50) continue;
+        /* match the exact edge fade curve of the cached blurred pass (lyEdgeY) to avoid any opacity jump on handoff */
+        const edge = isAnim ? lyEdgeY(L, yy - 12) : (clamp((yy - L.regTop) / 48, 0, 1) * clamp((L.regBot - yy + 30) / 70, 0, 1));
+        c.save();
+        c.globalAlpha = edge * distFade * fadeAlpha * paintK;
+        if (lineSc !== 1 && !bgl) { c.translate(24, blockMidY); c.scale(lineSc, lineSc); c.translate(-24, -blockMidY); }
+        for (let ri = 0; ri < r.it.length; ri++) {
+          const it = r.it[ri];
+          const x = 24 + r.ox + it.x;
+          let chs = it.chs;
+          if (!chs && isAnim && (act || (i < ci && actK > .01))) {
+            c.font = font;
+            chs = it.chs = lyChs(c, it.t);
+          }
+          if (isAnim && (act || (i < ci && actK > .01)) && chs && chs.length) {
+            const n = chs.length;
+            const wStart = (it.s != null && it.e != null) ? it.s : (lStart + it.a * lDur * .82);
+            const wDur = (it.s != null && it.e != null) ? Math.max(.06, it.e - it.s) : Math.max(.08, (it.b - it.a) * lDur * .82);
+            const step = n > 1 ? clamp((wDur * .78) / (n - 1), .028, .056) : 0;
+            const firstT0 = wStart - .03, lastEnd = wStart + (n - 1) * step - .03 + TOT;
+            if (sPos <= firstT0) {
+              txt(c, it.t, x, yy, font, base, 'left', 0, true);
+            } else if (sPos >= lastEnd) {
+              txt(c, it.t, x, yy, font, doneCol, 'left', 0, true);
+            } else {
+              c.font = font; c.textAlign = 'left'; c.textBaseline = 'alphabetic';
+              let ciCh = 0;
+              while (ciCh < n) {
+                const ch = chs[ciCh];
+                if (ch.ch === ' ') { ciCh++; continue; }
+                const dtCh = sPos - (firstT0 + ciCh * step);
+                if (dtCh <= 0) {
+                  let run = ch.ch, k = ciCh + 1;
+                  while (k < n && (sPos - (firstT0 + k * step)) <= 0) { run += chs[k].ch; k++; }
+                  c.fillStyle = base;
+                  c.fillText(run, x + ch.x, yy);
+                  ciCh = k;
+                } else if (dtCh >= TOT) {
+                  let run = ch.ch, k = ciCh + 1;
+                  while (k < n && (sPos - (firstT0 + k * step)) >= TOT) { run += chs[k].ch; k++; }
+                  c.fillStyle = doneCol;
+                  c.fillText(run, x + ch.x, yy);
+                  ciCh = k;
                 } else {
-                  const u = (dtCh - RISE) / FALL;
-                  env = 1 - u * u * u * (u * (u * 6 - 15) + 10);
+                  const uCol = clamp(dtCh / .22, 0, 1), lps = uCol * uCol * (3 - 2 * uCol);
+                  let env;
+                  if (dtCh < RISE) {
+                    const u = dtCh / RISE;
+                    env = u * u * (3 - 2 * u);
+                  } else {
+                    const u = (dtCh - RISE) / FALL;
+                    env = 1 - u * u * u * (u * (u * 6 - 15) + 10);
+                  }
+                  const al = bA + (hA - bA) * lps * actK;
+                  c.fillStyle = ink.rgba(al.toFixed(3));
+                  if (env * actK > 0.004) {
+                    const cLift = -5.2 * env * actK;
+                    const cSc = 1 + .105 * env * actK;
+                    const cx = x + ch.x + ch.w * .5, cy = yy - fs * .32 + cLift;
+                    c.save();
+                    c.translate(cx, cy); c.scale(cSc, cSc); c.translate(-cx, -cy);
+                    c.fillText(ch.ch, x + ch.x, yy + cLift);
+                    c.restore();
+                  } else {
+                    c.fillText(ch.ch, x + ch.x, yy);
+                  }
+                  ciCh++;
                 }
-                const cLift = -5.2 * env * actK;
-                const cSc = 1 + .105 * env * actK;
-                const al = bA + (hA - bA) * lps * actK;
-                const cx = x + ch.x + ch.w * .5, cy = yy - fs * .32 + cLift;
-                c.save();
-                c.translate(cx, cy); c.scale(cSc, cSc); c.translate(-cx, -cy);
-                c.fillStyle = ink.rgba(al.toFixed(3));
-                c.fillText(ch.ch, x + ch.x, yy + cLift);
-                c.restore();
               }
             }
-          }
-        } else {
-          const p = act ? lyProg(it, ln, sPos, tf) : 0;
-          txt(c, it.t, x, yy, font, base, 'left', 0, true);
-          if (act && p > 0) {
-            c.save(); c.beginPath(); c.rect(x - 4, yy - 42, it.tw * p + 6 * (p >= 1 ? 1 : 0), 56); c.clip();
-            txt(c, it.t, x, yy, font, hi, 'left', 0, true);
-            c.restore();
+          } else {
+            const p = act ? lyProg(it, ln, sPos, tf) : 0;
+            txt(c, it.t, x, yy, font, base, 'left', 0, true);
+            if (act && p > 0) {
+              c.save(); c.beginPath(); c.rect(x - 4, yy - 42, it.tw * p + 6 * (p >= 1 ? 1 : 0), 56); c.clip();
+              txt(c, it.t, x, yy, font, hi, 'left', 0, true);
+              c.restore();
+            }
           }
         }
-      });
-      c.restore();
-    });
+        c.restore();
+      }
+    };
     paint(b.rows, 0, LY_LH, fnt, LY_FS, dim, activeCol, false);
-    if (b.bg) b.bg.forEach(x => paint(x.rows, x.y, BG_LH, fb, BG_FS, ink.rgba(.26, true), ink.rgba(.78), true));
+    if (b.bg) for (let bi = 0; bi < b.bg.length; bi++) paint(b.bg[bi].rows, b.bg[bi].y, BG_LH, fb, BG_FS, bgDim, bgHi, true);
     if (b.trans && b.trans.lines.length) {
-      b.trans.lines.forEach((tl, ti) => {
-        const ty = L.regTop + b.y + yOff + b.trans.y + (ti + 1) * 20 - 4 - SH.lScroll;
-        if (ty < L.regTop - 40 || ty > L.regBot + 40) return;
+      for (let ti = 0; ti < b.trans.lines.length; ti++) {
+        const tl = b.trans.lines[ti];
+        const ty = byTop + b.trans.y + (ti + 1) * 20 - 4;
+        if (ty < L.regTop - 40 || ty > L.regBot + 40) continue;
         const edge = isAnim ? lyEdgeY(L, ty - 8) : (clamp((ty - L.regTop) / 48, 0, 1) * clamp((L.regBot - ty + 30) / 70, 0, 1));
         c.save();
         c.globalAlpha = edge * distFade * fadeAlpha * paintK * (act ? .78 : .42);
-        txt(c, tl, 24, ty, _lyTransFont, ink.rgba(.85, true), 'left');
+        txt(c, tl, 24, ty, _lyTransFont, transCol, 'left');
         c.restore();
-      });
+      }
     }
     if (REG && activeHit && fadeAlpha > .5 && byBot > L.regTop && byTop < L.regBot) {
       const cy0 = Math.max(L.regTop, byTop), cy1 = Math.min(L.regBot, byBot);
       shit(0, cy0, W, cy1 - cy0, () => seek((times[i] || 0) + .2), 'lyrics');
     }
-  });
+  }
   c.restore(); if (activeHit && fadeAlpha > .5) shit(0, L.regTop, W, L.regBot - L.regTop, null, 'lyrics');
 }
 
@@ -778,17 +858,18 @@ function lyEdgeY(L, y) {
   const t = clamp((y - L.regTop) / LY_TOPZ, 0, 1), b = clamp((L.regBot - y) / LY_BOTZ, 0, 1);
   return (t * t * (3 - 2 * t)) * (b * b * (3 - 2 * b));
 }
-let _lyMaskCv = null;
-let _qMaskCv = null;
+let _lyMaskCv = null, _lyMaskCtx = null;
+let _qMaskCv = null, _qMaskCtx = null;
 function drawLyMasked(c, cv, dy, bw, bh, al, L) {
   const fadeTopEnd = L.regTop + LY_TOPZ, fadeBotStart = L.regBot - LY_BOTZ;
   if (dy >= fadeTopEnd && dy + bh <= fadeBotStart) {
     c.save(); c.globalAlpha = al; c.drawImage(cv, 0, dy, bw, bh); c.restore();
     return;
   }
-  const mc = _lyMaskCv || (_lyMaskCv = document.createElement('canvas'));
+  if (!_lyMaskCv) { _lyMaskCv = document.createElement('canvas'); _lyMaskCtx = _lyMaskCv.getContext('2d'); }
+  const mc = _lyMaskCv;
   if (mc.width < cv.width || mc.height < cv.height) { mc.width = Math.max(mc.width, cv.width); mc.height = Math.max(mc.height, cv.height); }
-  const mx = mc.getContext('2d');
+  const mx = _lyMaskCtx;
   mx.setTransform(1, 0, 0, 1, 0, 0);
   mx.globalCompositeOperation = 'copy';
   mx.globalAlpha = 1;
@@ -796,12 +877,15 @@ function drawLyMasked(c, cv, dy, bw, bh, al, L) {
   mx.globalCompositeOperation = 'destination-in';
   const g = mx.createLinearGradient(0, 0, 0, cv.height);
   const stop = (y, a) => { const o = (y - dy) / bh; if (o >= 0 && o <= 1) g.addColorStop(o, 'rgba(0,0,0,' + a.toFixed(3) + ')'); };
-  const edgeAt = y => lyEdgeY(L, y);
-  const N = 12;
-  stop(dy, edgeAt(dy));
-  for (let s = 0; s <= N; s++) { const y = L.regTop + LY_TOPZ * s / N; if (y > dy && y < dy + bh) stop(y, edgeAt(y)); }
-  for (let s = 0; s <= N; s++) { const y = fadeBotStart + LY_BOTZ * s / N; if (y > dy && y < dy + bh) stop(y, edgeAt(y)); }
-  stop(dy + bh, edgeAt(dy + bh));
+  const N = 4;
+  stop(dy, lyEdgeY(L, dy));
+  if (dy < fadeTopEnd) {
+    for (let s = 0; s <= N; s++) { const y = L.regTop + LY_TOPZ * s / N; if (y > dy && y < dy + bh) stop(y, lyEdgeY(L, y)); }
+  }
+  if (dy + bh > fadeBotStart) {
+    for (let s = 0; s <= N; s++) { const y = fadeBotStart + LY_BOTZ * s / N; if (y > dy && y < dy + bh) stop(y, lyEdgeY(L, y)); }
+  }
+  stop(dy + bh, lyEdgeY(L, dy + bh));
   mx.fillStyle = g;
   mx.fillRect(0, 0, cv.width, cv.height);
   mx.globalCompositeOperation = 'source-over';
@@ -810,41 +894,41 @@ function drawLyMasked(c, cv, dy, bw, bh, al, L) {
   c.restore();
 }
 
-/* Offscreen cache for progressive blur on inactive lyrics lines: regenerates only when quantized blur (0.35px step) changes */
+/* Offscreen cache for progressive blur on inactive lyrics lines: 1x DPR, fixed padding, bounded LRU pool */
 function drawBlurredLyBlock(c, b, blurPx, fnt, fb, ink) {
-  const qBlur = Math.round(blurPx * 3) / 3;
-  const dpr = Math.min(2, S.width / Math.max(1, W));
-  const pad = Math.ceil(qBlur * 2.5) + 10;
+  const qBlur = _lyQuantBlur(blurPx);
+  const pad = _LY_BLUR_PAD;
   const bw = W, bh = Math.ceil(b.h + pad * 2);
   const tKey = ink ? ink.qKey : '31,31,31';
   if (!b._bCv || b._bBlur !== qBlur || b._bW !== bw || b._bH !== bh || b._bTint !== tKey) {
-    const cv = b._bCv || (b._bCv = document.createElement('canvas'));
-    cv.width = Math.ceil(bw * dpr);
-    cv.height = Math.ceil(bh * dpr);
+    const cv = _allocLyBlurCanvas(b);
+    if (cv.width !== bw) cv.width = bw;
+    if (cv.height !== bh) cv.height = bh;
     b._bBlur = qBlur; b._bW = bw; b._bH = bh; b._bPad = pad; b._bTint = tKey;
-    const bc = cv.getContext('2d');
-    bc.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const bc = b._bCtx || (b._bCtx = cv.getContext('2d'));
+    bc.setTransform(1, 0, 0, 1, 0, 0);
     bc.clearRect(0, 0, bw, bh);
     let hasFilter = false;
     try {
-      bc.filter = 'blur(' + (qBlur * dpr).toFixed(2) + 'px)';
+      bc.filter = 'blur(' + qBlur.toFixed(2) + 'px)';
       hasFilter = typeof bc.filter === 'string' && bc.filter.indexOf('blur') !== -1;
     } catch (e) {}
     const renderBlock = (ctx, ox, oy, mulA) => {
       const drawRows = (rows, y0, lh, font, col) => {
         ctx.font = font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
         ctx.fillStyle = col;
-        rows.forEach((r, j) => {
-          const ry = pad + y0 + (j + 1) * lh - 8 + oy;
-          r.it.forEach(it => {
+        for (let j = 0; j < rows.length; j++) {
+          const r = rows[j], ry = pad + y0 + (j + 1) * lh - 8 + oy;
+          for (let ri = 0; ri < r.it.length; ri++) {
+            const it = r.it[ri];
             ctx.fillText(it.t, 24 + r.ox + it.x + ox, ry);
-          });
-        });
+          }
+        }
       };
       ctx.save();
       ctx.globalAlpha = mulA;
       drawRows(b.rows, 0, LY_LH, fnt, ink ? ink.rgba(.42, true) : 'rgba(255,255,255,.42)');
-      if (b.bg) b.bg.forEach(x => drawRows(x.rows, x.y, BG_LH, fb, ink ? ink.rgba(.26, true) : 'rgba(255,255,255,.26)'));
+      if (b.bg) for (let bi = 0; bi < b.bg.length; bi++) drawRows(b.bg[bi].rows, b.bg[bi].y, BG_LH, fb, ink ? ink.rgba(.26, true) : 'rgba(255,255,255,.26)');
       ctx.restore();
     };
     if (hasFilter) {
@@ -860,6 +944,8 @@ function drawBlurredLyBlock(c, b, blurPx, fnt, fb, ink) {
       ];
       taps.forEach(([ox, oy, w]) => renderBlock(bc, ox, oy, w));
     }
+  } else {
+    _touchLyBlurLru(b);
   }
   return b._bCv;
 }
@@ -907,17 +993,17 @@ window.prewarmLyrics = function(t) {
     if (_lyPrewarmKey !== runKey) return;
     const active = typeof cur === 'function' ? cur() : t;
     if (!active || active.id !== t.id || SH.lyLay !== lay) return;
+    const ink = shInk(active);
     while (cursor < visIdxs.length) {
       const idx = visIdxs[cursor++];
       const b = blocks[idx];
       if (!b || b.isGap) continue;
       const effBlur = b.blur != null ? b.blur : (idx === fci ? 0 : (idx > fci ? clamp((idx - fci) * .72, 0, 3.0) : clamp((fci - idx) * .85, 0, 2.8)));
       if (effBlur <= 0.002) continue;
-      const qBlur = Math.round(Math.max(.34, effBlur) * 3) / 3;
-      const pad = Math.ceil(qBlur * 2.5) + 10;
-      const bh = Math.ceil(b.h + pad * 2);
-      if (!b._bCv || b._bBlur !== qBlur || b._bW !== W || b._bH !== bh) {
-        drawBlurredLyBlock(sc, b, Math.max(.34, effBlur), fnt, fb);
+      const qBlur = _lyQuantBlur(effBlur);
+      const bh = Math.ceil(b.h + _LY_BLUR_PAD * 2);
+      if (!b._bCv || b._bBlur !== qBlur || b._bW !== W || b._bH !== bh || b._bTint !== ink.qKey) {
+        drawBlurredLyBlock(sc, b, Math.max(.34, effBlur), fnt, fb, ink);
         break;
       }
     }
@@ -1123,6 +1209,13 @@ function drawQueueSkeleton(tc, startY, top, bot, qInk) {
   return count;
 }
 
+let _qMaskGrad = null, _qMaskGradKey = '';
+function _releaseQFadeCv() {
+  if (_qFadeCv && (_qFadeCv.width || _qFadeCv.height)) {
+    _qFadeCv.width = 0;
+    _qFadeCv.height = 0;
+  }
+}
 function drawQueue(c, L, fadeAlpha = 1) {
   const refillFromRadio = () => {
     const have = new Set(PL.queue.map(x => x && x.id).filter(Boolean));
@@ -1188,13 +1281,13 @@ function drawQueue(c, L, fadeAlpha = 1) {
   const top = py + 62, bot = L.regBot, qBase = PL.qi + 1, rowCount = Math.max(0, PL.queue.length - qBase), rh = 60;
   SH.qMax = Math.max(0, 52 + rowCount * rh + 30 - (bot - top));
   if (fadeAlpha > .5 && SH.mode === 'queue') shit(0, top, W, bot - top, null, 'queue');
-  const dpr = (S.width / Math.max(1, W)) || 1;
+  const dpr = Math.min(2, (S.width / Math.max(1, W)) || 1);
   const y0 = top - 8, y1 = bot, availH = Math.max(1, y1 - y0);
   const mw = Math.max(1, Math.round(W * dpr));
   const mh = Math.max(1, Math.round(availH * dpr));
-  if (!_qMaskCv) _qMaskCv = document.createElement('canvas');
-  if (_qMaskCv.width !== mw || _qMaskCv.height !== mh) { _qMaskCv.width = mw; _qMaskCv.height = mh; }
-  const qc = _qMaskCv.getContext('2d');
+  if (!_qMaskCv) { _qMaskCv = document.createElement('canvas'); _qMaskCtx = _qMaskCv.getContext('2d'); }
+  if (_qMaskCv.width !== mw || _qMaskCv.height !== mh) { _qMaskCv.width = mw; _qMaskCv.height = mh; _qMaskGradKey = ''; }
+  const qc = _qMaskCtx;
   qc.setTransform(1, 0, 0, 1, 0, 0);
   qc.clearRect(0, 0, mw, mh);
   qc.save();
@@ -1204,9 +1297,10 @@ function drawQueue(c, L, fadeAlpha = 1) {
   let targetI = -1, pillY = 0;
   if (isDragging) {
     const pyTouch = SH.dragQueue.curY != null ? SH.dragQueue.curY : (typeof INP !== 'undefined' ? INP.y : 0);
-    const localY = pyTouch - shY();
+    const curOy = _curShY != null ? _curShY : shY();
+    const localY = pyTouch - curOy;
     if (SH.dragQueue.grabOff == null) {
-      const startY = (SH.dragQueue.startY != null ? SH.dragQueue.startY : pyTouch) - shY();
+      const startY = (SH.dragQueue.startY != null ? SH.dragQueue.startY : pyTouch) - curOy;
       const startRowY = (top - SH.qScroll) + 52 + SH.dragQueue.fromIdx * rh;
       SH.dragQueue.grabOff = clamp(startY - startRowY, 0, rh);
     }
@@ -1217,11 +1311,13 @@ function drawQueue(c, L, fadeAlpha = 1) {
       if (localY < top + 38 && SH.qScroll > 0) {
         const spd = clamp((top + 38 - localY) / 38, 0.15, 1.5);
         SH.qScroll = clamp(SH.qScroll - 320 * spd * dtScroll, 0, SH.qMax);
-        redraw();
+        if (typeof scheduleSceneAnimRedraw === 'function') scheduleSceneAnimRedraw();
+        else redrawSheetContent();
       } else if (localY > bot - 38 && SH.qScroll < SH.qMax) {
         const spd = clamp((localY - (bot - 38)) / 38, 0.15, 1.5);
         SH.qScroll = clamp(SH.qScroll + 320 * spd * dtScroll, 0, SH.qMax);
-        redraw();
+        if (typeof scheduleSceneAnimRedraw === 'function') scheduleSceneAnimRedraw();
+        else redrawSheetContent();
       }
     }
     pillY = clamp(localY - SH.dragQueue.grabOff, top - 10, bot - rh + 10);
@@ -1362,6 +1458,31 @@ function drawQueue(c, L, fadeAlpha = 1) {
       SH._qSkelSeen = true;
       SH._qSkelSeenMs = nowMs;
       skelCount = drawQueueSkeleton(qc, base + 52, top, bot, qInk);
+    } else if (!hasRemoving && !PL.infinity) {
+      const cy = Math.max(base + 82, Math.round((base + 52 + bot) * 0.5) - 10);
+      const fontMain = F(600, 15);
+      const pref = window.t('queue.infinity_off_prefix');
+      const suff = window.t('queue.infinity_off_suffix');
+      const _qtw = (fnt, s) => (typeof measureTw === 'function' ? measureTw(qc, fnt, s) : (qc.font = fnt, qc.measureText(s).width));
+      const wPref = _qtw(fontMain, pref);
+      const wSuff = _qtw(fontMain, suff);
+      const icSz = 19, icGap = 6, icSlot = 20;
+      const totalW = wPref + icGap + icSlot + icGap + wSuff;
+      const mainCol = qInk.rgba(.78, true);
+      const icCol = qInk.rgba(.88, true);
+      if (totalW <= W - 32) {
+        const startX = (W - totalW) * 0.5;
+        txt(qc, pref, startX, cy, fontMain, mainCol);
+        icon(qc, 'infinity', startX + wPref + icGap + icSlot * 0.5, cy - 4.5, icSz, icCol);
+        txt(qc, suff, startX + wPref + icGap + icSlot + icGap, cy, fontMain, mainCol);
+      } else {
+        const line1W = wPref + icGap + icSlot;
+        const startX = (W - line1W) * 0.5;
+        txt(qc, pref, startX, cy - 10, fontMain, mainCol);
+        icon(qc, 'infinity', startX + wPref + icGap + icSlot * 0.5, cy - 14.5, icSz, icCol);
+        txt(qc, suff, W * 0.5, cy + 10, fontMain, mainCol, 'center', W - 48);
+      }
+      txt(qc, window.t('queue.infinity_off_hint'), W * 0.5, cy + (totalW <= W - 32 ? 23 : 33), F(400, 13), qInk.rgba(.52, true), 'center', W - 48);
     }
     if (hasRemoving) drawRemovingQueueRows(qc);
   } else {
@@ -1388,10 +1509,54 @@ function drawQueue(c, L, fadeAlpha = 1) {
       }
     } else {
       SH._qSkelFadeT0 = 0;
+      _releaseQFadeCv();
     }
 
     const renderQueueRows = (rc) => {
       const qOff = SH.qOff || (SH.qOff = new Map());
+      if (!isDragging && !settleObj && !qOff.size) {
+        const lo = Math.max(0, Math.floor((top - 70 - (base + 52)) / rh));
+        const hi = Math.min(rowCount, Math.ceil((bot + 10 - (base + 52)) / rh));
+        if (hi > lo) {
+          const visCounts = new Map();
+          for (let i = lo; i < hi; i++) {
+            const t = PL.queue[qBase + i];
+            const idKey = (t && t.id) || t;
+            visCounts.set(idKey, 0);
+          }
+          if (lo > 0) {
+            for (let j = 0; j < lo; j++) {
+              const t = PL.queue[qBase + j];
+              const idKey = (t && t.id) || t;
+              const prev = visCounts.get(idKey);
+              if (prev !== undefined) visCounts.set(idKey, prev + 1);
+            }
+          }
+          for (let i = lo; i < hi; i++) {
+            const t = PL.queue[qBase + i];
+            const idKey = (t && t.id) || t;
+            const qn = visCounts.get(idKey) || 0;
+            visCounts.set(idKey, qn + 1);
+            const qSwKey = 'q:' + ((t && t.id) ? t.id : ('r' + i)) + '#' + qn;
+            const y = base + 52 + i * rh;
+            if (y < top - 70 || y > bot + 10) continue;
+            const swSt = typeof swqRowState === 'function' ? swqRowState(qSwKey) : null;
+            const swx = swSt ? swSt.x : 0;
+            if (Math.abs(swx) > 0.05) {
+              drawSwipedQueueRow(rc, t, y, swx, swSt);
+            } else {
+              drawQueueRowBody(rc, t, y);
+            }
+            if (fadeAlpha > .5 && SH.mode === 'queue' && y + rh > top && y < bot) {
+              const cy0 = Math.max(top, y), cy1 = Math.min(bot, y + rh);
+              shit(0, cy0, W - 60, cy1 - cy0, () => { PL.qi += i + 1; PL.pos = 0; loadAudio(); redraw(); }, 'queue', { qRowKey: qSwKey, qRowIdx: i, qAbsIdx: qBase + i, qRowTrack: t });
+              shit(W - 60, cy0, 60, cy1 - cy0, null, 'queueGrip', { rowIdx: i, absIdx: qBase + i, item: t });
+            }
+          }
+        }
+        drawRemovingQueueRows(rc);
+        return;
+      }
       const seen = new Map();
       const qSwSeen = new Map();
       const activeKeys = new Set();
@@ -1490,35 +1655,42 @@ function drawQueue(c, L, fadeAlpha = 1) {
   const effRowCount = rowCount || skelCount;
   const hasBotOverflow = (52 + effRowCount * rh - SH.qScroll) > (bot - top) - 8 || SH.qMax > 0;
   if (topFade > 0.005 || hasBotOverflow) {
-    const g = qc.createLinearGradient(0, 0, 0, mh);
-    const topEnd = Math.min(0.45, (Q_TOPZ + 8) / availH);
-    const botStart = Math.max(topEnd + 0.02, 1 - Q_BOTZ / availH);
-    const N = 8;
-    if (topFade > 0.005) {
-      const minTopA = 1 - topFade;
-      for (let s = 0; s <= N; s++) {
-        const u = s / N;
-        const sm = u * u * (3 - 2 * u);
-        const a = minTopA + topFade * sm;
-        g.addColorStop(u * topEnd, 'rgba(0,0,0,' + a.toFixed(3) + ')');
+    const qTop = Math.round(topFade * 16);
+    const gKey = mh + '|' + Math.round(availH) + '|' + qTop + '|' + (hasBotOverflow ? 1 : 0);
+    if (!_qMaskGrad || _qMaskGradKey !== gKey) {
+      _qMaskGradKey = gKey;
+      const g = qc.createLinearGradient(0, 0, 0, mh);
+      const topEnd = Math.min(0.45, (Q_TOPZ + 8) / availH);
+      const botStart = Math.max(topEnd + 0.02, 1 - Q_BOTZ / availH);
+      const N = 4;
+      const qTf = qTop / 16;
+      if (qTf > 0.005) {
+        const minTopA = 1 - qTf;
+        for (let s = 0; s <= N; s++) {
+          const u = s / N;
+          const sm = u * u * (3 - 2 * u);
+          const a = minTopA + qTf * sm;
+          g.addColorStop(u * topEnd, 'rgba(0,0,0,' + a.toFixed(3) + ')');
+        }
+      } else {
+        g.addColorStop(0, 'rgba(0,0,0,1)');
+        g.addColorStop(topEnd, 'rgba(0,0,0,1)');
       }
-    } else {
-      g.addColorStop(0, 'rgba(0,0,0,1)');
-      g.addColorStop(topEnd, 'rgba(0,0,0,1)');
-    }
-    if (hasBotOverflow) {
-      for (let s = 0; s <= N; s++) {
-        const u = s / N;
-        const sm = u * u * (3 - 2 * u);
-        const a = 1 - sm;
-        g.addColorStop(botStart + u * (1 - botStart), 'rgba(0,0,0,' + a.toFixed(3) + ')');
+      if (hasBotOverflow) {
+        for (let s = 0; s <= N; s++) {
+          const u = s / N;
+          const sm = u * u * (3 - 2 * u);
+          const a = 1 - sm;
+          g.addColorStop(botStart + u * (1 - botStart), 'rgba(0,0,0,' + a.toFixed(3) + ')');
+        }
+      } else {
+        g.addColorStop(botStart, 'rgba(0,0,0,1)');
+        g.addColorStop(1, 'rgba(0,0,0,1)');
       }
-    } else {
-      g.addColorStop(botStart, 'rgba(0,0,0,1)');
-      g.addColorStop(1, 'rgba(0,0,0,1)');
+      _qMaskGrad = g;
     }
     qc.globalCompositeOperation = 'destination-in';
-    qc.fillStyle = g;
+    qc.fillStyle = _qMaskGrad;
     qc.fillRect(0, 0, mw, mh);
     qc.globalCompositeOperation = 'source-over';
   }

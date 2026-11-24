@@ -2,6 +2,7 @@ package dev.sonora.music.lyrics
 
 import dev.sonora.music.LyricLine
 import dev.sonora.music.Lyrics
+import dev.sonora.music.SonoraHttpPool
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -11,11 +12,13 @@ import org.json.JSONObject
 /** Synced and plain LRC lyrics client backed by LrcLib. */
 object LrcLib {
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
-        .callTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient by lazy {
+        SonoraHttpPool.baseClient.newBuilder()
+            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
 
     suspend fun lyrics(title: String, artist: String, durationMs: Long): Lyrics? =
         withContext(Dispatchers.IO) {

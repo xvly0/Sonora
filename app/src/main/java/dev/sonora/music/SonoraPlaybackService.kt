@@ -178,6 +178,14 @@ object SonoraAudioResolver {
     private val lock = Any()
     private val inFlight = ConcurrentHashMap<String, CompletableFuture<String?>>()
     private val loudnessCache = ConcurrentHashMap<String, Float>()
+    private val retryShift = ConcurrentHashMap<String, AtomicInteger>()
+
+    fun rotateClientForRetry(videoId: String) {
+        val cleanId = videoId.removePrefix("yt:").trim()
+        if (cleanId.isEmpty()) return
+        if (retryShift.size > 128) retryShift.clear()
+        retryShift.computeIfAbsent(cleanId) { AtomicInteger(0) }.incrementAndGet()
+    }
 
     @Volatile
     private var initialized = false
@@ -229,7 +237,7 @@ object SonoraAudioResolver {
         return withContext(Dispatchers.IO) {
             val resolved = runCatching {
                 withTimeoutOrNull(2500L) {
-                    val playerRes = YouTube.player(cleanId, client = YouTubeClient.ANDROID_VR_1_65_10).getOrNull()
+                    val playerRes = YouTube.player(cleanId, client = YouTubeClient.ANDROID_VR_1_61_48).getOrNull()
                     extractLoudnessDb(playerRes)
                 }
             }.getOrNull()
@@ -308,20 +316,33 @@ object SonoraAudioResolver {
     private fun resolveUncached(videoId: String): String? {
         StreamCache.get(videoId)?.let { return it }
 
-        // 1. Primary: InnerTube multi-client parallel API resolution (fast TTFA + loudnessDb in one call)
+        // 1. Primary: InnerTube multi-client hedged resolution (fast TTFA + loudnessDb in one call)
         try {
-            val clients = listOf(
-                YouTubeClient.ANDROID_VR_1_65_10,
+            val baseClients = listOf(
                 YouTubeClient.ANDROID_VR_1_61_48,
                 YouTubeClient.VISIONOS,
+                YouTubeClient.ANDROID_VR_1_43_32,
                 YouTubeClient.IOS
             )
+            val cleanId = videoId.removePrefix("yt:").trim()
+            val shift = (retryShift[cleanId]?.get() ?: 0) % baseClients.size
+            val clients = if (shift == 0) {
+                baseClients
+            } else {
+                List(baseClients.size) { i -> baseClients[(i + shift) % baseClients.size] }
+            }
             val resolvedPair = runBlocking {
                 val deferred = CompletableDeferred<Pair<com.metrolist.innertube.models.response.PlayerResponse.StreamingData.Format, Float?>?>()
+                val primaryFailed = CompletableDeferred<Unit>()
                 val remaining = AtomicInteger(clients.size)
-                val jobs = clients.map { client ->
+                val jobs = clients.mapIndexed { idx, client ->
                     launch(Dispatchers.IO) {
                         try {
+                            if (idx > 0) {
+                                // Hedge fallback clients after a short stagger unless primary already failed.
+                                withTimeoutOrNull(idx * 250L) { primaryFailed.await() }
+                                if (deferred.isCompleted) return@launch
+                            }
                             val playerRes = YouTube.player(videoId, client = client).getOrNull()
                             val formats = playerRes?.streamingData?.adaptiveFormats
                             val audio = formats?.filter { it.isAudio && !it.url.isNullOrEmpty() }
@@ -333,8 +354,11 @@ object SonoraAudioResolver {
                             if (audio != null && !audio.url.isNullOrEmpty()) {
                                 val db = extractLoudnessDb(playerRes, audio)
                                 deferred.complete(audio to db)
+                            } else if (idx == 0) {
+                                primaryFailed.complete(Unit)
                             }
                         } catch (_: Exception) {
+                            if (idx == 0) primaryFailed.complete(Unit)
                         } finally {
                             if (remaining.decrementAndGet() == 0) {
                                 deferred.complete(null)
@@ -470,6 +494,8 @@ class SonoraPlaybackService : MediaSessionService() {
     @Volatile
     private var cachedAudioOutputsJson: String? = null
     private var lastEmittedQuality: Pair<String, String>? = null
+    private var lastPlayerVolume: Float = Float.NaN
+    private var lastTailVolume: Float = Float.NaN
 
     @Volatile
     var currentTitle: String = "Sonora"
@@ -525,6 +551,7 @@ class SonoraPlaybackService : MediaSessionService() {
 
         private val ARTIST_SPLIT_REGEX = Regex("""\s*,\s*|\s*&\s*""")
         private val ARTIST_STATS_REGEX = Regex("""(?i).*\d[\d.,]*\s*(?:k|m|b|mln|mila|milioni|mrd)?\s*(?:riproduzioni?|visualizzazioni?|ascolti?|iscritti?|views?|plays?|subscribers?).*""")
+        private val YT_VIDEO_ID_REGEX = Regex("^[A-Za-z0-9_-]{11}$")
         private val ARTIST_NOISE_WORDS = setOf("brano", "canzone", "singolo", "album", "video", "song", "single", "track")
 
         var instance: SonoraPlaybackService? = null
@@ -549,9 +576,18 @@ class SonoraPlaybackService : MediaSessionService() {
             }
         }
 
+        internal val playbackOkHttp: OkHttpClient by lazy {
+            SonoraHttpPool.baseClient.newBuilder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(15, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build()
+        }
+
         internal val downloadOkHttp: OkHttpClient by lazy {
-            OkHttpClient.Builder()
-                .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+            SonoraHttpPool.baseClient.newBuilder()
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(20, TimeUnit.SECONDS)
                 .retryOnConnectionFailure(true)
@@ -674,14 +710,7 @@ class SonoraPlaybackService : MediaSessionService() {
             .setUsage(C.USAGE_MEDIA)
             .build()
 
-        pooledOkHttp = OkHttpClient.Builder()
-            .connectionPool(ConnectionPool(32, 5, TimeUnit.MINUTES))
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(true)
-            .followRedirects(true)
-            .followSslRedirects(true)
-            .build()
+        pooledOkHttp = playbackOkHttp
 
         val httpDataSourceFactory = OkHttpDataSource.Factory(pooledOkHttp)
             .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -981,7 +1010,7 @@ class SonoraPlaybackService : MediaSessionService() {
         val trimmed = rawUrl?.trim().orEmpty()
         if (trimmed.isEmpty()) {
             val cleanId = fallbackTrackId.trim()
-            if (cleanId.matches(Regex("^[A-Za-z0-9_-]{11}$"))) {
+            if (YT_VIDEO_ID_REGEX.matches(cleanId)) {
                 return Uri.parse("https://i.ytimg.com/vi/$cleanId/hqdefault.jpg")
             }
             return null
@@ -1025,7 +1054,7 @@ class SonoraPlaybackService : MediaSessionService() {
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
         var sample = 1
         while (bounds.outWidth > 0 && bounds.outHeight > 0 &&
-            (bounds.outWidth / sample > maxDim * 2 || bounds.outHeight / sample > maxDim * 2)
+            (bounds.outWidth / sample > maxDim || bounds.outHeight / sample > maxDim)
         ) {
             sample *= 2
         }
@@ -1454,16 +1483,7 @@ class SonoraPlaybackService : MediaSessionService() {
         if (cleanId.isEmpty() || cleanId.startsWith("local_")) return
         if (!::resolvingDataSourceFactory.isInitialized) return
         if (prewarmedBytesIds.contains(cleanId)) return
-        if (runCatching { SonoraDownloadManager.isTrackDownloaded(this@SonoraPlaybackService, cleanId) }.getOrDefault(false)) {
-            prewarmedBytesIds.add(cleanId)
-            return
-        }
         val cacheKey = "youtube:track:$cleanId"
-        val mediaCache = runCatching { getMediaCache(this@SonoraPlaybackService) }.getOrNull() ?: return
-        if (runCatching { mediaCache.isCached(cacheKey, 0L, 128L * 1024L) }.getOrDefault(false)) {
-            prewarmedBytesIds.add(cleanId)
-            return
-        }
         synchronized(prewarmLock) {
             if (prewarmBytesJob?.isActive == true && prewarmBytesTrackId == cleanId) {
                 return
@@ -1472,6 +1492,15 @@ class SonoraPlaybackService : MediaSessionService() {
             prewarmBytesTrackId = cleanId
             prewarmBytesJob = scope.launch(Dispatchers.IO) {
                 try {
+                    if (runCatching { SonoraDownloadManager.isTrackDownloaded(this@SonoraPlaybackService, cleanId) }.getOrDefault(false)) {
+                        prewarmedBytesIds.add(cleanId)
+                        return@launch
+                    }
+                    val mediaCache = runCatching { getMediaCache(this@SonoraPlaybackService) }.getOrNull() ?: return@launch
+                    if (runCatching { mediaCache.isCached(cacheKey, 0L, 128L * 1024L) }.getOrDefault(false)) {
+                        prewarmedBytesIds.add(cleanId)
+                        return@launch
+                    }
                     if (snapIsBuffering) {
                         delay(120)
                         if (snapIsBuffering || !isActive) return@launch
@@ -1565,14 +1594,23 @@ class SonoraPlaybackService : MediaSessionService() {
     private fun applyEffectiveVolume() {
         val base = (baseVolume * sleepFadeEnvelope).coerceIn(0f, 1f)
         mainSlot.fade = fadeEnvelope
-        player.volume = if (mainSlot.mixed) base else (base * fadeEnvelope).coerceIn(0f, 1f)
+        val nextPlayerVol = if (mainSlot.mixed) base else (base * fadeEnvelope).coerceIn(0f, 1f)
+        if (nextPlayerVol != lastPlayerVolume) {
+            lastPlayerVolume = nextPlayerVol
+            player.volume = nextPlayerVol
+        }
         tailPlayer?.let { tail ->
-            tail.volume = if (tailSlot.mixed) 1f else (base * tailSlot.fade).coerceIn(0f, 1f)
+            val nextTailVol = if (tailSlot.mixed) 1f else (base * tailSlot.fade).coerceIn(0f, 1f)
+            if (nextTailVol != lastTailVolume) {
+                lastTailVolume = nextTailVol
+                tail.volume = nextTailVol
+            }
         }
     }
 
     private fun ensureTailPlayer(): ExoPlayer {
         return tailPlayer ?: buildExoPlayer(handleAudioFocus = false, slot = tailSlot).also { tail ->
+            lastTailVolume = Float.NaN
             tail.repeatMode = Player.REPEAT_MODE_OFF
             preferredDeviceId?.let { id ->
                 audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.firstOrNull { d -> d.id == id }
@@ -1630,6 +1668,7 @@ class SonoraPlaybackService : MediaSessionService() {
                 tailPlayer?.clearMediaItems()
                 tailPlayer?.release()
                 tailPlayer = null
+                lastTailVolume = Float.NaN
             }
         }
     }
@@ -2107,6 +2146,7 @@ class SonoraPlaybackService : MediaSessionService() {
         val attempt = (last?.third ?: 0) + 1
         recovering = Triple(id, now, attempt)
         StreamCache.forget(id)
+        SonoraAudioResolver.rotateClientForRetry(id)
 
         val at = exo.currentPosition
         val index = exo.currentMediaItemIndex
@@ -2243,12 +2283,15 @@ class SonoraPlaybackService : MediaSessionService() {
     private fun startProgressLoop() {
         progressJob?.cancel()
         progressJob = scope.launch {
+            var lastNotifyAtMs = 0L
+            var lastTrackId = ""
+            var lastDur = -1L
             while (isActive && player.isPlaying) {
                 val dur = player.duration.coerceAtLeast(0L)
                 val pos = player.currentPosition.coerceAtLeast(0L)
                 val cf = crossfadeSec
                 val activeItemId = player.currentMediaItem?.mediaId.orEmpty()
-                var tickMs = 250L
+                var tickMs = 500L
                 if (cf > 0 && !sleepAtTrackEnd && currentRepeatMode != 2 && fadeJob?.isActive != true &&
                     dur > (cf * 1000L + 2000L) && activeItemId.isNotEmpty() && activeItemId == currentTrackId
                 ) {
@@ -2265,7 +2308,14 @@ class SonoraPlaybackService : MediaSessionService() {
                         playbackListener?.onAutoCrossfade(activeItemId)
                     }
                 }
-                notifyState()
+                val now = SystemClock.elapsedRealtime()
+                val stateChanged = activeItemId != lastTrackId || dur != lastDur
+                if (stateChanged || now - lastNotifyAtMs >= 480L) {
+                    lastNotifyAtMs = now
+                    lastTrackId = activeItemId
+                    lastDur = dur
+                    notifyState()
+                }
                 delay(tickMs)
             }
         }

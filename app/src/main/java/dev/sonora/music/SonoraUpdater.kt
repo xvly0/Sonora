@@ -25,12 +25,30 @@ class SonoraUpdater private constructor(context: Context) {
 
     private val app = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .followSslRedirects(true)
-        .build()
+    private val client: OkHttpClient by lazy {
+        SonoraHttpPool.baseClient.newBuilder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+    }
+    private val cachedVersionName: String by lazy {
+        try {
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                app.packageManager.getPackageInfo(
+                    app.packageName,
+                    PackageManager.PackageInfoFlags.of(0)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                app.packageManager.getPackageInfo(app.packageName, 0)
+            }
+            info.versionName.orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+    }
 
     @Volatile
     private var _state: State = State.Idle
@@ -63,22 +81,7 @@ class SonoraUpdater private constructor(context: Context) {
         data class Failed(val reason: String, val available: Available? = null) : State
     }
 
-    fun installedVersionName(): String {
-        return try {
-            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                app.packageManager.getPackageInfo(
-                    app.packageName,
-                    PackageManager.PackageInfoFlags.of(0)
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                app.packageManager.getPackageInfo(app.packageName, 0)
-            }
-            info.versionName.orEmpty()
-        } catch (_: Exception) {
-            ""
-        }
-    }
+    fun installedVersionName(): String = cachedVersionName
 
     fun currentAvailable(): State.Available? {
         return when (val s = _state) {

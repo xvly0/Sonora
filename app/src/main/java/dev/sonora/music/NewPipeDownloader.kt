@@ -45,14 +45,15 @@ class NewPipeDownloader(private val http: OkHttpClient) : Downloader() {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-        private val sharedHttpClient = OkHttpClient.Builder()
-            .connectionPool(okhttp3.ConnectionPool(8, 5, TimeUnit.MINUTES))
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(25, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(true)
-            .build()
+        private val sharedHttpClient: OkHttpClient by lazy {
+            SonoraHttpPool.baseClient.newBuilder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(25, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
+                .build()
+        }
 
-        private val instance = NewPipeDownloader(sharedHttpClient)
+        private val instance: NewPipeDownloader by lazy { NewPipeDownloader(sharedHttpClient) }
 
         fun create(): NewPipeDownloader = instance
     }

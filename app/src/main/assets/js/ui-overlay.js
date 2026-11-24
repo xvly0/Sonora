@@ -86,6 +86,7 @@ function openOutDrawer() {
   OUT_DRAWER.sp.v = 0;
   if (typeof armHistory === 'function') armHistory();
   D.ov = D.gl = true;
+  if (typeof wakeFrame === 'function') wakeFrame();
 }
 function closeOutDrawer() {
   if (!OUT_DRAWER.open) return;
@@ -94,6 +95,7 @@ function closeOutDrawer() {
   OUT_DRAWER.sp.t = 0;
   OUT_DRAWER.sp.v = 0;
   D.ov = D.gl = true;
+  if (typeof wakeFrame === 'function') wakeFrame();
 }
 function outDrawerAct(i) {
   const row = OUT_DRAWER.rows && OUT_DRAWER.rows[i];
@@ -134,6 +136,7 @@ function openCM(t, ax, ay, ctx, meta) {
   CM.sp.t = 1; CM.sp.v = 0;
   if (typeof armHistory === 'function') armHistory();
   D.ov = D.gl = true;
+  if (typeof wakeFrame === 'function') wakeFrame();
 }
 function setCmMode(mode, pendingAdd) {
   CM.prevMode = CM.mode;
@@ -161,6 +164,7 @@ function closeCM() {
   CM.pendingAdd = null;
   CM.sp.t = 0; CM.sp.v = 0;
   D.ov = D.gl = true;
+  if (typeof wakeFrame === 'function') wakeFrame();
 }
 function cmItems(item, ctx, meta) {
   if (!item) return [];
@@ -731,32 +735,42 @@ const fgG = () => pal.dark ? pal.fg : (BARC.t > .1 ? rgba4(BARC.fg) : '#ffffff')
 const hasPill = P => P.kind === 'album' || P.kind === 'artist';
 const getMenuItems = () => [[t('settings.theme_auto'), 'auto'], [t('settings.theme_light'), 'light'], [t('settings.theme_dark'), 'dark']];
 const menuRect = () => ({ x: W - 18 - 236, y: LAY.avatar.y + 52, w: 236, h: 42 + getMenuItems().length * 46 + 6 });
+let _dockCacheKey = '', _dockCacheVal = null;
 function dock() {
-  const em0 = sstep(clamp(NAV.minT, 0, 1)), sm = sstep(clamp(NAV.sm, 0, 1)), e = Math.max(em0, sm), em = em0 * (1 - sm);
   const tb = LAY.tab, m = LAY.mini, se = LAY.search, sd = tb.h, sc = 46;
   const effectiveKb = Math.max(KBH || 0, window.__NATIVE_KBH__ || 0);
+  const vvOffset = (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.offsetTop) || 0;
+  const dKey = NAV.minT + '|' + NAV.sm + '|' + effectiveKb + '|' + vvOffset + '|' + W + '|' + H + '|' + tb.y + '|' + tb.w;
+  if (dKey === _dockCacheKey && _dockCacheVal) return _dockCacheVal;
+  const em0 = sstep(clamp(NAV.minT, 0, 1)), sm = sstep(clamp(NAV.sm, 0, 1)), e = Math.max(em0, sm), em = em0 * (1 - sm);
   const kbOpen = (effectiveKb > 1);
   if (!window.__MAX_H__ || (!kbOpen && H > window.__MAX_H__)) {
     window.__MAX_H__ = H;
   }
   const isViewResized = window.__MAX_H__ && (window.__MAX_H__ - H) > 100;
-  const vvOffset = (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.offsetTop) || 0;
   const bot0 = tb.y + sd;
   const bot = kbOpen ? (isViewResized ? (H - 14 + vvOffset) : (bot0 - effectiveKb + vvOffset)) : bot0;
   const s = mix(sd, sc, e);
   const fh = 54, ts = mix(sd, mix(sc, fh, sm), e), c1 = tb.x + mix(sc, fh, sm) + 8, c2 = W - tb.x - sc - 8;
   const circ = { x: mix(se.x, W - tb.x - sc, e), y: bot - s, w: s, h: s }, field = { x: c1, y: bot - fh, w: W - tb.x - c1, h: fh };
   const my0 = bot - ts - 8 - m.h;
-  return { e, em, sm,
+  _dockCacheKey = dKey;
+  return (_dockCacheVal = { e, em, sm,
     tab: { x: tb.x, y: bot - ts, w: mix(tb.w, ts, e), h: ts },
     search: { x: mix(circ.x, field.x, sm), y: mix(circ.y, field.y, sm), w: mix(circ.w, field.w, sm), h: mix(circ.h, field.h, sm) },
-    mini: { x: mix(m.x, c1, em), y: mix(my0, bot - sc, em), w: mix(m.w, c2 - c1, em), h: mix(m.h, sc, em) } };
+    mini: { x: mix(m.x, c1, em), y: mix(my0, bot - sc, em), w: mix(m.w, c2 - c1, em), h: mix(m.h, sc, em) } });
 }
 const TINTC = {};
+let _PH_TINT_D = null, _PH_TINT_L = null;
 function tintOf(P) {
   if (!P || (P.kind !== 'album' && P.kind !== 'artist')) return null;
   const it = P.data.item, k = it.id + (pal.dark ? 'd' : 'l'); if (TINTC[k]) return TINTC[k];
-  const pc = artPalette(artItem(it)), [h0, s0] = rgb2hsl(...pc[0]), [domH, domS] = pc._dom || [h0, s0], [footH, footS, footL] = pc._foot || [domH, domS, .42];
+  const pc = artPalette(artItem(it));
+  if (pc._placeholder) {
+    if (pal.dark && _PH_TINT_D) return _PH_TINT_D;
+    if (!pal.dark && _PH_TINT_L) return _PH_TINT_L;
+  }
+  const [h0, s0] = rgb2hsl(...pc[0]), [domH, domS] = pc._dom || [h0, s0], [footH, footS, footL] = pc._foot || [domH, domS, .42];
   const [imgL, darkFrac, footAvgL, footDarkFrac] = pc._meta || [.42, 0, .42, 0];
   const useFoot = footS > .09, h = useFoot ? footH : domH;
   const hueDist = (a, b) => { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; };
@@ -802,7 +816,13 @@ function tintOf(P) {
     _btnHl: pal.dark ? [hrgb[0], hrgb[1], hrgb[2], .82] : [255, 255, 255, .88],
     toString() { return this.css; }
   };
-  if (!pc._placeholder) TINTC[k] = outTint;
+  if (!pc._placeholder) {
+    const tKeys = Object.keys(TINTC);
+    if (tKeys.length >= 128) delete TINTC[tKeys[0]];
+    TINTC[k] = outTint;
+  } else {
+    if (pal.dark) _PH_TINT_D = outTint; else _PH_TINT_L = outTint;
+  }
   return outTint;
 }
 const BARC = { init: false, accent: [250, 46, 73, 1], pillBg: [255, 255, 255, .14], fg: [255, 255, 255, 1], sub: [235, 235, 245, .60], topTint: [255, 255, 255, .16], btnHl: [255, 255, 255, .50], t: 0 };
@@ -914,12 +934,14 @@ window.onTabSwitch = function(fromTab, toTab) {
     _tabTrans.step = step;
     _tabTrans.t0 = performance.now();
     _tabTrans.sp.x = 0; _tabTrans.sp.v = 0; _tabTrans.sp.t = 1;
+    if (typeof wakeFrame === 'function') wakeFrame();
   } catch (e) {
     _tabTrans.active = false;
   }
 };
 let _inDrawScenePending = false, _inDrawScenePendingOv = false;
 function scheduleSceneAnimRedraw(withOv) {
+  if (typeof wakeFrame === 'function') wakeFrame();
   if (window.__IN_DRAW_SCENE) {
     _inDrawScenePending = true;
     if (withOv) _inDrawScenePendingOv = true;
@@ -966,7 +988,7 @@ function drawScene() {
       if (s.length > 1 && pp > .001) {
         const Punder = s[s.length - 2], oxUnder = -W * .28 * (1 - pp), underAmt = 1 - pp;
         const canUseUnderCache = typeof document !== 'undefined' && S.width > 0 && S.height > 0 &&
-          !(typeof _skulletActive !== 'undefined' && _skulletActive) && !_waveVis && !(typeof window !== 'undefined' && window._artFadeActive);
+          !(typeof _skulletActive !== 'undefined' && _skulletActive) && !(typeof window !== 'undefined' && window._artFadeActive);
         if (canUseUnderCache) {
           if (!_underPageCv) { _underPageCv = document.createElement('canvas'); _underPageCtx = _underPageCv.getContext('2d'); }
           if (_underPageCv.width !== S.width || _underPageCv.height !== S.height) {
@@ -1260,12 +1282,13 @@ function drawHeroTopTitle(c, Ppage, icCol, qtVal) {
   const alpha = visA * dockFade;
   if (alpha <= 0.01) return;
   const tMorph = sstep(clamp(((topY + 64) - rawY) / 64, 0, 1));
-  const fs = +mix(21, 17, tMorph).toFixed(2);
-  const fw = Math.round(mix(500, 600, tMorph));
-  const maxW = mix(W - 48, W - 2 * 116, tMorph);
+  const scF = mix(1, 17 / 21, tMorph);
+  const maxW = mix(W - 48, W - 2 * 116, tMorph) / scF;
   c.save();
   c.globalAlpha *= alpha;
-  txt(c, titleText, W / 2, ty, F(fw, fs), icCol, 'center', maxW);
+  c.translate(W / 2, ty);
+  if (scF < 0.999) c.scale(scF, scF);
+  txt(c, titleText, 0, 0, F(600, 21), icCol, 'center', maxW);
   c.restore();
 }
 function ensureTopbarRefs() {
@@ -1281,15 +1304,55 @@ function ensureTopbarRefs() {
     }
   }
 }
+function syncWebGLTopbar() {
+  if (FALLBACK || typeof lg === 'undefined' || !lg) return;
+  const st = stackOf(), P = st[st.length - 1], root = st.length === 1, pp = NAV.popP;
+  const sc1 = P ? (P.scroll || 0) : 0, p1 = clamp(sc1 / 60, 0, 1);
+  const Pprev = !root ? st[st.length - 2] : null;
+  const sc0 = Pprev ? (Pprev.scroll || 0) : 0, p0 = !root ? clamp(sc0 / 60, 0, 1) : 0;
+  const splitNum = !root && pp > .0001 ? pp * W : 0;
+  const barH = (root && NAV.tab === 'search')
+    ? Math.max(56, Math.ceil(TOP + 16))
+    : Math.max(112, Math.ceil((LAY.back ? LAY.back.y + LAY.back.h : 96) + 16));
+  const hasSheetCut = SH.t > .002 || SH.drag;
+  const shTop = hasSheetCut ? shY() : barH;
+  const sheetCov = hasSheetCut && shTop <= .5;
+  const vis0 = !sheetCov && splitNum > 0.5 && sc0 > .1;
+  const vis1 = !sheetCov && sc1 > .1 && splitNum < W - 0.5;
+  const defC = pal.dark ? 0 : 1;
+  const tn1 = !root ? tintOf(P) : null;
+  const tn0 = (Pprev && st.length > 2) ? tintOf(Pprev) : null;
+  const tb = lg.topBlur, tbp = lg.topBlurPrev;
+  if (tn1 && tn1.rgb) { tb[0] = tn1.rgb[0] / 255; tb[1] = tn1.rgb[1] / 255; tb[2] = tn1.rgb[2] / 255; }
+  else { tb[0] = tb[1] = tb[2] = defC; }
+  tb[3] = vis1 ? p1 : 0;
+  if (tn0 && tn0.rgb) { tbp[0] = tn0.rgb[0] / 255; tbp[1] = tn0.rgb[1] / 255; tbp[2] = tn0.rgb[2] / 255; }
+  else { tbp[0] = tbp[1] = tbp[2] = defC; }
+  tbp[3] = vis0 ? p0 : 0;
+  lg.topBlurH = barH;
+  lg.topBlurSplit = splitNum;
+  if (hasSheetCut && shTop < barH && !sheetCov) {
+    const sr = Math.min(46 * (1 - clamp((SH.t - .9) / .1, 0, 1)), W / 2);
+    if (!lg.topBlurSheetCut) lg.topBlurSheetCut = { y: shTop, r: sr };
+    else { lg.topBlurSheetCut.y = shTop; lg.topBlurSheetCut.r = sr; }
+  } else {
+    lg.topBlurSheetCut = null;
+  }
+}
 function drawOverlay() {
   const rimChanged = drawRim();
   const c = TC; c.setTransform($top.width / W, 0, 0, $top.height / H, 0, 0); c.clearRect(0, 0, W, H);
   const shVis = clamp(1 - shY() / H, 0, 1);
   const k = clamp(1 - shVis * 3, 0, 1), P = topPage(), st = stackOf(), t = cur();
+  const sheetFull = SH.t >= 0.999 && !SH.drag;
   {
     ensureTopbarRefs();
     const tb = _tbEl, tbPrev = _tbPrevEl, tbCurr = _tbCurrEl;
-    if (tb && tbPrev && tbCurr) {
+    if (!FALLBACK) {
+      if (tb && !tb._hiddenForGl) { tb._hiddenForGl = true; tb.style.display = 'none'; }
+      syncWebGLTopbar();
+    } else if (tb && tbPrev && tbCurr) {
+      if (tb._hiddenForGl) { tb._hiddenForGl = false; tb.style.display = 'block'; }
       const root = st.length === 1, pp = NAV.popP;
       const sc1 = P ? (P.scroll || 0) : 0, p1 = clamp(sc1 / 60, 0, 1).toFixed(3);
       const Pprev = !root ? st[st.length - 2] : null;
@@ -1316,107 +1379,9 @@ function drawOverlay() {
       const tn0 = (Pprev && st.length > 2) ? tintOf(Pprev) : null, rgb0 = tn0 ? tn0.rgb.join(', ') : defRgb;
       if (tb._rgb0 !== rgb0) { tb._rgb0 = rgb0; tb.style.setProperty('--rgb0', rgb0); }
       if (tb._rgb1 !== rgb1) { tb._rgb1 = rgb1; tb.style.setProperty('--rgb1', rgb1); }
-      const emptyHoleMask = tb._emptyMask || (tb._emptyMask = 'url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27/%3E")');
-      const holeMask = (Ppage, dx, wBox, cacheBox) => {
-        if (wBox <= 0) return 'none';
-        if (sheetCov) return emptyHoleMask;
-        const holes = [];
-        if (Ppage) {
-          if (Ppage === st[0]) {
-            if (NAV.tab === 'home' || NAV.tab === 'library') {
-              const tbn = topBtns(tbP(Ppage));
-              if (NAV.tab === 'library') holes.push({ x: tbn.mo.x + dx, y: tbn.mo.y, w: tbn.mo.w, h: tbn.mo.h });
-              holes.push({ x: tbn.av.x + dx, y: tbn.av.y, w: tbn.av.w, h: tbn.av.h });
-            }
-          } else {
-            const bk = LAY.back;
-            holes.push({ x: bk.x + dx, y: bk.y, w: bk.w, h: bk.h });
-            if (hasPill(Ppage)) {
-              const ap = pillRect(Ppage), ps = pSearchRect(Ppage);
-              holes.push({ x: ap.x + dx, y: ap.y, w: ap.w, h: ap.h });
-              if (ps.qt > .01) holes.push({ x: ps.x + dx, y: ps.y, w: ps.w, h: ps.h });
-            }
-          }
-        }
-        if (!holes.length && (!hasSheetCut || shTop >= barH)) return 'none';
-        const mDpr = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, 3);
-        const svgW = Math.max(1, Math.round(wBox * mDpr));
-        const svgH = Math.max(1, Math.round(barH * mDpr));
-        const vbW = +wBox.toFixed(2);
-        const hasCut = hasSheetCut && shTop < barH;
-        const sy = hasCut ? +Math.max(0, shTop).toFixed(2) : -1;
-        const sr = hasCut ? +Math.min(46 * (1 - clamp((SH.t - .9) / .1, 0, 1)), vbW / 2).toFixed(2) : -1;
-        const inset = 0.65;
-        let maskKey = svgW + 'x' + svgH + '|' + vbW + '|' + barH + '|' + sy + ',' + sr;
-        const holeGeom = [];
-        for (let i = 0; i < holes.length; i++) {
-          const h = holes[i];
-          if (h.y >= shTop + 46) continue;
-          const hx = h.x + inset, hy = h.y + inset;
-          const hw = h.w - inset * 2, hh = h.h - inset * 2;
-          if (hw <= 0 || hh <= 0) continue;
-          const hr = Math.max(0, Math.min(22 - inset, hw / 2, hh / 2));
-          const x = +hx.toFixed(2), y = +hy.toFixed(2), w = +hw.toFixed(2), hh2 = +hh.toFixed(2), rr = +hr.toFixed(2);
-          maskKey += '|' + x + ',' + y + ',' + w + ',' + hh2 + ',' + rr;
-          holeGeom.push([x, y, w, hh2, rr]);
-        }
-        if (cacheBox && cacheBox._mKey === maskKey && cacheBox._mVal) return cacheBox._mVal;
-        let clipDef = '', clipAttr = '';
-        if (hasCut) {
-          const cd = sr > .5
-            ? 'M0,0H' + vbW + 'V' + +(sy + sr).toFixed(2) + 'A' + sr + ',' + sr + ' 0 0 0 ' + +(vbW - sr).toFixed(2) + ',' + sy + 'H' + sr + 'A' + sr + ',' + sr + ' 0 0 0 0,' + +(sy + sr).toFixed(2) + 'Z'
-            : 'M0,0H' + vbW + 'V' + sy + 'H0Z';
-          clipDef = '<defs><clipPath id="sc"><path d="' + cd + '"/></clipPath></defs>';
-          clipAttr = ' clip-path="url(#sc)"';
-        }
-        let d = 'M0,0H' + vbW + 'V' + barH + 'H0Z';
-        holeGeom.forEach(([x, y, w, hh2, rr]) => {
-          const lineW = +(w - 2 * rr).toFixed(2), lineH = +(hh2 - 2 * rr).toFixed(2);
-          if (lineW <= 0.01 && lineH <= 0.01 && rr > 0) {
-            const cx = +(x + w / 2).toFixed(2), dRx = +(w / 2).toFixed(2), dRy = +(hh2 / 2).toFixed(2);
-            d += 'M' + cx + ',' + y + 'a' + dRx + ',' + dRy + ' 0 1 1 0,' + +(dRy * 2).toFixed(2) + 'a' + dRx + ',' + dRy + ' 0 1 1 0,-' + +(dRy * 2).toFixed(2) + 'Z';
-          } else {
-            const x0 = +(x + rr).toFixed(2);
-            d += 'M' + x0 + ',' + y;
-            if (lineW > 0.01) d += 'h' + lineW;
-            if (rr > 0) d += 'a' + rr + ',' + rr + ' 0 0 1 ' + rr + ',' + rr;
-            if (lineH > 0.01) d += 'v' + lineH;
-            if (rr > 0) d += 'a' + rr + ',' + rr + ' 0 0 1 -' + rr + ',' + rr;
-            if (lineW > 0.01) d += 'h-' + lineW;
-            if (rr > 0) d += 'a' + rr + ',' + rr + ' 0 0 1 -' + rr + ',-' + rr;
-            if (lineH > 0.01) d += 'v-' + lineH;
-            if (rr > 0) d += 'a' + rr + ',' + rr + ' 0 0 1 ' + rr + ',-' + rr;
-            d += 'Z';
-          }
-        });
-        const url = 'url("data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="' + svgW + '" height="' + svgH + '" viewBox="0 0 ' + vbW + ' ' + barH + '" preserveAspectRatio="none" shape-rendering="geometricPrecision">' + clipDef + '<path' + clipAttr + ' fill="black" fill-rule="evenodd" d="' + d + '"/></svg>') + '")';
-        if (cacheBox) { cacheBox._mKey = maskKey; cacheBox._mVal = url; }
-        return url;
-      };
-      const m0 = vis0 ? holeMask(Pprev, -W * .28 * (1 - pp), splitNum, tbPrev) : 'none';
-      const m1 = vis1 ? holeMask(P, -splitNum, W - splitNum, tbCurr) : 'none';
-      const applySpanMask = (spans, m, key, box) => {
-        if (box[key] === m) return;
-        box[key] = m;
-        spans.forEach((sp, i) => {
-          const g = _TOPBAR_GRAD[i];
-          if (m === 'none') {
-            const v = g || 'none';
-            sp.style.webkitMaskImage = v; sp.style.maskImage = v;
-            sp.style.webkitMaskComposite = ''; sp.style.maskComposite = '';
-          } else if (g) {
-            const v = g + ', ' + m;
-            sp.style.webkitMaskImage = v; sp.style.maskImage = v;
-            sp.style.webkitMaskComposite = 'source-in'; sp.style.maskComposite = 'intersect';
-          } else {
-            sp.style.webkitMaskImage = m; sp.style.maskImage = m;
-          }
-        });
-      };
-      applySpanMask(tb._spansPrev, m0, '_m', tbPrev);
-      applySpanMask(tb._spansCurr, m1, '_m', tbCurr);
     }
   }
+  if (!sheetFull) {
   {
     c.save(); c.globalAlpha = 1;
     const root = st.length === 1, title = NAV_TITLED[P.kind] ? P.data.title : null;
@@ -1688,17 +1653,33 @@ function drawOverlay() {
         const bCx = m.x + (rightEdge - m.x) * 0.5, bCy = m.y + m.h * 0.5;
         c.translate(bCx, bCy); c.scale(bodySc, bodySc); c.translate(-bCx, -bCy);
       }
+      const miniTxtSc = mix(1, 13.5 / 14.5, em);
+      const drawMiniTxt = (titleStr, subStr) => {
+        const cyM = m.y + m.h / 2;
+        if (miniTxtSc < 0.998) {
+          c.save();
+          c.translate(tx, cyM);
+          c.scale(miniTxtSc, miniTxtSc);
+          const smw = mw / miniTxtSc;
+          txt(c, titleStr, 0, -1.8, F(600, 14.5), fgG(), 'left', smw);
+          txt(c, subStr, 0, 15.2, F(400, 13.2), subG(), 'left', smw);
+          c.restore();
+        } else {
+          txt(c, titleStr, tx, cyM - 1.8, F(600, 14.5), fgG(), 'left', mw);
+          txt(c, subStr, tx, cyM + 15.5, F(400, 13.5), subG(), 'left', mw);
+        }
+      };
       if (_miniTrans.tr && _miniTrans.t > 0.01) {
         const ot = _miniTrans.tr;
         c.save(); c.translate(_miniTrans.dx, 0); c.globalAlpha = kDock * _miniTrans.t * miniDropA;
         drawArt(c, ot, m.x + pl, m.y + (m.h - as) / 2, as, mix(7, 6, em));
-        txt(c, ot.title, tx, m.y + m.h / 2 - mix(1.8, 1.5, em), F(600, +mix(14.5, 13.5, em).toFixed(2)), fgG(), 'left', mw); txt(c, subOfTrack(ot), tx, m.y + m.h / 2 + mix(15.5, 13.5, em), F(400, +mix(13.5, 12, em).toFixed(2)), subG(), 'left', mw);
+        drawMiniTxt(ot.title, subOfTrack(ot));
         c.restore();
       }
       c.save();
       c.translate(mdx * .82, 0); c.globalAlpha = kDock * mal * miniDropA * (_miniTrans.t > 0.01 ? clamp(1 - _miniTrans.t * 0.35, 0, 1) : 1);
       drawArt(c, miniDispTr, m.x + pl, m.y + (m.h - as) / 2, as, mix(7, 6, em));
-      txt(c, miniDispTr.title, tx, m.y + m.h / 2 - mix(1.8, 1.5, em), F(600, +mix(14.5, 13.5, em).toFixed(2)), fgG(), 'left', mw); txt(c, subOfTrack(miniDispTr), tx, m.y + m.h / 2 + mix(15.5, 13.5, em), F(400, +mix(13.5, 12, em).toFixed(2)), subG(), 'left', mw);
+      drawMiniTxt(miniDispTr.title, subOfTrack(miniDispTr));
       c.restore();
       c.restore();
       const btnX = mix(m.x + m.w - 72, m.x + m.w - 26, em), btnY = m.y + m.h / 2;
@@ -1732,6 +1713,7 @@ function drawOverlay() {
     c.fillStyle = '#000';
     rrPath(c, 0, oy, W, H + 80, rad); c.fill();
     c.restore();
+  }
   }
   OV_SHITS = [];
   if (SH.t > .01 && t) {
@@ -2038,7 +2020,10 @@ function drawOverlay() {
   return rimChanged;
 }
 
-function setG(g, r, vis, o) { g.set(Object.assign({ x: r.x, y: r.y, width: r.w, height: r.h, visible: vis }, o || {})); }
+function setG(g, r, vis, o) {
+  g.x = r.x; g.y = r.y; g.width = r.w; g.height = r.h; g.own.visible = vis;
+  if (o) g.set(o);
+}
 /* advance bar springs BEFORE drawing so the glass lens and refracted overlay share the same frame */
 function stepNav(dt) {
   const idx = TABS.findIndex(x => x[0] === NAV.tab);
@@ -2050,28 +2035,50 @@ function stepNav(dt) {
 }
 /* cache HTML prompt modal DOM nodes to avoid 60fps querySelector/layout thrashing */
 let _promptEl = null, _promptSheet = null, _promptInited = false, _promptGlassVis = false, _promptGeom = null, _lastPromptGeomKey = '';
+let _promptTransitionUntil = 0, _promptDirty = true, _promptLastFallback = null;
+function invalidatePromptGeom(ms) {
+  _promptDirty = true;
+  const until = performance.now() + (ms == null ? 420 : ms);
+  if (until > _promptTransitionUntil) _promptTransitionUntil = until;
+  if (typeof wakeFrame === 'function') wakeFrame();
+}
+if (typeof window !== 'undefined') window.invalidatePromptGeom = invalidatePromptGeom;
 function ensurePromptRefs() {
   if (_promptInited) return;
   _promptInited = true;
   if (typeof document !== 'undefined') {
     _promptEl = document.getElementById('sonoraPrompt');
     _promptSheet = _promptEl ? _promptEl.querySelector('.prompt-sheet') : null;
+    if (_promptEl && typeof MutationObserver !== 'undefined') {
+      try {
+        new MutationObserver(() => { invalidatePromptGeom(420); }).observe(_promptEl, { attributes: true, attributeFilter: ['class', 'style'] });
+      } catch (_) {}
+    }
   }
 }
 function isSonoraPromptOpen() {
-  const el = typeof document !== 'undefined' && document.getElementById('sonoraPrompt');
+  ensurePromptRefs();
+  const el = _promptEl;
   return Boolean(el && el.style.display !== 'none' && (el.classList.contains('visible') || el.classList.contains('active')));
 }
 function syncPromptGeom() {
   ensurePromptRefs();
-  if (_promptEl) _promptEl.classList.toggle('fallback-gl', !!FALLBACK);
+  if (_promptEl && _promptLastFallback !== !!FALLBACK) {
+    _promptLastFallback = !!FALLBACK;
+    _promptEl.classList.toggle('fallback-gl', !!FALLBACK);
+  }
   const pOpen = !!(_promptEl && _promptEl.style.display !== 'none');
   const pAnim = typeof window !== 'undefined' && typeof window._promptGlassAlpha === 'number' && window._promptGlassAlpha > 0.02;
   if (_promptSheet && (pOpen || pAnim)) {
     const pActive = _promptEl.classList.contains('visible') || _promptEl.classList.contains('active');
     if (pActive || pAnim) {
+      const now = performance.now();
+      if (!_promptDirty && now > _promptTransitionUntil && _promptGlassVis && _promptGeom && _promptGeom.op >= 0.99 && pActive) {
+        return false;
+      }
+      _promptDirty = false;
       const sr = _promptSheet.getBoundingClientRect();
-      const or = OUT_RECT || $out.getBoundingClientRect();
+      const or = (OUT_RECT && OUT_RECT.width > 0) ? OUT_RECT : (OUT_RECT = $out.getBoundingClientRect());
       const cs = getComputedStyle(_promptSheet);
       const op = clamp(parseFloat(cs.opacity || (pActive ? '1' : '0')) || 0, 0, 1);
       window._promptGlassAlpha = op;
@@ -2089,11 +2096,13 @@ function syncPromptGeom() {
   _promptGlassVis = false;
   _promptGeom = null;
   _lastPromptGeomKey = '';
+  _promptDirty = false;
   if (typeof window !== 'undefined') window._promptGlassAlpha = 0;
   return wasVis;
 }
 function updateGlass(dt) {
   if (!BARC.init) stepBarCols(0);
+  syncWebGLTopbar();
   const shVis = clamp(1 - shY() / H, 0, 1);
   const k = clamp(1 - shVis * 3, 0, 1), dkV = dockVis(), kDock = k * dkV, dy = shVis * 120, vis = kDock > .02, st = stackOf(), root = st.length === 1, tb = LAY.tab, ch = false;
   const Ptop = topPage(), tn = !root ? tintOf(Ptop) : null;
@@ -2357,7 +2366,6 @@ function updateGlass(dt) {
     });
   }
   if (G.prompt) {
-    syncPromptGeom();
     if (_promptGlassVis && _promptGeom) {
       const pg = _promptGeom, pt = cmTheme(null);
       setG(G.prompt, { x: pg.x, y: pg.y, w: pg.w, h: pg.h }, true, {
@@ -2425,7 +2433,10 @@ function updateGlass(dt) {
 
 const INP = { rel: 0, down: false, id: -1, x0: 0, y0: 0, x: 0, y: 0, ly: 0, lx: 0, t0: 0, mode: null, tgt: null, samples: [], thumb: { on: false, x: 0, press: 0 } };
 const tabPos = x => clamp((x - LAY.tabs[0].x) / LAY.tabs[0].w - .5, 0, 3);
-const pt = e => { const r = $out.getBoundingClientRect(); return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) }; };
+const pt = e => {
+  const r = (OUT_RECT && OUT_RECT.width > 0) ? OUT_RECT : (OUT_RECT = $out.getBoundingClientRect());
+  return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+};
 function topmost(list, x, y, needFn, pad) { for (let i = list.length - 1; i >= 0; i--) { const h = list[i]; if (inR(h, x, y, pad) && (!needFn || h.fn)) return h; } return null; }
 const setVol = x => {
   PL.vol = clamp((x - 52) / (W - 104), 0, 1);
@@ -2437,7 +2448,7 @@ const setVol = x => {
   SH.volDrag = true;
   redraw();
 };
-let frameNo = 0;
+let frameNo = 0, _lastShPhaseDraw = 0, _shColsSettling = false;
 
 const SWQ_THRESHOLD = 96;
 const SWQ_HOLD      = 96;
@@ -2734,20 +2745,22 @@ function physics(dt) {
   if (!(INP.down && INP.mode === 'dismiss') && SH.drag) { SH.drag = ease(SH.drag, 0, 14, dt); if (Math.abs(SH.drag) < .2) SH.drag = 0; redraw(); }
   if (!(INP.down && INP.mode === 'miniSwipe') && Math.abs(NAV.miniDx) > .15) { NAV.miniDx = ease(NAV.miniDx, 0, 18, dt); if (Math.abs(NAV.miniDx) < .15) NAV.miniDx = 0; D.ov = D.gl = true; } else if (!(INP.down && INP.mode === 'miniSwipe') && NAV.miniDx !== 0) { NAV.miniDx = 0; D.ov = D.gl = true; }
   if (!(INP.down && INP.mode === 'miniDismiss') && Math.abs(NAV.miniDy) > .15) { NAV.miniDy = ease(NAV.miniDy, 0, 18, dt); if (Math.abs(NAV.miniDy) < .15) NAV.miniDy = 0; D.ov = D.gl = true; } else if (!(INP.down && INP.mode === 'miniDismiss') && NAV.miniDy !== 0) { NAV.miniDy = 0; D.ov = D.gl = true; }
-  { const a0 = SP.art.x; SP.art.t = PL.playing ? 1 : .82; SP.art.step(dt); SH.pk = SP.art.x; if ((SP.art.busy || SP.art.x !== a0) && SH.t > .01) redraw(); }
-  { const m0 = SP.shMode.x, t0 = SP.shText.x, q0 = SP.qMode.x, p1 = SP.sP1.x, p2 = SP.sP2.x, p3 = SP.sP3.x, la0 = SP.sLyAnim ? SP.sLyAnim.x : 0, lc0 = SP.sLyClassic ? SP.sLyClassic.x : 0;
-    SP.shMode.t = SH.mode === 'art' ? 0 : 1; SP.shMode.step(dt); SH.modeP = clamp(SP.shMode.x, 0, 1);
-    SP.shText.t = SH.mode === 'art' ? 0 : 1; SP.shText.step(dt); SH.textP = clamp(SP.shText.x, 0, 1);
-    SP.qMode.t = (SH.mode === 'queue' && SH.t > .05) ? 1 : 0; SP.qMode.step(dt); SH.qModeP = clamp(SP.qMode.x, 0, 1);
-    SP.sP1.t = PL.shuffle ? 1 : 0; SP.sP1.step(dt);
-    SP.sP2.t = PL.repeat > 0 ? 1 : 0; SP.sP2.step(dt);
-    SP.sP3.t = PL.infinity ? 1 : 0; SP.sP3.step(dt);
-    if (SP.sLyAnim) { SP.sLyAnim.t = (SRCUI.style === 'classic') ? 0 : 1; SP.sLyAnim.step(dt); }
-    if (SP.sLyClassic) { SP.sLyClassic.t = (SRCUI.style === 'classic') ? 1 : 0; SP.sLyClassic.step(dt); }
-    const shBusy = SP.shMode.busy || SP.shText.busy || SP.qMode.busy || SP.sP1.busy || SP.sP2.busy || SP.sP3.busy ||
-      (SP.sLyAnim && (SP.sLyAnim.busy || SP.sLyAnim.x !== la0)) || (SP.sLyClassic && (SP.sLyClassic.busy || SP.sLyClassic.x !== lc0)) ||
-      SP.shMode.x !== m0 || SP.shText.x !== t0 || SP.qMode.x !== q0 || SP.sP1.x !== p1 || SP.sP2.x !== p2 || SP.sP3.x !== p3;
-    if (shBusy && SH.t > .01) redraw(); }
+  if (SH.t > .01 || SH.target > 0 || SP.art.busy || SP.shMode.busy || SP.shText.busy || SP.qMode.busy || SP.sP1.busy || SP.sP2.busy || SP.sP3.busy || (SP.sLyAnim && SP.sLyAnim.busy) || (SP.sLyClassic && SP.sLyClassic.busy)) {
+    { const a0 = SP.art.x; SP.art.t = PL.playing ? 1 : .82; SP.art.step(dt); SH.pk = SP.art.x; if ((SP.art.busy || SP.art.x !== a0) && SH.t > .01) redraw(); }
+    { const m0 = SP.shMode.x, t0 = SP.shText.x, q0 = SP.qMode.x, p1 = SP.sP1.x, p2 = SP.sP2.x, p3 = SP.sP3.x, la0 = SP.sLyAnim ? SP.sLyAnim.x : 0, lc0 = SP.sLyClassic ? SP.sLyClassic.x : 0;
+      SP.shMode.t = SH.mode === 'art' ? 0 : 1; SP.shMode.step(dt); SH.modeP = clamp(SP.shMode.x, 0, 1);
+      SP.shText.t = SH.mode === 'art' ? 0 : 1; SP.shText.step(dt); SH.textP = clamp(SP.shText.x, 0, 1);
+      SP.qMode.t = (SH.mode === 'queue' && SH.t > .05) ? 1 : 0; SP.qMode.step(dt); SH.qModeP = clamp(SP.qMode.x, 0, 1);
+      SP.sP1.t = PL.shuffle ? 1 : 0; SP.sP1.step(dt);
+      SP.sP2.t = PL.repeat > 0 ? 1 : 0; SP.sP2.step(dt);
+      SP.sP3.t = PL.infinity ? 1 : 0; SP.sP3.step(dt);
+      if (SP.sLyAnim) { SP.sLyAnim.t = (SRCUI.style === 'classic') ? 0 : 1; SP.sLyAnim.step(dt); }
+      if (SP.sLyClassic) { SP.sLyClassic.t = (SRCUI.style === 'classic') ? 1 : 0; SP.sLyClassic.step(dt); }
+      const shBusy = SP.shMode.busy || SP.shText.busy || SP.qMode.busy || SP.sP1.busy || SP.sP2.busy || SP.sP3.busy ||
+        (SP.sLyAnim && (SP.sLyAnim.busy || SP.sLyAnim.x !== la0)) || (SP.sLyClassic && (SP.sLyClassic.busy || SP.sLyClassic.x !== lc0)) ||
+        SP.shMode.x !== m0 || SP.shText.x !== t0 || SP.qMode.x !== q0 || SP.sP1.x !== p1 || SP.sP2.x !== p2 || SP.sP3.x !== p3;
+      if (shBusy && SH.t > .01) redraw(); }
+  }
   {
     if (!SH.botHl) SH.botHl = { lyrics: 0, airplay: 0, queue: 0 };
     const isOutOn = typeof OUT_DRAWER !== 'undefined' && OUT_DRAWER.open;
@@ -2777,7 +2790,7 @@ function physics(dt) {
     if (!SH.cols || SH.cols.length !== tg.length) {
       SH.cols = tg.map(q => q.slice());
       colsSettling = true;
-    } else {
+    } else if (SH.cols !== tg) {
       SH.cols.forEach((q, i) => {
         for (let k = 0; k < 3; k++) {
           const nv = ease(q[k], tg[i][k], 2.6, dt);
@@ -2786,20 +2799,23 @@ function physics(dt) {
         }
       });
     }
+    _shColsSettling = colsSettling;
     const shAnim = PL.playing || colsSettling || SH.t <= .999 || SH.target < 1 || !!SH.drag || !!INP.down ||
       SP.art.busy || SP.shMode.busy || SP.shText.busy || SP.qMode.busy ||
       Math.abs(SH.lVel || 0) > 8 || Math.abs(SH.qVel || 0) > 8 ||
       !!SH.dragQueue || !!SH.qSettle || !!(SH.qOff && SH.qOff.size > 0) || !!(SH.qRemoving && SH.qRemoving.length > 0);
     if (shAnim) {
       SH.phase += dt * (PL.playing ? .3 : .12);
-      if (frameNo & 1) {
-        if (SH.t > .999) {
+      const nowSh = performance.now();
+      if (SH.t >= .999) {
+        if (nowSh - _lastShPhaseDraw >= 55) {
+          _lastShPhaseDraw = nowSh;
           if (typeof redrawSceneOnly === 'function') redrawSceneOnly();
           else { D.scene = D.gl = true; }
-        } else {
-          D.scene = D.gl = true;
-          if (SH.t < .99) D.ov = true;
         }
+      } else if (frameNo & 1) {
+        D.scene = D.gl = true;
+        if (SH.t < .99) D.ov = true;
       }
     }
   }
@@ -2853,7 +2869,7 @@ function physics(dt) {
     if (Math.abs(NAV.sm - st) > .0015) { NAV.sm = ease(NAV.sm, st, 10, dt); if (Math.abs(NAV.sm - st) <= .0015) NAV.sm = st; redraw(); } else if (NAV.sm !== st) { NAV.sm = st; redraw(); } }
   { const st = SRCUI.open && SH.t > .5 ? 1 : 0; if (Math.abs(SRCUI.t - st) > .0015) { SRCUI.t = ease(SRCUI.t, st, 14, dt); if (Math.abs(SRCUI.t - st) <= .0015) SRCUI.t = st; redraw(); } else if (SRCUI.t !== st) { SRCUI.t = st; redraw(); } if (!st && SRCUI.open && SH.t < .05) SRCUI.open = false;
     const exSt = SRCUI.ex ? 1 : 0; SRCUI.exT = SRCUI.exT || 0; if (Math.abs(SRCUI.exT - exSt) > .0015) { SRCUI.exT = ease(SRCUI.exT, exSt, 15, dt); if (Math.abs(SRCUI.exT - exSt) <= .0015) SRCUI.exT = exSt; redraw(); } else if (SRCUI.exT !== exSt) { SRCUI.exT = exSt; redraw(); } }
-  if (SH.lyLay && SH.lyLay.blocks) {
+  if (SH.t > .5 && (SH.mode === 'lyrics' || SH.fromMode === 'lyrics') && SH.lyLay && SH.lyLay.blocks) {
     const ci = SH.lAct != null ? SH.lAct : -1;
     const fci = Math.max(0, ci);
     let chLy = false;
@@ -2989,6 +3005,7 @@ function outDrawerHit(x, y) {
 }
 $out.addEventListener('pointerdown', e => {
   if (isSonoraPromptOpen()) return;
+  if (typeof wakeFrame === 'function') wakeFrame();
   if (typeof armHistory === 'function') armHistory();
   const p = pt(e), now = performance.now(), P = topPage(), st = stackOf();
   Object.assign(INP, { down: true, id: e.pointerId, x0: p.x, y0: p.y, x: p.x, y: p.y, lx: p.x, ly: p.y, t0: now, mode: null, tgt: null, samples: [{ t: now, x: p.x, y: p.y }] });
@@ -3132,7 +3149,7 @@ $out.addEventListener('pointerdown', e => {
   INP.tgt = { type: 'page', rail, hit: phit };
 });
 $out.addEventListener('pointermove', e => {
-  if (!INP.down) return; const p = pt(e), now = performance.now(), dx = p.x - INP.x0, dy = p.y - INP.y0, ddx = p.x - INP.lx, ddy = p.y - INP.ly, tg = INP.tgt, P = topPage();
+  if (!INP.down) return; if (typeof wakeFrame === 'function') wakeFrame(); const p = pt(e), now = performance.now(), dx = p.x - INP.x0, dy = p.y - INP.y0, ddx = p.x - INP.lx, ddy = p.y - INP.ly, tg = INP.tgt, P = topPage();
   INP.samples.push({ t: now, x: p.x, y: p.y }); if (INP.samples.length > 8) INP.samples.shift(); INP.lx = p.x; INP.ly = p.y; INP.x = p.x; INP.y = p.y;
   if (!tg) return;
   if (tg.type === 'outDrawer') {
@@ -3322,7 +3339,7 @@ $out.addEventListener('pointermove', e => {
   }
 });
 function endPointer(e, cancel) {
-  if (!INP.down) return; INP.down = false; const p = pt(e), v = velocity(), mode = INP.mode, tg = INP.tgt, P = topPage(), moved = Math.hypot(p.x - INP.x0, p.y - INP.y0), quick = performance.now() - INP.t0 < 600;
+  if (!INP.down) return; if (typeof wakeFrame === 'function') wakeFrame(); INP.down = false; const p = pt(e), v = velocity(), mode = INP.mode, tg = INP.tgt, P = topPage(), moved = Math.hypot(p.x - INP.x0, p.y - INP.y0), quick = performance.now() - INP.t0 < 600;
   INP.thumb.on = false; CM.pressRow = -1; OUT_DRAWER.pressRow = -1; relGlass(); if (typeof pressUp === 'function') pressUp(); try { $out.releasePointerCapture(INP.id); } catch (_) {}
   if (tg && tg.hit && tg.hit.lqCtrl) lqRelease(tg.hit.lqCtrl);
   if (cancel) {
@@ -3588,6 +3605,7 @@ window.updateKeyboardInset = function(imeDp) {
   if (typeof document !== 'undefined' && document.documentElement) {
     document.documentElement.style.setProperty('--prompt-kb', Math.round(nk) + 'px');
   }
+  invalidatePromptGeom(350);
   if (Math.abs(nk - KBH) > 0.5) {
     KBH = nk;
     if (typeof layout === 'function') layout();
@@ -3604,6 +3622,7 @@ function updateKBH() {
     const curNative = Math.max(window.__NATIVE_KBH__ || 0, nativeKb || 0);
     if (KBH !== curNative) {
       KBH = curNative;
+      invalidatePromptGeom(350);
       redraw();
     }
     return;
@@ -3613,21 +3632,18 @@ function updateKBH() {
   const kbTop = visualViewport.offsetTop + visualViewport.height - OUT_RECT.top;
   const k = Math.max(0, ($out.clientHeight || innerHeight) - kbTop);
   const nk = k < 40 ? 0 : k;
-  if (nk !== KBH) { KBH = nk; redraw(); }
+  if (nk !== KBH) { KBH = nk; invalidatePromptGeom(350); redraw(); }
 }
 if (window.visualViewport) { visualViewport.addEventListener('resize', updateKBH); visualViewport.addEventListener('scroll', updateKBH); }
 window.addEventListener('resize', () => {
-  if (typeof relayout === 'function') relayout();
-  else redraw();
+  invalidatePromptGeom(350);
+  if ($out && ($out.clientWidth !== W || $out.clientHeight !== H)) {
+    if (typeof relayout === 'function') relayout();
+    else redraw();
+  } else if ($out) {
+    OUT_RECT = $out.getBoundingClientRect();
+  }
 });
-if (typeof ResizeObserver !== 'undefined' && typeof $out !== 'undefined' && $out) {
-  try {
-    new ResizeObserver(() => {
-      if (typeof relayout === 'function') relayout();
-      else redraw();
-    }).observe($out);
-  } catch (_) {}
-}
 $q.addEventListener('focus', () => {
   if (SH.t > .05 || SH.target > .05 || OUT_DRAWER.open || CM.open || NAV.menu || SRCUI.open || isSonoraPromptOpen()) { $q.blur(); return; }
   const P = topPage();
@@ -3706,52 +3722,112 @@ function syncQ() {
   if (css !== qSty) { qSty = css; $q.style.cssText = css; }
 }
 let lastT = performance.now(), FALLBACK = null;
-function frame(now) {
-  const dt = Math.min(.05, (now - lastT) / 1000); lastT = now;
-  physics(dt); stepNav(dt); tickPlayer(dt); syncQ(); syncHistory();
-  const spinCont = typeof isSpinnerActive === 'function' && isSpinnerActive();
-  const animCont = (spinCont && SH.t > .01) ||
-    (typeof window !== 'undefined' && window._lyIntroActive && SH.t > .5 && SH.mode === 'lyrics' && PL.playing);
-  const ovCont = spinCont && SH.t < .98 && typeof cur === 'function' && !!cur();
-  if (animCont) {
-    D.scene = true;
-    D.gl = true;
+let _rafId = 0, _rafIdleFrames = 0, _inFrame = false;
+function wakeFrame() {
+  _rafIdleFrames = 0;
+  if (_inFrame || _rafId) return;
+  if (typeof requestAnimationFrame === 'function') {
+    lastT = performance.now();
+    _rafId = requestAnimationFrame(frame);
   }
-  if (ovCont) {
-    D.ov = true;
-    D.gl = true;
-  }
-  if (typeof syncPromptGeom === 'function' && syncPromptGeom()) {
-    D.ov = true;
-    D.gl = true;
-  }
-  if (D.scene) {
-    if (typeof _skulletActive !== 'undefined') _skulletActive = false;
-    if (typeof window !== 'undefined') window._artFadeActive = false;
-    drawScene();
-    if (!FALLBACK) lg.markSceneDirty();
-    D.scene = _inDrawScenePending;
-    if (_inDrawScenePendingOv) { D.ov = true; _inDrawScenePendingOv = false; }
-    _inDrawScenePending = false;
-    D.gl = true;
-  }
-  if (D.ov) { if (drawOverlay() && !FALLBACK) lg.markOverlayDirty(); D.ov = false; D.gl = true; }
-  if (FALLBACK) { if (D.gl) { FALLBACK.setTransform(1, 0, 0, 1, 0, 0); FALLBACK.drawImage(S, 0, 0); FALLBACK.drawImage(O, 0, 0); D.gl = false; } }
-  else {
-    lg._blurFreeze = false;
-    lg._blurStale = false;
-    if (D.gl || INP.down || INP.thumb.press > 0 || lg.busy) {
-      updateGlass(dt); lg.render(); D.gl = false;
+}
+if (typeof window !== 'undefined') window.wakeFrame = wakeFrame;
+function _hasActiveFrameWork(now, didRender) {
+  if (typeof document !== 'undefined' && document.hidden) return false;
+  if (didRender || D.scene || D.ov || D.gl) return true;
+  if (!FALLBACK && typeof lg !== 'undefined' && lg && lg.busy) return true;
+  if (INP.down || INP.rel > 0 || INP.thumb.on || INP.thumb.press > 0) return true;
+  if (PL.playing || (typeof isSpinnerActive === 'function' && isSpinnerActive())) return true;
+  if (_tabTrans.active || _miniTrans.t > 0.005 || NAV.miniDismissT > 0.005) return true;
+  if (NAV.popP !== NAV.popT || NAV.focus || Math.abs(NAV.miniDx) > 0.1 || Math.abs(NAV.miniDy) > 0.1) return true;
+  if (SH.t !== SH.target || SH.drag !== 0 || _shColsSettling || Math.abs(SH.qVel || 0) > 0.5 || Math.abs(SH.lVel || 0) > 0.5 ||
+      SH.dragQueue || SH.qSettle || (SH.qOff && SH.qOff.size > 0) || (SH.qRemoving && SH.qRemoving.length > 0)) return true;
+  if (SH.t > .5 && SH.mode === 'lyrics' && (SH.lHold > 0 || Math.abs(SH.lScroll - SH.lTarget) > 0.15)) return true;
+  if (CM.sp.busy || OUT_DRAWER.sp.busy || MENU_SP.busy || CM.fade < 1 || CM.pressRow >= 0 || CM.prevPressRow >= 0 ||
+      OUT_DRAWER.pressRow >= 0 || OUT_DRAWER.prevPressRow >= 0 || OUT_DRAWER.drag !== 0) return true;
+  if (SP.tab.busy || SP.tabP.busy || SP.hl.busy || SP.art.busy || SP.shMode.busy || SP.shText.busy || SP.qMode.busy ||
+      SP.sP1.busy || SP.sP2.busy || SP.sP3.busy || (SP.sLyAnim && SP.sLyAnim.busy) || (SP.sLyClassic && SP.sLyClassic.busy)) return true;
+  if (typeof _lqHasBusy !== 'undefined' && _lqHasBusy) return true;
+  if (typeof _PRESS !== 'undefined' && _PRESS && _PRESS.vals && _PRESS.vals.size > 0) return true;
+  if ((typeof _skulletActive !== 'undefined' && _skulletActive) || (typeof window !== 'undefined' && window._artFadeActive)) return true;
+  if (typeof LIVE !== 'undefined' && LIVE && LIVE.toastT > 0) return true;
+  if (SWQ.state !== 'idle' || SWQ.x !== 0 || SWQ.crossP > 0 || (typeof SWQ_ROWS !== 'undefined' && SWQ_ROWS.size > 0)) return true;
+  if (now < _promptTransitionUntil) return true;
+  const P = topPage();
+  if (P) {
+    if (Math.abs(P.vel || 0) > 0.5 || P.scrollTo != null) return true;
+    for (const id in P.rails) {
+      const r = P.rails[id];
+      if (r && (r.to != null || Math.abs(r.vel || 0) > 0.5 || r.x < 0 || r.x > (r.max || 0))) return true;
     }
   }
-  requestAnimationFrame(frame);
+  return false;
+}
+function frame(now) {
+  _rafId = 0;
+  _inFrame = true;
+  let didRender = false;
+  try {
+    const dt = Math.min(.05, Math.max(0, (now - lastT) / 1000)); lastT = now;
+    _shColsSettling = false;
+    physics(dt); stepNav(dt); tickPlayer(dt); syncQ();
+    const spinCont = typeof isSpinnerActive === 'function' && isSpinnerActive();
+    const animCont = (spinCont && SH.t > .01) ||
+      (typeof window !== 'undefined' && window._lyIntroActive && SH.t > .5 && SH.mode === 'lyrics' && PL.playing);
+    const ovCont = spinCont && SH.t < .98 && typeof cur === 'function' && !!cur();
+    if (animCont) {
+      D.scene = true;
+      D.gl = true;
+    }
+    if (ovCont) {
+      D.ov = true;
+      D.gl = true;
+    }
+    if (typeof syncPromptGeom === 'function' && syncPromptGeom()) {
+      D.ov = true;
+      D.gl = true;
+    }
+    didRender = D.scene || D.ov || D.gl;
+    if (D.scene || D.ov) syncHistory();
+    if (D.scene) {
+      if (typeof _skulletActive !== 'undefined') _skulletActive = false;
+      if (typeof window !== 'undefined') window._artFadeActive = false;
+      drawScene();
+      if (!FALLBACK) lg.markSceneDirty();
+      D.scene = _inDrawScenePending;
+      if (_inDrawScenePendingOv) { D.ov = true; _inDrawScenePendingOv = false; }
+      _inDrawScenePending = false;
+      D.gl = true;
+    }
+    if (D.ov) { if (drawOverlay() && !FALLBACK) lg.markOverlayDirty(); D.ov = false; D.gl = true; }
+    if (FALLBACK) { if (D.gl) { FALLBACK.setTransform(1, 0, 0, 1, 0, 0); FALLBACK.drawImage(S, 0, 0); FALLBACK.drawImage(O, 0, 0); D.gl = false; } }
+    else {
+      lg._blurFreeze = false;
+      lg._blurStale = false;
+      if (D.gl || INP.thumb.press > 0 || lg.busy) {
+        updateGlass(dt); lg.render(); D.gl = false;
+      }
+    }
+  } catch (err) {
+    console.error('[Sonora:frame]', err);
+  } finally {
+    _inFrame = false;
+  }
+  if (!_rafId) {
+    if (_hasActiveFrameWork(now, didRender)) {
+      _rafIdleFrames = 0;
+      _rafId = requestAnimationFrame(frame);
+    } else if (++_rafIdleFrames < 3) {
+      _rafId = requestAnimationFrame(frame);
+    }
+  }
 }
 function init() {
   try { initGlass(); lg.setScene(S); lg.setOverlay(O); }
   catch (err) { console.warn('WebGL non disponibile, uso il disegno semplice', err); FALLBACK = $out.getContext('2d'); const tb = document.getElementById('topbar'); if (tb) tb.style.display = 'block'; new ResizeObserver(() => { $out.width = $out.clientWidth * 2; $out.height = $out.clientHeight * 2; relayout(); }).observe($out); }
   if (!FALLBACK) relayout(); else { $out.width = $out.clientWidth * 2; $out.height = $out.clientHeight * 2; relayout(); }
-  applyTheme(); requestAnimationFrame(frame);
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => {
+  applyTheme(); wakeFrame();
+  if (document.fonts && document.fonts.ready && document.fonts.status !== 'loaded') document.fonts.ready.then(() => {
     if (typeof _clearFitCache === 'function') _clearFitCache();
     Object.keys(ARTC).forEach(k => { if (ARTC[k] && !ARTC[k]._real) delete ARTC[k]; });
     Object.keys(PALC).forEach(k => { if (PALC[k] && !PALC[k]._real && ARTC[k] && !ARTC[k]._real) delete PALC[k]; });
@@ -3759,9 +3835,13 @@ function init() {
   });
 }
 
-let _resumeTimer = null;
+let _resumeTimer = null, _lastResumeAt = 0;
 function _handleSonoraResume() {
-  lastT = performance.now();
+  const now = performance.now();
+  if (now - _lastResumeAt < 100) { wakeFrame(); return; }
+  _lastResumeAt = now;
+  lastT = now;
+  invalidatePromptGeom(350);
   if (typeof layout === 'function' && W > 0 && H > 0) layout();
   redraw();
   if (!FALLBACK && typeof lg !== 'undefined' && lg) {
@@ -3788,7 +3868,7 @@ function _handleSonoraResume() {
     FALLBACK.drawImage(O, 0, 0);
     D.scene = D.ov = D.gl = false;
   }
-  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => { redraw(); });
+  wakeFrame();
   if (!_resumeTimer && typeof setTimeout === 'function') {
     _resumeTimer = setTimeout(() => {
       _resumeTimer = null;

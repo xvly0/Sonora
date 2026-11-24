@@ -52,6 +52,12 @@ import java.util.concurrent.ConcurrentHashMap
 
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        private val bgIoExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "SonoraMainBgIo").apply { isDaemon = true }
+        }
+    }
+
     private lateinit var webView: WebView
     private lateinit var assetLoader: WebViewAssetLoader
     private val nativeBridge = SonoraNativeBridge()
@@ -63,12 +69,16 @@ class MainActivity : AppCompatActivity() {
     private var lastTopInsetDp = Float.NaN
     private var lastImeDp = Float.NaN
     private var lastAnimImeDp = Float.NaN
+    private var lastAnimImePushMs = 0L
+    private var lastResumePushElapsedMs = 0L
     private val playbackStateLock = Any()
     private var lastPbPlaying = false
     private var lastPbBuffering = false
     private var lastPbPosSec = Double.NaN
     private var lastPbDurSec = Double.NaN
     private var lastPbTrackId: String? = null
+    private var lastPbQuotedTrackId: String = "\"\""
+    private var lastPbPushElapsedMs = 0L
     private var servicePlaybackListener: SonoraPlaybackService.Companion.PlaybackListener? = null
     private val pendingServiceActions = mutableListOf<(SonoraPlaybackService) -> Unit>()
     @Volatile
@@ -253,10 +263,9 @@ class MainActivity : AppCompatActivity() {
 
         webView.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
-                android.util.Log.d(
-                    "SonoraConsole",
-                    "${consoleMessage.message()} (line ${consoleMessage.lineNumber()} of ${consoleMessage.sourceId()})"
-                )
+                if (isDebuggable) {
+                    android.util.Log.d("SonoraConsole", "${consoleMessage.message()} (line ${consoleMessage.lineNumber()} of ${consoleMessage.sourceId()})")
+                }
                 return true
             }
 
@@ -342,8 +351,11 @@ class MainActivity : AppCompatActivity() {
                     val density = resources.displayMetrics.density
                     val imeDp = if (density > 0) imeInsets.bottom / density else 0f
                     nativeBridge.currentKeyboardHeightDp = imeDp
-                    if (lastAnimImeDp.isNaN() || kotlin.math.abs(imeDp - lastAnimImeDp) >= 0.25f) {
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    val deltaOk = lastAnimImeDp.isNaN() || kotlin.math.abs(imeDp - lastAnimImeDp) >= 4f
+                    if (deltaOk && (lastAnimImePushMs == 0L || now - lastAnimImePushMs >= 32L)) {
                         lastAnimImeDp = imeDp
+                        lastAnimImePushMs = now
                         webView.evaluateJavascript(
                             "if (typeof window.updateKeyboardInset === 'function') window.updateKeyboardInset($imeDp);",
                             null
@@ -362,6 +374,7 @@ class MainActivity : AppCompatActivity() {
                         nativeBridge.currentKeyboardHeightDp = imeDp
                         lastImeDp = imeDp
                         lastAnimImeDp = imeDp
+                        lastAnimImePushMs = 0L
                         webView.evaluateJavascript(
                             "if (typeof window.updateKeyboardInset === 'function') window.updateKeyboardInset($imeDp);",
                             null
@@ -386,6 +399,17 @@ class MainActivity : AppCompatActivity() {
                     return SonoraApiInterceptor.handle(url, request.requestHeaders ?: emptyMap())
                 }
 
+                if (url.path == "/favicon.ico") {
+                    return WebResourceResponse(
+                        "image/x-icon",
+                        "UTF-8",
+                        204,
+                        "No Content",
+                        emptyMap(),
+                        java.io.ByteArrayInputStream(ByteArray(0))
+                    )
+                }
+
                 return super.shouldInterceptRequest(view, request)
             }
 
@@ -402,20 +426,14 @@ class MainActivity : AppCompatActivity() {
                 request: WebResourceRequest,
                 error: WebResourceError
             ) {
-                android.util.Log.e(
-                    "SonoraWebError",
-                    "Error on ${request.url}: ${error.description} (code ${error.errorCode})"
-                )
+                android.util.Log.e("SonoraWebError", "Error on ${request.url}: ${error.description} (code ${error.errorCode})")
             }
 
             override fun onRenderProcessGone(
                 view: WebView,
                 detail: RenderProcessGoneDetail
             ): Boolean {
-                android.util.Log.w(
-                    "SonoraWeb",
-                    "Render process gone (crashed=${detail.didCrash()}), recreating activity..."
-                )
+                android.util.Log.w("SonoraWeb", "Render process gone (crashed=${detail.didCrash()}), recreating activity...")
                 recreate()
                 return true
             }
@@ -426,21 +444,33 @@ class MainActivity : AppCompatActivity() {
                 if (!isUiResumed) return
                 val posSec = positionMs / 1000.0
                 val durSec = durationMs / 1000.0
+                val now = android.os.SystemClock.elapsedRealtime()
+                val qTrack: String
                 synchronized(playbackStateLock) {
-                    if (lastPbTrackId == trackId &&
+                    val sameMeta = lastPbTrackId == trackId &&
                         lastPbPlaying == isPlaying &&
                         lastPbBuffering == isBuffering &&
-                        lastPbPosSec == posSec &&
-                        lastPbDurSec == durSec) return
+                        lastPbDurSec == durSec
+                    if (sameMeta) {
+                        if (lastPbPosSec == posSec) return
+                        val elapsedSec = (now - lastPbPushElapsedMs) / 1000.0
+                        val expectedPos = if (isPlaying && !isBuffering) lastPbPosSec + elapsedSec else lastPbPosSec
+                        val isSeekJump = lastPbPosSec.isNaN() || kotlin.math.abs(posSec - expectedPos) > 0.35
+                        if (!isSeekJump && now - lastPbPushElapsedMs < 450L) return
+                    }
+                    if (lastPbTrackId != trackId) {
+                        lastPbQuotedTrackId = JSONObject.quote(trackId)
+                    }
                     lastPbTrackId = trackId
                     lastPbPlaying = isPlaying
                     lastPbBuffering = isBuffering
                     lastPbPosSec = posSec
                     lastPbDurSec = durSec
+                    lastPbPushElapsedMs = now
+                    qTrack = lastPbQuotedTrackId
                 }
                 runOnUiThread {
                     if (!isUiResumed) return@runOnUiThread
-                    val qTrack = JSONObject.quote(trackId)
                     webView.evaluateJavascript(
                         "window.onSonoraPlaybackState&&window.onSonoraPlaybackState($isPlaying,$posSec,$durSec,$isBuffering,$qTrack)",
                         null
@@ -625,6 +655,7 @@ class MainActivity : AppCompatActivity() {
                 val cfgJson = SonoraLocaleManager.toJson(includeChanged = true).toString()
                 postResumeWebViewRefresh("if (window.onSonoraLocaleChanged) window.onSonoraLocaleChanged($cfgJson);")
             }
+            lastResumePushElapsedMs = android.os.SystemClock.elapsedRealtime()
             postResumeWebViewRefresh("if (window.onSonoraResume) window.onSonoraResume(); else if (typeof redraw === 'function') redraw();")
         }
         if (SonoraPlaybackService.instance != null || isServiceBound || !initialServiceStartScheduled) {
@@ -645,7 +676,11 @@ class MainActivity : AppCompatActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus && isUiResumed) {
-            postResumeWebViewRefresh("if (window.onSonoraResume) window.onSonoraResume();")
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastResumePushElapsedMs >= 250L) {
+                lastResumePushElapsedMs = now
+                postResumeWebViewRefresh("if (window.onSonoraResume) window.onSonoraResume();")
+            }
         }
     }
 
@@ -887,11 +922,6 @@ class MainActivity : AppCompatActivity() {
                     if (i < arr.length()) arr.optDouble(i, 0.0).toFloat() else 0f
                 }
                 SonoraEqualizer.update(gains)
-                runOnUiThread {
-                    ensureService { service ->
-                        service.setEqGains(gains)
-                    }
-                }
             }
         }
 
@@ -1003,6 +1033,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         private val cacheStatsLock = Any()
+        private val cacheStatsRefreshing = java.util.concurrent.atomic.AtomicBoolean(false)
 
         @Volatile
         private var cachedCacheStatsJson: String? = null
@@ -1010,36 +1041,56 @@ class MainActivity : AppCompatActivity() {
         @Volatile
         private var cachedCacheStatsAtMs: Long = 0L
 
+        private fun computeCacheStatsJson(): String {
+            val mediaBytes = SonoraPlaybackService.getMediaCacheSizeBytes(this@MainActivity)
+            val downloadsBytes = SonoraDownloadManager.getDownloadsSizeBytes(this@MainActivity)
+            val downloadsCount = SonoraDownloadManager.getCompletedDownloadCount(this@MainActivity)
+            val httpCoverBytes = SonoraApiInterceptor.getCoverAndHttpCacheBytes()
+            val lyricsBytes = dev.sonora.music.lyrics.LyricsLibrary.getDiskCacheSizeBytes()
+            val lyricsCount = dev.sonora.music.lyrics.LyricsLibrary.getCachedEntryCount()
+            val coverCount = CoverCache.count()
+            return JSONObject().apply {
+                put("mediaBytes", mediaBytes)
+                put("downloadsBytes", downloadsBytes)
+                put("downloadsCount", downloadsCount)
+                put("httpCoverBytes", httpCoverBytes)
+                put("lyricsBytes", lyricsBytes)
+                put("totalBytes", mediaBytes + httpCoverBytes + lyricsBytes)
+                put("lyricsCount", lyricsCount)
+                put("coverCount", coverCount)
+            }.toString()
+        }
+
+        private fun refreshCacheStatsAsync() {
+            if (!cacheStatsRefreshing.compareAndSet(false, true)) return
+            bgIoExecutor.execute {
+                try {
+                    val json = computeCacheStatsJson()
+                    synchronized(cacheStatsLock) {
+                        cachedCacheStatsJson = json
+                        cachedCacheStatsAtMs = android.os.SystemClock.elapsedRealtime()
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    cacheStatsRefreshing.set(false)
+                }
+            }
+        }
+
         @JavascriptInterface
         fun getCacheStats(): String {
             val now = android.os.SystemClock.elapsedRealtime()
             val cached = cachedCacheStatsJson
-            if (cached != null && now - cachedCacheStatsAtMs < 5_000L) {
+            if (cached != null) {
+                if (now - cachedCacheStatsAtMs >= 5_000L) {
+                    refreshCacheStatsAsync()
+                }
                 return cached
             }
+            // Cold call: trigger async refresh and compute once cleanly (sub-caches are now O(1) indexed).
             synchronized(cacheStatsLock) {
-                val innerNow = android.os.SystemClock.elapsedRealtime()
-                val innerCached = cachedCacheStatsJson
-                if (innerCached != null && innerNow - cachedCacheStatsAtMs < 5_000L) {
-                    return innerCached
-                }
-                val mediaBytes = SonoraPlaybackService.getMediaCacheSizeBytes(this@MainActivity)
-                val downloadsBytes = SonoraDownloadManager.getDownloadsSizeBytes(this@MainActivity)
-                val downloadsCount = SonoraDownloadManager.getCompletedDownloadCount(this@MainActivity)
-                val httpCoverBytes = SonoraApiInterceptor.getCoverAndHttpCacheBytes()
-                val lyricsBytes = dev.sonora.music.lyrics.LyricsLibrary.getDiskCacheSizeBytes()
-                val lyricsCount = dev.sonora.music.lyrics.LyricsLibrary.getCachedEntryCount()
-                val coverCount = CoverCache.count()
-                val json = JSONObject().apply {
-                    put("mediaBytes", mediaBytes)
-                    put("downloadsBytes", downloadsBytes)
-                    put("downloadsCount", downloadsCount)
-                    put("httpCoverBytes", httpCoverBytes)
-                    put("lyricsBytes", lyricsBytes)
-                    put("totalBytes", mediaBytes + httpCoverBytes + lyricsBytes)
-                    put("lyricsCount", lyricsCount)
-                    put("coverCount", coverCount)
-                }.toString()
+                cachedCacheStatsJson?.let { return it }
+                val json = computeCacheStatsJson()
                 cachedCacheStatsJson = json
                 cachedCacheStatsAtMs = android.os.SystemClock.elapsedRealtime()
                 return json
@@ -1066,16 +1117,16 @@ class MainActivity : AppCompatActivity() {
             val clean = SonoraDownloadManager.normalizeTrackId(id)
             if (clean.isEmpty() || clean.startsWith("local_")) return false
             SonoraDownloadManager.enqueue(this@MainActivity, clean)
-            cachedCacheStatsJson = null
             cachedCacheStatsAtMs = 0L
+            refreshCacheStatsAsync()
             return true
         }
 
         @JavascriptInterface
         fun deleteDownloadedTrack(id: String): Boolean {
             val removed = SonoraPlaybackService.deleteDownloadedTrack(this@MainActivity, id)
-            cachedCacheStatsJson = null
             cachedCacheStatsAtMs = 0L
+            refreshCacheStatsAsync()
             return removed
         }
 
@@ -1083,20 +1134,31 @@ class MainActivity : AppCompatActivity() {
         fun clearCache(): Boolean {
             return runCatching {
                 SonoraApiInterceptor.clearCaches()
-                SonoraPlaybackService.clearAudioDiskCache(this@MainActivity)
-                listOf(
-                    java.io.File(cacheDir, "innertube_http_cache"),
-                    java.io.File(cacheDir, "innertube/innertube_http_cache"),
-                    java.io.File(cacheDir, "apple_http_cache"),
-                    java.io.File(cacheDir, "lyrics_v4"),
-                    java.io.File(cacheDir, "sonora_lyrics_cache"),
-                ).forEach { dir ->
-                    runCatching {
-                        if (dir.exists()) dir.deleteRecursively()
-                    }
+                StreamCache.clear()
+                synchronized(cacheStatsLock) {
+                    cachedCacheStatsJson = "{\"mediaBytes\":0,\"downloadsBytes\":${SonoraDownloadManager.getDownloadsSizeBytes(this@MainActivity)},\"downloadsCount\":${SonoraDownloadManager.getCompletedDownloadCount(this@MainActivity)},\"httpCoverBytes\":0,\"lyricsBytes\":0,\"totalBytes\":0,\"lyricsCount\":0,\"coverCount\":0}"
+                    cachedCacheStatsAtMs = 0L
                 }
-                cachedCacheStatsJson = null
-                cachedCacheStatsAtMs = 0L
+                val appCtx = applicationContext
+                val rootCacheDir = cacheDir
+                bgIoExecutor.execute {
+                    runCatching {
+                        SonoraPlaybackService.clearAudioDiskCache(appCtx)
+                    }
+                    listOf(
+                        java.io.File(rootCacheDir, "innertube_http_cache"),
+                        java.io.File(rootCacheDir, "innertube/innertube_http_cache"),
+                        java.io.File(rootCacheDir, "apple_http_cache"),
+                        java.io.File(rootCacheDir, "apple_catalog_v1"),
+                        java.io.File(rootCacheDir, "lyrics_v4"),
+                        java.io.File(rootCacheDir, "sonora_lyrics_cache"),
+                    ).forEach { dir ->
+                        runCatching {
+                            if (dir.exists()) dir.deleteRecursively()
+                        }
+                    }
+                    refreshCacheStatsAsync()
+                }
                 true
             }.getOrDefault(false)
         }

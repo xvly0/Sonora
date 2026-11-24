@@ -82,8 +82,9 @@ const $top = document.getElementById('top'), TC = $top.getContext('2d');
 let W = 0, H = 0, FRAME = false, TOP = 12;
 const D = { scene: true, ov: true, gl: true };
 let _skulletActive = false;
-const redraw = () => { D.scene = D.ov = D.gl = true; };
-const redrawSceneOnly = () => { D.scene = D.gl = true; };
+const _wakeFrame = () => { if (typeof window !== 'undefined' && typeof window.wakeFrame === 'function') window.wakeFrame(); };
+const redraw = () => { D.scene = D.ov = D.gl = true; _wakeFrame(); };
+const redrawSceneOnly = () => { D.scene = D.gl = true; _wakeFrame(); };
 const redrawSheetContent = () => {
   if (typeof SH !== 'undefined' && SH && SH.t >= 0.999 &&
       !(typeof CM !== 'undefined' && CM && CM.open) &&
@@ -108,6 +109,13 @@ window.haptic = function(kind) {
 };
 
 const _PRESS = { downKey: null, vals: new Map(), downAt: new Map(), age: new Map() };
+function _isSceneOnlyPressKey(k) {
+  return k.startsWith('song:') || k.startsWith('card:') || k.startsWith('artrel:') ||
+    k.startsWith('pill:') || k.startsWith('librow:') || k.startsWith('set_tile:') ||
+    k.startsWith('geo:') || k.startsWith('rec:') || k.startsWith('recap_') ||
+    k.startsWith('recs_') || k.startsWith('rec_') || k.startsWith('circ:') ||
+    k.startsWith('hPlay:') || k === 'set_upd';
+}
 window.pressDown = function(key) {
   if (!key) return;
   const k = String(key);
@@ -119,10 +127,16 @@ window.pressDown = function(key) {
     _PRESS.downAt.set(k, now);
     _PRESS.age.set(k, 0);
   }
-  redraw();
+  if (_isSceneOnlyPressKey(k)) redrawSceneOnly();
+  else redraw();
 };
 window.pressUp = function() {
-  if (_PRESS.downKey != null) { _PRESS.downKey = null; redraw(); }
+  if (_PRESS.downKey != null) {
+    const prevK = _PRESS.downKey;
+    _PRESS.downKey = null;
+    if (_isSceneOnlyPressKey(prevK)) redrawSceneOnly();
+    else redraw();
+  }
 };
 function pressFactor(key) {
   if (!key) return 0;
@@ -140,6 +154,7 @@ function pressTint(key, maxA) {
   return p > 0.001 ? p * (maxA == null ? 0.045 : maxA) : 0;
 }
 function stepPress(dt) {
+  if (!_PRESS.vals.size) return false;
   let ch = false;
   const scrolling = typeof INP !== 'undefined' && INP.mode && INP.mode !== 'none';
   const now = (typeof performance !== 'undefined' && typeof performance.now === 'function') ? performance.now() : Date.now();
@@ -208,7 +223,13 @@ try {
   if (sp && typeof sp === 'object') Object.assign(PREFS, sp);
 } catch (e) {}
 try {
-  if (typeof window !== 'undefined' && window.SonoraNative && typeof window.SonoraNative.getLocaleConfig === 'function') {
+  if (typeof window !== 'undefined' && typeof window.getLocaleConfig === 'function') {
+    const lc = window.getLocaleConfig();
+    if (lc && typeof lc === 'object') {
+      if (lc.lang) PREFS.lang = lc.lang;
+      if (lc.country) PREFS.country = lc.country;
+    }
+  } else if (typeof window !== 'undefined' && window.SonoraNative && typeof window.SonoraNative.getLocaleConfig === 'function') {
     const nc = JSON.parse(window.SonoraNative.getLocaleConfig() || 'null');
     if (nc && typeof nc === 'object') {
       if (nc.lang) PREFS.lang = nc.lang;
@@ -225,7 +246,7 @@ PREFS.volumeNorm = PREFS.volumeNorm !== false;
 if (!Array.isArray(PREFS.eqGains) || PREFS.eqGains.length !== 5) {
   PREFS.eqGains = [0, 0, 0, 0, 0];
 }
-const _nativeAudioSync = { eq: null, cf: null, sf: null, vn: null, vol: null, eqTimer: 0, volTimer: 0 };
+const _nativeAudioSync = { eq: null, cf: null, sf: null, vn: null, vol: null, rep: null, eqTimer: 0, volTimer: 0 };
 function syncNativeAudioConfig(force) {
   const N = typeof window !== 'undefined' && window.SonoraNative;
   if (!N) return;
@@ -235,6 +256,7 @@ function syncNativeAudioConfig(force) {
     const sf = !!PREFS.skipFade;
     const vn = PREFS.volumeNorm !== false;
     const vol = (typeof PL !== 'undefined' && PL.vol != null) ? PL.vol : 0.62;
+    const rep = (typeof PL !== 'undefined' && PL.repeat) ? Number(PL.repeat) : 0;
     if (typeof N.setEqGains === 'function' && (force || eqStr !== _nativeAudioSync.eq)) {
       _nativeAudioSync.eq = eqStr;
       N.setEqGains(eqStr);
@@ -252,7 +274,10 @@ function syncNativeAudioConfig(force) {
       _nativeAudioSync.vol = vol;
       N.setVolume(vol);
     }
-    if (typeof syncNativeRepeat === 'function') syncNativeRepeat();
+    if (typeof syncNativeRepeat === 'function' && (force || rep !== _nativeAudioSync.rep)) {
+      _nativeAudioSync.rep = rep;
+      syncNativeRepeat();
+    }
   } catch (e) {}
 }
 function syncNativeVolume(vol) {
@@ -270,7 +295,11 @@ function syncNativeVolume(vol) {
     } catch (e) {}
   }, 32);
 }
-let _prefsSaveTimer = 0, _prefsSaveDirty = false;
+let _prefsSaveTimer = 0, _prefsSaveDirty = false, _lastGlassPrefSig = '';
+function _glassPrefSig() {
+  return (PREFS.glassProfile || 'balanced') + '|' + (PREFS.glassBlur != null ? PREFS.glassBlur : 2) + '|' +
+    (PREFS.glassRefraction != null ? PREFS.glassRefraction : 24) + '|' + (PREFS.glassChromatic ? 1 : 0) + '|' + (pal && pal.dark ? 1 : 0);
+}
 function _writePrefsStorage() {
   try { localStorage.setItem('sonora-prefs', JSON.stringify(PREFS)); } catch (e) {}
 }
@@ -280,7 +309,7 @@ function flushPrefsSave() {
   _prefsSaveDirty = false;
   _writePrefsStorage();
 }
-function savePrefs(immediate) {
+function savePrefs(immediate, opts) {
   _prefsSaveDirty = true;
   if (immediate) {
     flushPrefsSave();
@@ -288,8 +317,15 @@ function savePrefs(immediate) {
     if (_prefsSaveTimer) clearTimeout(_prefsSaveTimer);
     _prefsSaveTimer = setTimeout(flushPrefsSave, 200);
   }
-  syncNativeAudioConfig();
-  if (typeof lg !== 'undefined' && lg) { lg.setDefaults(glassStyle()); applyStyles(); }
+  if (!(opts && opts.skipAudioSync)) syncNativeAudioConfig();
+  if (typeof lg !== 'undefined' && lg) {
+    const gSig = _glassPrefSig();
+    if ((opts && opts.glass) || gSig !== _lastGlassPrefSig) {
+      _lastGlassPrefSig = gSig;
+      lg.setDefaults(glassStyle());
+      applyStyles();
+    }
+  }
   redraw();
 }
 if (typeof window !== 'undefined') {
@@ -317,7 +353,7 @@ function applyTheme(mode) {
   const r = document.documentElement; if (themeMode === 'auto') r.removeAttribute('data-theme'); else r.setAttribute('data-theme', themeMode);
   Object.keys(ARTC).forEach(k => { if (ARTC[k] && ARTC[k]._placeholder) delete ARTC[k]; });
   if (typeof BARC !== 'undefined') BARC.init = false;
-  if (typeof lg !== 'undefined' && lg) { lg.setDefaults(glassStyle()); applyStyles(); }
+  if (typeof lg !== 'undefined' && lg) { _lastGlassPrefSig = _glassPrefSig(); lg.setDefaults(glassStyle()); applyStyles(); }
   redraw();
 }
 mqDark.addEventListener && mqDark.addEventListener('change', () => applyTheme());
@@ -335,10 +371,11 @@ function syncTabLabels() {
 syncTabLabels();
 if (typeof window !== 'undefined') window.syncTabLabels = syncTabLabels;
 function layout() {
-  const nativeTop = (typeof window !== 'undefined' && window.SonoraNative && typeof window.SonoraNative.getTopInset === 'function')
-    ? window.SonoraNative.getTopInset()
-    : null;
-  TOP = (window.SAFE_TOP != null) ? window.SAFE_TOP : (nativeTop != null ? nativeTop : (window.SonoraNative ? 44 : (FRAME ? 56 : 14)));
+  TOP = (window.SAFE_TOP != null)
+    ? window.SAFE_TOP
+    : ((typeof window !== 'undefined' && window.SonoraNative && typeof window.SonoraNative.getTopInset === 'function')
+      ? (window.SonoraNative.getTopInset() ?? 44)
+      : (window.SonoraNative ? 44 : (FRAME ? 56 : 14)));
   const m = 18, sd = 59, mh = 52, gap = 8, by = H - 14 - sd - (FRAME ? 8 : 0);
   LAY.tab = { x: m, y: by, w: W - m * 2 - sd - gap, h: sd };
   LAY.search = { x: W - m - sd, y: by, w: sd, h: sd };
@@ -416,8 +453,12 @@ function attachAudioEq(a) {
   } catch (e) {}
 }
 const cur = () => PL.queue[PL.qi];
+const _cleanArtCache = new Map();
+const _subTrackCache = new Map();
 function cleanArtistText(a) {
   if (!a) return '';
+  let cached = _cleanArtCache.get(a);
+  if (cached !== undefined) return cached;
   const parts = a.split(/\s*,\s*|\s*&\s*/)
     .map(s => s.trim())
     .filter(s => {
@@ -428,11 +469,21 @@ function cleanArtistText(a) {
       if (/^\d{1,2}[:.]\d{2}/.test(l)) return false;
       return true;
     });
-  return parts.length ? parts.join(', ') : a;
+  const res = parts.length ? parts.join(', ') : a;
+  if (_cleanArtCache.size >= 300) _cleanArtCache.clear();
+  _cleanArtCache.set(a, res);
+  return res;
 }
 const subOfTrack = t => {
-  const clean = cleanArtistText(t ? t.artist : '');
-  return clean ? clean.replace(/, ([^,]+)$/, ' & $1') : '';
+  const raw = t ? t.artist : '';
+  if (!raw) return '';
+  let cached = _subTrackCache.get(raw);
+  if (cached !== undefined) return cached;
+  const clean = cleanArtistText(raw);
+  const res = clean ? clean.replace(/, ([^,]+)$/, ' & $1') : '';
+  if (_subTrackCache.size >= 300) _subTrackCache.clear();
+  _subTrackCache.set(raw, res);
+  return res;
 };
 function isSpinnerActive() {
   if (!PL.playing) return false;
@@ -526,7 +577,9 @@ function enqueueTracks(tracks, mode, autoPlayIfIdle) {
 function syncNativeRepeat() {
   const N = typeof window !== 'undefined' && window.SonoraNative;
   if (N && typeof N.setRepeatMode === 'function') {
-    try { N.setRepeatMode((PL && PL.repeat) ? Number(PL.repeat) : 0); } catch (e) {}
+    const rep = (PL && PL.repeat) ? Number(PL.repeat) : 0;
+    _nativeAudioSync.rep = rep;
+    try { N.setRepeatMode(rep); } catch (e) {}
   }
 }
 if (typeof window !== 'undefined') window.syncNativeRepeat = syncNativeRepeat;
@@ -939,7 +992,9 @@ window.onSonoraPlaybackState = function(isPlaying, posSec, durSec, isBuffering, 
     PL.loadingSince = 0;
     PL.playing = true;
     PL.pos = posSec;
-    PL.sPos = posSec;
+    if (!wasPlaying || PL.sPos == null || Math.abs(posSec - PL.sPos) > 0.35) {
+      PL.sPos = posSec;
+    }
   } else if (isBuffering) {
     if (!PL.loading) {
       PL.loading = true;
@@ -973,11 +1028,14 @@ window.onSonoraPlaybackState = function(isPlaying, posSec, durSec, isBuffering, 
       savePlayerState();
     }
   }
+  const lyVis = typeof SH !== 'undefined' && (SH.mode === 'lyrics' || (SH.fromMode === 'lyrics' && typeof SP !== 'undefined' && (SP.shMode.busy || SP.qMode.busy)));
   if (stateChanged) {
     redraw();
   } else if (typeof SH !== 'undefined' && SH.t > .01) {
-    if (SH.mode === 'lyrics' || SH.fromMode === 'lyrics') redraw();
-    else D.scene = true;
+    if (lyVis) redrawSheetContent();
+    else { D.scene = true; _wakeFrame(); }
+  } else if (PL.playing) {
+    _wakeFrame();
   }
 };
 
@@ -1152,7 +1210,8 @@ function tickPlayer(dt) {
   } else {
     if (!PL.loading && PL.playing) {
       PL.pos += dt;
-      PL.sPos = PL.pos;
+      if (PL.sPos == null || Math.abs(PL.pos - PL.sPos) > .35) PL.sPos = PL.pos;
+      else PL.sPos += dt + (PL.pos - PL.sPos) * Math.min(1, dt * 8);
     } else {
       PL.sPos = PL.pos;
     }
@@ -1160,10 +1219,11 @@ function tickPlayer(dt) {
   if (!PL.audio && PL.pos >= durOf(t)) next(true);
   if (typeof recTick === 'function') recTick(t, dt);
   if (SH.t > .01) {
-    if (SH.mode === 'lyrics' || SH.fromMode === 'lyrics') { D.scene = D.gl = true; }
-    else if (Math.floor(PL.pos * 2) !== tickPlayer.q) { tickPlayer.q = Math.floor(PL.pos * 2); D.scene = true; }
+    const lyVis = SH.mode === 'lyrics' || (SH.fromMode === 'lyrics' && typeof SP !== 'undefined' && (SP.shMode.busy || SP.qMode.busy));
+    if (lyVis) { D.scene = D.gl = true; _wakeFrame(); }
+    else if (Math.floor(PL.pos * 2) !== tickPlayer.q) { tickPlayer.q = Math.floor(PL.pos * 2); D.scene = true; _wakeFrame(); }
   }
-  if (_waveVis && SH.t < .98) D.scene = true;
+  if (_waveVis && SH.t < .98) { D.scene = true; _wakeFrame(); }
 }
 function seedMockPlayer() {
   const p = PLAYLISTS[0];
@@ -1376,13 +1436,34 @@ function _pruneAffinity() {
     for (let i = 0; i < drop; i++) delete arMap[aKeys[i]];
   }
 }
-function saveAffinity() {
+let _affSaveTimer = 0, _affSaveDirty = false;
+function flushAffinitySave() {
+  if (_affSaveTimer) { clearTimeout(_affSaveTimer); _affSaveTimer = 0; }
+  if (!_affSaveDirty) return;
+  _affSaveDirty = false;
   try {
     _pruneAffinity();
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(AFFINITY_KEY, JSON.stringify(AFFINITY));
     }
   } catch (e) {}
+}
+function saveAffinity(immediate) {
+  _affSaveDirty = true;
+  if (immediate) { flushAffinitySave(); return; }
+  if (_affSaveTimer) return;
+  _affSaveTimer = setTimeout(() => {
+    _affSaveTimer = 0;
+    flushAffinitySave();
+  }, 1500);
+}
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('pagehide', flushAffinitySave);
+}
+if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushAffinitySave();
+  });
 }
 function recordTrackSkip(t, sec) {
   if (!t || !t.id) return;
@@ -1485,10 +1566,19 @@ if (typeof window !== 'undefined') {
   window.recStartTrack = recStartTrack;
   window.syncNativeFavorite = syncNativeFavorite;
 }
+let _curYmCache = '', _curYmCacheAt = 0;
 function curYmKey(offsetMonths) {
+  if (!offsetMonths) {
+    const now = Date.now();
+    if (_curYmCache && (now - _curYmCacheAt) < 60000) return _curYmCache;
+    const d = new Date(now);
+    _curYmCache = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+    _curYmCacheAt = now;
+    return _curYmCache;
+  }
   const d = new Date();
   d.setDate(1);
-  if (offsetMonths) d.setMonth(d.getMonth() + offsetMonths);
+  d.setMonth(d.getMonth() + offsetMonths);
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
 }
 function fmtYmLabel(ym) {
@@ -1975,6 +2065,11 @@ function lqCtrl(id, initVal) {
   return c;
 }
 let _lqHasBusy = false;
+function markLqBusy() {
+  _lqHasBusy = true;
+  _wakeFrame();
+}
+if (typeof window !== 'undefined') window.markLqBusy = markLqBusy;
 function lqPress(c, px, ps) {
   c.pressed = true; c.pending = false;
   c.lastX = px; c.lastT = performance.now();
@@ -1998,8 +2093,7 @@ function lqRelease(c) {
   redraw();
 }
 function stepLq(dt) {
-  const inSettings = typeof topPage === 'function' && topPage() && topPage().kind === 'settings';
-  if (!_lqHasBusy && !inSettings) return false;
+  if (!_lqHasBusy) return false;
   let busy = false;
   for (const k in LQ) {
     const c = LQ[k];
@@ -2024,7 +2118,8 @@ const BTNG = ['back', 'more', 'av', 'apill', 'pSearch', 'hShuf', 'hDown', 'searc
 const TINT_ACC = 'rgba(250,46,73,.82)', TINT_NEU = 'rgba(255,255,255,.22)';
 
 function initGlass() {
-  lg = new LiquidGlass($out, { maxDpr: 3, autoUpload: false, defaults: glassStyle(), onResize: relayout, onContextRestored: () => { if (typeof window !== 'undefined' && typeof window.onSonoraResume === 'function') window.onSonoraResume(); else if (typeof redraw === 'function') redraw(); } });
+  lg = new LiquidGlass($out, { maxDpr: 2, autoUpload: false, defaults: glassStyle(), onResize: relayout, onContextRestored: () => { if (typeof window !== 'undefined' && typeof window.onSonoraResume === 'function') window.onSonoraResume(); else if (typeof redraw === 'function') redraw(); } });
+  _lastGlassPrefSig = _glassPrefSig();
   const setCtrlNames = [];
   for (let i = 0; i < 24; i++) setCtrlNames.push('setCtrl' + i);
   const names = ['tab', 'thumb', 'search', 'mini', 'more', 'av', 'back', 'apill', 'pSearch', 'backPrev', 'apillPrev', 'pSearchPrev', 'hShufPrev', 'hDownPrev', 'hShuf', 'hDown', 'menu', 'cm', 'outDrawer', 'prompt', 'sStar', 'sMore', 'sP1', 'sP2', 'sP3', 'sP4',

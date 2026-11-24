@@ -115,8 +115,16 @@ function _isScrollOrAnimBusy() {
 function _redrawAfterArt(it) {
   const cTr = typeof cur === 'function' ? cur() : null;
   const isCur = Boolean(it && cTr && (cTr.id === it.id || (it.kind === 'album' && cTr.album === it.id)));
-  if (!isCur && typeof redrawSheetContent === 'function') redrawSheetContent();
-  else if (typeof redraw === 'function') redraw();
+  const isCm = Boolean(typeof CM !== 'undefined' && CM && CM.open && CM.tr && it && CM.tr.id === it.id);
+  if (isCur || isCm) {
+    if (typeof redraw === 'function') redraw();
+  } else if (typeof SH !== 'undefined' && SH && SH.t >= 0.999 && typeof redrawSheetContent === 'function') {
+    redrawSheetContent();
+  } else if (typeof redrawSceneOnly === 'function') {
+    redrawSceneOnly();
+  } else if (typeof redraw === 'function') {
+    redraw();
+  }
 }
 function _isHiResCoverUrl(u) {
   return Boolean(u && /[?&]s=(?:1080|1200|1400)\b/.test(u));
@@ -183,10 +191,12 @@ function _pumpArtUpQ() {
         }
         if (it.thumb !== hq || !hasSameArt) {
           it.thumb = hq;
+          it._artFast = null;
           if (it.id && typeof BYID !== 'undefined' && BYID[it.id] && BYID[it.id] !== it) {
             const by = BYID[it.id];
             if (!(by.thumb && _isHiResCoverUrl(by.thumb) && !_isHiResCoverUrl(hq) && typeof isSameCoverBase === 'function' && isSameCoverBase(by.thumb, hq))) {
               by.thumb = hq;
+              by._artFast = null;
             }
           }
           if (isTrack && it.album && typeof BYID !== 'undefined' && BYID[it.album] &&
@@ -286,6 +296,10 @@ function _resolveTrackArtItem(item) {
   return alb;
 }
 function artOf(item) {
+  if (!item) return makeArt({ id: 'empty', hue: 220, style: 0 });
+  if (item._artFast && item._artFast._real && item._artFast.width > 0 && item._artFast._url === item.thumb && (item._appleUpgradeSettled || item.canonicalCover)) {
+    return item._artFast;
+  }
   const raw = item;
   if (item.kind === 'track' || !item.kind) {
     item = _resolveTrackArtItem(item);
@@ -297,7 +311,7 @@ function artOf(item) {
     ? raw.thumb
     : (item.thumb || (raw && raw.kind !== 'artist' && raw.thumb));
   if (isArtist && th && typeof isHqThumb === 'function' && !isHqThumb(th)) {
-    th = null; item.thumb = null; if (raw) raw.thumb = null;
+    th = null; item.thumb = null; item._artFast = null; if (raw) { raw.thumb = null; raw._artFast = null; }
   }
   if (th && !item.thumb) item.thumb = th;
   const liveOn = typeof LIVE === 'undefined' || Boolean(LIVE && LIVE.on);
@@ -313,7 +327,13 @@ function artOf(item) {
     typeof fetchAlbumThumb === 'function' && Boolean(item.title);
   const isAppleUrl = u => Boolean(u && typeof isAppleArtistThumb === 'function' && isAppleArtistThumb(u));
   const thIsApple = isAppleUrl(th);
-  const saveReal = cv => { if (raw && cv && cv._real && cv.width > 0) raw._lastRealArt = cv; return cv; };
+  const saveReal = cv => {
+    if (raw && cv && cv._real && cv.width > 0) {
+      raw._lastRealArt = cv;
+      if (cv._url === raw.thumb && (raw._appleUpgradeSettled || raw.canonicalCover)) raw._artFast = cv;
+    }
+    return cv;
+  };
   const canSeedKey = Boolean(k && raw && (k === raw.id || String(k).indexOf('s_') === 0));
   if (needsTrackApple) {
     _enqueueArtUp(raw, false);
@@ -415,6 +435,7 @@ function preloadArt(it, pri) {
 }
 let _animRaf = 0;
 function scheduleAnimRedraw() {
+  if (typeof window !== 'undefined' && typeof window.wakeFrame === 'function') window.wakeFrame();
   if (_animRaf) return;
   if (typeof requestAnimationFrame === 'function') {
     _animRaf = requestAnimationFrame(() => {
@@ -475,16 +496,35 @@ function drawRowPressTint(c, key, x, y, w, h, rad) {
   c.restore();
 }
 let _tileBudgetRaf = 0, _tileBuiltFrame = 0;
+const _TILE_LRU = new Map(), _TILE_LRU_MAX = 96;
+function _evictOldestTile() {
+  const first = _TILE_LRU.keys().next();
+  if (first.done) return;
+  const entry = _TILE_LRU.get(first.value);
+  _TILE_LRU.delete(first.value);
+  if (entry) {
+    if (entry.im && entry.im._tiles && entry.im._tiles[entry.key] === entry.cv) {
+      delete entry.im._tiles[entry.key];
+    }
+    if (entry.cv && 'width' in entry.cv) { try { entry.cv.width = entry.cv.height = 0; } catch (e) {} }
+  }
+}
 function drawArt(c, item, x, y, s, r) {
   const im = artOf(item);
   const rad = r == null ? Math.max(4, s * .07) : r;
   const a = (im && im._real) ? artFadeAlpha(im) : 1;
-  if (a >= 0.999 && s <= 200 && Math.abs(s - Math.round(s)) < 0.01 && im && im._real && im.width > 0) {
+  if (a >= 0.999 && s <= 240 && Math.abs(s - Math.round(s)) < 0.01 && im && im._real && im.width > 0) {
     const dpr = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 2, 2);
     const pw = Math.round(s * dpr), pr = Math.round(rad * dpr), key = pw + ':' + pr;
     let tc = im._tiles && im._tiles[key];
-    const deferTileBuild = _isScrollOrAnimBusy();
-    if (!tc && !deferTileBuild && _tileBuiltFrame < 3 && pw > 0) {
+    const busy = _isScrollOrAnimBusy();
+    const fastScroll = busy && ((typeof INP !== 'undefined' && INP && INP.down) ||
+      (typeof topPage === 'function' && topPage() && Math.abs(topPage().vel || 0) > 180) ||
+      (typeof NAV !== 'undefined' && NAV && (NAV.popP > 0.01 || NAV.pushP > 0.01 || NAV.popT > 0.01)) ||
+      (typeof _tabTrans !== 'undefined' && _tabTrans && _tabTrans.active) ||
+      (typeof SH !== 'undefined' && SH && (SH.drag || (SH.t > 0.01 && SH.t < 0.99))));
+    const frameCap = busy ? 1 : 3;
+    if (!tc && !fastScroll && _tileBuiltFrame < frameCap && pw > 0) {
       if (!_tileBudgetRaf && typeof requestAnimationFrame === 'function') {
         _tileBudgetRaf = requestAnimationFrame(() => { _tileBudgetRaf = 0; _tileBuiltFrame = 0; });
       }
@@ -510,10 +550,18 @@ function drawArt(c, item, x, y, s, r) {
         if (!im._tiles) im._tiles = {};
         const tKeys = Object.keys(im._tiles);
         if (tKeys.length >= 3) {
-          const oldT = im._tiles[tKeys[0]];
-          delete im._tiles[tKeys[0]];
-          if (oldT && 'width' in oldT) { try { oldT.width = oldT.height = 0; } catch (e) {} }
+          const oldKey = tKeys[0];
+          const oldT = im._tiles[oldKey];
+          delete im._tiles[oldKey];
+          if (oldT) {
+            if (oldT._lruId != null) _TILE_LRU.delete(oldT._lruId);
+            if ('width' in oldT) { try { oldT.width = oldT.height = 0; } catch (e) {} }
+          }
         }
+        while (_TILE_LRU.size >= _TILE_LRU_MAX) _evictOldestTile();
+        const lruId = ++_TILE_LRU_SEQ;
+        tc._lruId = lruId;
+        _TILE_LRU.set(lruId, { im, key, cv: tc });
         im._tiles[key] = tc;
       } catch (e) {}
     }
@@ -537,6 +585,7 @@ function drawArt(c, item, x, y, s, r) {
   c.restore();
   c.save(); rrPath(c, x + .5, y + .5, s - 1, s - 1, rad); c.lineWidth = 1; c.strokeStyle = 'rgba(128,128,128,.22)'; c.stroke(); c.restore();
 }
+let _TILE_LRU_SEQ = 0;
 function artColors(item) { const H = (item.kind === 'track' ? albumOf(item) : item).hue; return [hsl(H, 62, 30), hsl(H + 40, 70, 42), hsl(H - 30, 65, 36), hsl(H + 10, 70, 18)]; }
 
 const _COLC = {};
@@ -990,7 +1039,11 @@ function _parseCssRgb(col) {
   const m = s.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i);
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
 }
+const _DL_BADGE_C = new Map();
 function dlBadgeColors(tn, accCss, isDark) {
+  const cKey = (tn && tn._accent ? tn.accent : (accCss || '')) + (isDark ? '|d' : '|l');
+  const cached = _DL_BADGE_C.get(cKey);
+  if (cached) return cached;
   let fillRgb = null;
   let arrowRgb = null;
   if (tn && tn._accent) {
@@ -1022,10 +1075,13 @@ function dlBadgeColors(tn, accCss, isDark) {
   if (!arrowRgb) {
     arrowRgb = _relLuma(fillRgb[0], fillRgb[1], fillRgb[2]) > 0.34 ? [26, 26, 30] : [255, 255, 255];
   }
-  return {
+  const out = {
     fill: 'rgb(' + Math.round(fillRgb[0]) + ',' + Math.round(fillRgb[1]) + ',' + Math.round(fillRgb[2]) + ')',
     arrow: 'rgb(' + Math.round(arrowRgb[0]) + ',' + Math.round(arrowRgb[1]) + ',' + Math.round(arrowRgb[2]) + ')'
   };
+  if (_DL_BADGE_C.size >= 64) _DL_BADGE_C.delete(_DL_BADGE_C.keys().next().value);
+  _DL_BADGE_C.set(cKey, out);
+  return out;
 }
 function drawDlBadge(c, cx, cy, r, fillCol, arrowCol) {
   if (!arrowCol) {
@@ -1057,19 +1113,21 @@ const SHAD_PALC = {};
 function rgb2hsl(r, g, b) { r /= 255; g /= 255; b /= 255; const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2; let h = 0, s = 0; if (mx !== mn) { const d = mx - mn; s = l > .5 ? d / (2 - mx - mn) : d / (mx + mn); h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4; h *= 60; } return [h, s, l]; }
 function hsl2rgb(h, s, l) { h = ((h % 360) + 360) % 360 / 360; const f = (p, q, t) => { t = (t + 1) % 1; return t < 1 / 6 ? p + (q - p) * 6 * t : t < .5 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p; }, q = l < .5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q; return [f(p, q, h + 1 / 3) * 255, f(p, q, h) * 255, f(p, q, h - 1 / 3) * 255]; }
 
+const _PH_ART_PAL = (() => {
+  const res = [[28, 28, 32], [44, 44, 50], [22, 22, 26], [36, 36, 42], [26, 26, 30], [18, 18, 22]];
+  res._dom = [0, 0, .25];
+  res._foot = [0, 0, .22];
+  res._meta = [.25, .4, .22, .3];
+  res._placeholder = true;
+  return res;
+})();
+const _PALC_MAX = 128;
 let _PAL_CV = null, _PAL_CTX = null;
 function artPalette(item) {
   if (item.kind === 'track') item = albumOf(item); if (PALC[item.id]) return PALC[item.id];
   const im = artOf(item);
-  if (im && !im._real && im._placeholder) {
-    const res = [[28, 28, 32], [44, 44, 50], [22, 22, 26], [36, 36, 42], [26, 26, 30], [18, 18, 22]];
-    res._dom = [0, 0, .25];
-    res._foot = [0, 0, .22];
-    res._meta = [.25, .4, .22, .3];
-    res._placeholder = true;
-    return res;
-  }
-  const N = 24;
+  if (im && !im._real && im._placeholder) return _PH_ART_PAL;
+  const N = 16;
   if (!_PAL_CV) { _PAL_CV = document.createElement('canvas'); _PAL_CV.width = _PAL_CV.height = N; _PAL_CTX = _PAL_CV.getContext('2d', { willReadFrequently: true }); }
   const c = _PAL_CTX; c.clearRect(0, 0, N, N); if (im && im.width > 0) c.drawImage(im, 0, 0, N, N);
   const d = c.getImageData(0, 0, N, N).data, px = [];
@@ -1079,7 +1137,7 @@ function artPalette(item) {
     const inFoot = y >= Math.floor(N * .76);
     for (let x = 0; x < N; x++) {
       const i = (y * N + x) * 4, r = d[i], g = d[i + 1], b = d[i + 2];
-      const [h, s, l] = rgb2hsl(r, g, b), rad = h * Math.PI / 180, mx = Math.max(r, g, b) / 255, ch = (Math.max(r, g, b) - Math.min(r, g, b)) / 255;
+      const [h, s, l] = rgb2hsl(r, g, b), rad = h * 0.017453292519943295, mx = Math.max(r, g, b) / 255, ch = (Math.max(r, g, b) - Math.min(r, g, b)) / 255;
       sumL += l;
       if (l < .22) darkCnt++;
       if ((y & 1) === 0 && (x & 1) === 0) px.push({ r, g, b, h, s, l, ch, score: s * (1 - Math.abs(l - .5)) });
@@ -1124,12 +1182,15 @@ function artPalette(item) {
   res._dom = [domH, domS, domL];
   res._foot = [footH, footS, footL];
   res._meta = [sumL / (N * N), darkCnt / (N * N), footCnt > 0 ? footSumL / footCnt : .42, footCnt > 0 ? footDarkCnt / footCnt : 0];
+  const pKeys = Object.keys(PALC);
+  if (pKeys.length >= _PALC_MAX) delete PALC[pKeys[0]];
   return PALC[item.id] = res;
 }
 
+const _SHAD_DEF_PAL = [[250, 46, 73], [255, 122, 69], [46, 211, 198], [27, 27, 27], [220, 40, 80], [35, 180, 170]];
 let _SPAL_CV = null, _SPAL_CTX = null;
 function shaderPalette(item) {
-  if (!item) return [[250, 46, 73], [255, 122, 69], [46, 211, 198], [27, 27, 27], [220, 40, 80], [35, 180, 170]];
+  if (!item) return _SHAD_DEF_PAL;
   const alb = (!item.kind || item.kind === 'track') ? albumOf(item) : null;
   const albId = alb && alb.id;
   const trkId = item.id;
@@ -1147,12 +1208,12 @@ function shaderPalette(item) {
   // Keep the current shader colors until real cover artwork loads instead of caching fallback hues.
   if (!art || !art._real) {
     if (typeof SH !== 'undefined' && SH.cols && SH.cols.length === 6) {
-      return SH.cols.map(q => q.slice());
+      return SH.cols;
     }
-    return [[250, 46, 73], [255, 122, 69], [46, 211, 198], [27, 27, 27], [220, 40, 80], [35, 180, 170]];
+    return _SHAD_DEF_PAL;
   }
 
-  const N = 32;
+  const N = 24;
   if (!_SPAL_CV) { _SPAL_CV = document.createElement('canvas'); _SPAL_CV.width = _SPAL_CV.height = N; _SPAL_CTX = _SPAL_CV.getContext('2d', { willReadFrequently: true }); }
   const c = _SPAL_CTX; c.clearRect(0, 0, N, N);
   if (art.width > 0) c.drawImage(art, 0, 0, N, N);
@@ -1264,6 +1325,8 @@ function shaderPalette(item) {
       res[5] = hsl2rgb((hb - 8 + 360) % 360, clamp(sb * .85, .42, .82), .18);
     }
   }
+  const sKeys = Object.keys(SHAD_PALC);
+  if (sKeys.length >= _PALC_MAX) delete SHAD_PALC[sKeys[0]];
   if (trkId) SHAD_PALC[trkId] = res;
   if (albId) SHAD_PALC[albId] = res;
   return res;
@@ -1271,20 +1334,23 @@ function shaderPalette(item) {
 
 function txt(c, s, x, y, font, col, align, maxW, subpx) {
   c.font = font; c.fillStyle = col; c.textAlign = align || 'left'; c.textBaseline = 'alphabetic';
-  if (maxW) s = fit(c, s, maxW);
+  if (maxW) s = fit(c, s, maxW, font);
   if (subpx === false) c.fillText(s, Math.round(x), Math.round(y)); else c.fillText(s, x, y);
   return s;
 }
 const _FIT_CACHE = new Map(), _FIT_MAX = 800;
 const _WRAP_CACHE = new Map(), _WRAP_MAX = 600;
 function _clearFitCache() { _FIT_CACHE.clear(); _WRAP_CACHE.clear(); }
-function fit(c, s, w) {
+function fit(c, s, w, fontOpt) {
   if (!s) return s;
-  const key = c.font + '\0' + w + '\0' + s;
+  const qw = w | 0;
+  const key = (fontOpt || c.font) + '\0' + qw + '\0' + s;
   const hit = _FIT_CACHE.get(key);
   if (hit !== undefined) {
-    _FIT_CACHE.delete(key);
-    _FIT_CACHE.set(key, hit);
+    if (_FIT_CACHE.size > 600) {
+      _FIT_CACHE.delete(key);
+      _FIT_CACHE.set(key, hit);
+    }
     return hit;
   }
   let res;
@@ -1298,20 +1364,27 @@ function fit(c, s, w) {
   _FIT_CACHE.set(key, res);
   return res;
 }
-function wrap(c, s, w) {
-  const key = c.font + '|' + w + '|' + s;
+function wrap(c, s, w, fontOpt) {
+  const qw = w | 0;
+  const key = (fontOpt || c.font) + '|' + qw + '|' + s;
   const hit = _WRAP_CACHE.get(key);
   if (hit !== undefined) {
-    _WRAP_CACHE.delete(key);
-    _WRAP_CACHE.set(key, hit);
-    return hit.slice();
+    if (_WRAP_CACHE.size > 450) {
+      _WRAP_CACHE.delete(key);
+      _WRAP_CACHE.set(key, hit);
+    }
+    return hit;
   }
   const words = s.split(' '), out = []; let line = '';
-  words.forEach(wd => { const t = line ? line + ' ' + wd : wd; if (c.measureText(t).width > w && line) { out.push(line); line = wd; } else line = t; });
+  for (let i = 0; i < words.length; i++) {
+    const wd = words[i];
+    const t = line ? line + ' ' + wd : wd;
+    if (c.measureText(t).width > w && line) { out.push(line); line = wd; } else line = t;
+  }
   if (line) out.push(line);
   if (_WRAP_CACHE.size >= _WRAP_MAX) _WRAP_CACHE.delete(_WRAP_CACHE.keys().next().value);
   _WRAP_CACHE.set(key, out);
-  return out.slice();
+  return out;
 }
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const ease = (v, t, rate, dt) => v + (t - v) * (1 - Math.exp(-rate * dt));

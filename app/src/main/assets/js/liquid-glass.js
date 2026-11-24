@@ -35,19 +35,19 @@
 
   const FS = `
 precision highp float;
-uniform sampler2D uScene; uniform sampler2D uBlur; uniform sampler2D uUI;
+uniform sampler2D uScene; uniform sampler2D uBlur; uniform sampler2D uUI; uniform sampler2D uTopMid;
 uniform vec2 uRes; uniform float uDpr; uniform float uDither; uniform float uUseUI;
 uniform float uMode;
 uniform vec4 uRect; uniform float uRadius; uniform float uOpacity;
 uniform float uRefH; uniform float uRefA; uniform float uDepth; uniform float uChroma; uniform float uZoom;
 uniform float uBlurMix; uniform float uSlosh; uniform float uGlow;
 uniform float uBright; uniform float uContrast; uniform float uSat;
-uniform float uHlStyle; uniform vec4 uHlColor; uniform float uHlAngle; uniform float uHlFalloff; uniform float uHlWidth; uniform float uHlBlur; uniform float uHlAlpha;
+uniform float uHlStyle; uniform vec4 uHlColor; uniform vec2 uHlDir; uniform float uHlFalloff; uniform float uHlWidth; uniform float uHlBlur; uniform float uHlAlpha;
 uniform float uHasInner; uniform vec4 uInnerColor; uniform vec2 uInnerOff; uniform float uInnerR;
 uniform vec4 uSurface; uniform vec4 uTint;
 uniform vec4 uShadowC; uniform vec3 uShadowP;
-uniform vec4 uTopBlur;
-uniform float uTopBlurH;
+uniform vec4 uTopBlur; uniform vec4 uTopBlurPrev;
+uniform float uTopBlurH; uniform float uTopSplit;
 uniform vec2 uSheetCut;
 
 float radiusFix(float r, vec2 hs){ return min(r, min(hs.x, hs.y)); }
@@ -69,8 +69,10 @@ vec2 reflectUV(vec2 uv){ vec2 m = mod(abs(uv), 2.0); return mix(m, 2.0 - m, step
 
 vec3 bd(vec2 q, float blurMix){
   vec2 uv = reflectUV(q / uRes);
-  vec3 s = texture2D(uScene, uv).rgb;
-  if (blurMix > 0.001) s = mix(s, texture2D(uBlur, uv).rgb, blurMix);
+  vec3 s;
+  if (blurMix >= 0.999) s = texture2D(uBlur, uv).rgb;
+  else if (blurMix <= 0.001) s = texture2D(uScene, uv).rgb;
+  else s = mix(texture2D(uScene, uv).rgb, texture2D(uBlur, uv).rgb, blurMix);
   if (uUseUI > 0.5) {
     vec4 u = texture2D(uUI, uv);
     return u.rgb + s * (1.0 - u.a);
@@ -88,11 +90,41 @@ vec3 colorControls(vec3 col){
   o.b = (c * r) * col.r + (c * g) * col.g + (c * (b + uSat)) * col.b + t;
   return clamp(o, 0.0, 1.0);
 }
-float noise(){ return (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0 * uDither; }
+float noise(){ return (fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) - 0.5) / 255.0 * uDither; }
 
 void main(){
   vec2 q = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);
-  if (uMode > 1.5) { gl_FragColor = vec4(clamp(bd(q, 0.0) + noise(), 0.0, 1.0), 1.0); return; }
+  if (uMode > 1.5) {
+    vec2 uv = q / uRes;
+    vec3 col = texture2D(uScene, uv).rgb;
+    if (q.y < uTopBlurH && (uTopBlur.a > 0.001 || uTopBlurPrev.a > 0.001)) {
+      float isPrev = step(q.x, uTopSplit) * step(0.5, uTopSplit);
+      vec4 tb = mix(uTopBlur, uTopBlurPrev, isPrev);
+      if (tb.a > 0.001) {
+        float shK = 1.0;
+        if (uSheetCut.x > 0.0) {
+          vec2 shHs = vec2(uRes.x * 0.5, uRes.y);
+          vec2 shCc = q - vec2(uRes.x * 0.5, uSheetCut.x + uRes.y);
+          float shSd = sdRR(shCc, shHs, uSheetCut.y);
+          shK = smoothstep(-0.85 * uDpr, 0.5 * uDpr, shSd);
+        }
+        float p = tb.a * shK;
+        if (p > 0.001) {
+          float t = clamp(q.y / max(1.0, uTopBlurH), 0.0, 1.0);
+          vec3 bHi = texture2D(uBlur, uv).rgb;
+          vec3 bMid = texture2D(uTopMid, uv).rgb;
+          float wHi = 1.0 - smoothstep(0.04, 0.68, t);
+          float wMid = (1.0 - smoothstep(0.30, 1.0, t)) * (1.0 - wHi);
+          vec3 blurred = col * (1.0 - wHi - wMid) + bMid * wMid + bHi * wHi;
+          col = mix(col, blurred, p);
+          float tintA = 0.82 * (1.0 - t) * p;
+          col = mix(col, tb.rgb, tintA);
+        }
+      }
+    }
+    gl_FragColor = vec4(col, 1.0);
+    return;
+  }
 
   float shKeep = 1.0;
   if (uSheetCut.x > 0.0) {
@@ -108,10 +140,12 @@ void main(){
   float sd = sdRR(cc, hs, r);
 
   if (uMode < 0.5) {
+    float outMask = smoothstep(-0.85 * uDpr, 0.5 * uDpr, sd) * shKeep;
+    if (outMask <= 0.001) discard;
     float R = max(uShadowP.x, 1.0);
     float ssd = sdRR(cc - uShadowP.yz, hs, r);
     float a = 1.0 / (1.0 + exp(clamp(3.404 * ssd / R, -20.0, 20.0)));
-    a *= smoothstep(-0.85 * uDpr, 0.5 * uDpr, sd) * uShadowC.a * uOpacity * shKeep;
+    a *= outMask * uShadowC.a * uOpacity;
     gl_FragColor = vec4(uShadowC.rgb * a, a);
     return;
   }
@@ -122,13 +156,16 @@ void main(){
   vec2 eq = q;
   if (uZoom > 0.01 && abs(uZoom - 1.0) > 0.001) eq = cc / uZoom + uRect.xy;
   vec2 refq = eq; vec2 disp = vec2(0.0);
+  float gr = min(r * 1.5, min(hs.x, hs.y));
+  vec2 cachedBg = vec2(0.0);
+  bool hasBg = false;
   if (uRefH > 0.0 && uRefA != 0.0 && -sd < uRefH) {
     float cs = min(sd, 0.0);
     float d = circleMap(1.0 - (-cs / uRefH)) * (-uRefA);
-    float gr = min(r * 1.5, min(hs.x, hs.y));
-    vec2 bg = gradSdRR(cc, hs, gr);
+    cachedBg = gradSdRR(cc, hs, gr);
+    hasBg = true;
     vec2 nc = length(cc) > 0.0001 ? normalize(cc) : vec2(0.0);
-    vec2 tg = bg + uDepth * nc;
+    vec2 tg = cachedBg + uDepth * nc;
     vec2 g = length(tg) > 0.0001 ? normalize(tg) : vec2(0.0);
     refq = eq + d * g;
     if (uChroma > 0.0) disp = d * g * (uChroma * ((cc.x * cc.y) / (hs.x * hs.y)));
@@ -136,17 +173,10 @@ void main(){
   refq.x += uSlosh;
 
   vec3 col;
-  if (length(disp) > 0.01) {
-    vec3 red = bd(refq + disp, uBlurMix);
-    vec3 ora = bd(refq + disp * (2.0 / 3.0), uBlurMix);
-    vec3 yel = bd(refq + disp * (1.0 / 3.0), uBlurMix);
-    vec3 grn = bd(refq, uBlurMix);
-    vec3 cya = bd(refq - disp * (1.0 / 3.0), uBlurMix);
-    vec3 blu = bd(refq - disp * (2.0 / 3.0), uBlurMix);
-    vec3 pur = bd(refq - disp, uBlurMix);
-    col.r = red.r / 3.5 + ora.r / 3.5 + yel.r / 3.5 + pur.r / 7.0;
-    col.g = ora.g / 7.0 + yel.g / 3.5 + grn.g / 3.5 + cya.g / 3.5;
-    col.b = cya.b / 3.0 + blu.b / 3.0 + pur.b / 3.0;
+  if (dot(disp, disp) > 0.0001) {
+    col.r = bd(refq + disp * 0.55, uBlurMix).r;
+    col.g = bd(refq, uBlurMix).g;
+    col.b = bd(refq - disp * 0.65, uBlurMix).b;
   } else col = bd(refq, uBlurMix);
 
   col = colorControls(col);
@@ -163,17 +193,17 @@ void main(){
   if (uHlStyle > 0.5 && uHlAlpha > 0.0 && uHlWidth > 0.0) {
     float sdist = abs(sd + uHlWidth * 0.5) - (uHlWidth * 0.5);
     float mask = (1.0 - smoothstep(-0.25 * uDpr, max(0.85 * uDpr, uHlBlur), sdist)) * (1.0 - smoothstep(-1.0 * uDpr, 0.15 * uDpr, sd));
-    float gr = min(r * 1.5, min(hs.x, hs.y));
-    vec2 grad = gradSdRR(cc, hs, gr);
-    vec2 nrm = vec2(cos(uHlAngle), sin(uHlAngle));
-    float d = dot(grad, nrm);
-    vec3 hlRgb = uTint.a > 0.25 ? mix(uHlColor.rgb, clamp(uTint.rgb * 1.35 + 0.2, 0.0, 1.0), clamp(uTint.a * 0.65, 0.0, 0.55)) : uHlColor.rgb;
-    if (uHlStyle > 2.5) {
-      if (d > 0.0) col = mix(col, hlRgb, clamp(pow(d, max(0.1, uHlFalloff)) * uHlAlpha * mask, 0.0, 1.0));
-    } else if (uHlStyle > 1.5) {
-      col = clamp(col + hlRgb * (pow(abs(d), max(0.1, uHlFalloff)) * uHlAlpha * mask), 0.0, 1.0);
-    } else {
-      col = clamp(col + hlRgb * (uHlAlpha * mask), 0.0, 1.0);
+    if (mask > 0.001) {
+      vec2 grad = hasBg ? cachedBg : gradSdRR(cc, hs, gr);
+      float d = dot(grad, uHlDir);
+      vec3 hlRgb = uTint.a > 0.25 ? mix(uHlColor.rgb, clamp(uTint.rgb * 1.35 + 0.2, 0.0, 1.0), clamp(uTint.a * 0.65, 0.0, 0.55)) : uHlColor.rgb;
+      if (uHlStyle > 2.5) {
+        if (d > 0.0) col = mix(col, hlRgb, clamp(pow(d, max(0.1, uHlFalloff)) * uHlAlpha * mask, 0.0, 1.0));
+      } else if (uHlStyle > 1.5) {
+        col = clamp(col + hlRgb * (pow(abs(d), max(0.1, uHlFalloff)) * uHlAlpha * mask), 0.0, 1.0);
+      } else {
+        col = clamp(col + hlRgb * (uHlAlpha * mask), 0.0, 1.0);
+      }
     }
   }
 
@@ -183,18 +213,18 @@ void main(){
 }`;
 
   const BVS = 'attribute vec2 a; varying vec2 v; void main(){ v = a * 0.5 + 0.5; gl_Position = vec4(a, 0.0, 1.0); }';
+  const DFS = 'precision mediump float; varying vec2 v; uniform sampler2D uImage; void main(){ gl_FragColor = texture2D(uImage, v); }';
   const BFS = `
-precision highp float;
+precision mediump float;
 varying vec2 v; uniform sampler2D uImage; uniform vec2 uStep;
 vec2 reflectUV(vec2 uv){ vec2 m = mod(abs(uv), 2.0); return mix(m, 2.0 - m, step(1.0, m)); }
 void main(){
-  vec4 c = texture2D(uImage, v) * 0.227027; float tw = 0.227027;
-  for (int i = 1; i < 5; i++) {
-    float w = i == 1 ? 0.1945946 : (i == 2 ? 0.1216216 : (i == 3 ? 0.054054 : 0.016216));
-    vec2 o = uStep * float(i);
-    c += texture2D(uImage, reflectUV(v + o)) * w; c += texture2D(uImage, reflectUV(v - o)) * w; tw += w * 2.0;
-  }
-  gl_FragColor = c / tw;
+  vec2 o1 = uStep * 1.3846154;
+  vec2 o2 = uStep * 3.2307692;
+  vec4 c = texture2D(uImage, v) * 0.2270270;
+  c += (texture2D(uImage, reflectUV(v + o1)) + texture2D(uImage, reflectUV(v - o1))) * 0.3162162;
+  c += (texture2D(uImage, reflectUV(v + o2)) + texture2D(uImage, reflectUV(v - o2))) * 0.0702703;
+  gl_FragColor = c;
 }`;
 
   class Glass {
@@ -219,7 +249,7 @@ void main(){
       const d = this.lg.defaults[name]; if (d !== undefined) return d;
       return GLOBAL_DEFAULTS[name];
     }
-    setPressed(on) { this._pt = on ? 1 : 0; this.lg.busy = true; return this; }
+    setPressed(on) { this._pt = on ? 1 : 0; this.lg.busy = true; if (typeof window !== 'undefined' && typeof window.wakeFrame === 'function') window.wakeFrame(); return this; }
     reset(name) { if (name) delete this.own[name]; else this.own = {}; return this; }
     destroy() { this.lg.remove(this); }
   }
@@ -230,11 +260,12 @@ void main(){
       const o = options || {};
       this.canvas = typeof canvas === 'string' ? document.querySelector(canvas) : canvas;
       if (!this.canvas) throw new Error('LiquidGlass: canvas not found');
-      this.maxDpr = o.maxDpr || 3; this.autoUpload = o.autoUpload !== false; this.dither = o.dither !== false; this.onResize = o.onResize || null; this.onContextRestored = o.onContextRestored || null;
+      this.maxDpr = Math.min(o.maxDpr || 2, 2); this.autoUpload = o.autoUpload !== false; this.dither = o.dither !== false; this.onResize = o.onResize || null; this.onContextRestored = o.onContextRestored || null;
       this.defaults = Object.assign({}, o.defaults || {});
       this.glasses = []; this.scene = null; this.overlay = null; this.dpr = 1; this.busy = false;
-      this.topBlur = [0, 0, 0, 0]; this.topBlurH = 112;
+      this.topBlur = [0, 0, 0, 0]; this.topBlurPrev = [0, 0, 0, 0]; this.topBlurH = 112; this.topBlurSplit = 0; this.topBlurSheetCut = null;
       this._sceneDirty = true; this._overlayDirty = true; this._sceneUp = false; this._overlayUp = false;
+      this._sceneTexW = 0; this._sceneTexH = 0; this._ovTexW = 0; this._ovTexH = 0;
       this._bw = 0; this._bh = 0; this._lost = false; this._t = 0;
       this._initGL(); this.resize();
       if (o.autoResize !== false && typeof ResizeObserver !== 'undefined') {
@@ -258,12 +289,13 @@ void main(){
       const attr = { antialias: false, alpha: false, premultipliedAlpha: false, powerPreference: 'high-performance' };
       const gl = this.gl = this.canvas.getContext('webgl2', attr) || this.canvas.getContext('webgl', attr);
       if (!gl) throw new Error('LiquidGlass: WebGL is not available');
-      this.prog = this._program(VS, FS); this.bprog = this._program(BVS, BFS);
-      const names = ['uScene', 'uBlur', 'uUI', 'uRes', 'uBox', 'uDpr', 'uDither', 'uUseUI', 'uMode', 'uRect', 'uRadius', 'uOpacity', 'uRefH', 'uRefA', 'uDepth', 'uChroma', 'uZoom', 'uBlurMix', 'uSlosh', 'uGlow',
-        'uBright', 'uContrast', 'uSat', 'uHlStyle', 'uHlColor', 'uHlAngle', 'uHlFalloff', 'uHlWidth', 'uHlBlur', 'uHlAlpha', 'uHasInner', 'uInnerColor', 'uInnerOff', 'uInnerR', 'uSurface', 'uTint', 'uShadowC', 'uShadowP', 'uTopBlur', 'uTopBlurH', 'uSheetCut'];
+      this.prog = this._program(VS, FS); this.bprog = this._program(BVS, BFS); this.dprog = this._program(BVS, DFS);
+      const names = ['uScene', 'uBlur', 'uUI', 'uTopMid', 'uRes', 'uBox', 'uDpr', 'uDither', 'uUseUI', 'uMode', 'uRect', 'uRadius', 'uOpacity', 'uRefH', 'uRefA', 'uDepth', 'uChroma', 'uZoom', 'uBlurMix', 'uSlosh', 'uGlow',
+        'uBright', 'uContrast', 'uSat', 'uHlStyle', 'uHlColor', 'uHlDir', 'uHlFalloff', 'uHlWidth', 'uHlBlur', 'uHlAlpha', 'uHasInner', 'uInnerColor', 'uInnerOff', 'uInnerR', 'uSurface', 'uTint', 'uShadowC', 'uShadowP', 'uTopBlur', 'uTopBlurPrev', 'uTopBlurH', 'uTopSplit', 'uSheetCut'];
       this.U = {}; names.forEach((n) => { this.U[n] = gl.getUniformLocation(this.prog, n); });
       this.BU = { uImage: gl.getUniformLocation(this.bprog, 'uImage'), uStep: gl.getUniformLocation(this.bprog, 'uStep') };
-      this.aLoc = gl.getAttribLocation(this.prog, 'a'); this.bLoc = gl.getAttribLocation(this.bprog, 'a');
+      this.DU = { uImage: gl.getUniformLocation(this.dprog, 'uImage') };
+      this.aLoc = gl.getAttribLocation(this.prog, 'a'); this.bLoc = gl.getAttribLocation(this.bprog, 'a'); this.dLoc = gl.getAttribLocation(this.dprog, 'a');
       this.quad = gl.createBuffer(); this.tri = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quad); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1]), gl.STATIC_DRAW);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.tri); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
@@ -278,7 +310,10 @@ void main(){
       this.tex = { scene: mk(0), blur: mk(1), overlay: mk(2) };
       this.texA = mk(3); this.texH = mk(3); this.fboA = gl.createFramebuffer(); this.fboH = gl.createFramebuffer();
       this.texT = mk(3); this.fboT = gl.createFramebuffer(); this._bl = new Map(); this._ver = 0; this._dsVer = -1;
+      gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex.scene);
       this._bw = this._bh = 0; this._sceneUp = this._overlayUp = false;
+      this._sceneTexW = this._sceneTexH = this._ovTexW = this._ovTexH = 0;
       this._blurFreeze = false; this._blurStale = false;
     }
 
@@ -318,6 +353,7 @@ void main(){
         gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
         gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+        gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
       };
       if (this._bw !== fw || this._bh !== fh) {
         alloc(this.texH, this.fboH, hw, hh); alloc(this.texA, this.fboA, fw, fh); alloc(this.texT, this.fboT, fw, fh);
@@ -325,8 +361,20 @@ void main(){
         this._bl.clear(); gl.bindFramebuffer(gl.FRAMEBUFFER, null); this._bw = fw; this._bh = fh; this._dsVer = -1;
       }
       const key = Math.round(radius * 2) / 2; let e = this._bl.get(key);
-      if (e && e.ver === this._ver) return e.tex;
+      if (e && e.ver === this._ver && this._dsVer === this._ver) return e.tex;
       if (this._blurFreeze && e) { this._blurStale = true; this._blurMapVer = -1; return e.tex; }
+      // Unbind any FBO textures from TEXTURE1/TEXTURE3 before rendering to FBOs (prevents WebGL2 feedback loops)
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
+      gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
+      if (this._dsVer !== this._ver) {
+        gl.useProgram(this.dprog); gl.disable(gl.BLEND);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.tri); gl.enableVertexAttribArray(this.dLoc); gl.vertexAttribPointer(this.dLoc, 2, gl.FLOAT, false, 0, 0);
+        gl.uniform1i(this.DU.uImage, 0);
+        gl.viewport(0, 0, hw, hh); gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboH); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex.scene); gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.viewport(0, 0, fw, fh); gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboA); gl.bindTexture(gl.TEXTURE_2D, this.texH); gl.drawArrays(gl.TRIANGLES, 0, 3);
+        this._dsVer = this._ver;
+        this._bprogBound = false;
+      }
       if (!this._inBlurBatch || !this._bprogBound) {
         gl.useProgram(this.bprog); gl.disable(gl.BLEND);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.tri); gl.enableVertexAttribArray(this.bLoc); gl.vertexAttribPointer(this.bLoc, 2, gl.FLOAT, false, 0, 0);
@@ -334,7 +382,6 @@ void main(){
         if (this._inBlurBatch) this._bprogBound = true;
       }
       const pass = (src, dst, w, h, dx, dy) => { gl.viewport(0, 0, w, h); gl.bindFramebuffer(gl.FRAMEBUFFER, dst); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src); gl.uniform2f(this.BU.uStep, dx, dy); gl.drawArrays(gl.TRIANGLES, 0, 3); };
-      if (this._dsVer !== this._ver) { pass(this.tex.scene, this.fboH, hw, hh, 0, 0); pass(this.texH, this.fboA, fw, fh, 0, 0); this._dsVer = this._ver; }
       if (!e) {
         if (this._bl.size >= 16) {
           for (const [k2, e2] of this._bl) {
@@ -350,9 +397,14 @@ void main(){
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         alloc(tex, fbo, fw, fh); e = { tex, fbo, ver: -1 }; this._bl.set(key, e);
       }
-      const s = radius * 0.082;
-      pass(this.texA, this.fboT, fw, fh, s / fw, 0); pass(this.texT, e.fbo, fw, fh, 0, s / fh);
-      pass(e.tex, this.fboT, fw, fh, s / fw, 0); pass(this.texT, e.fbo, fw, fh, 0, s / fh);
+      if (radius <= 5.0) {
+        const s = radius * 0.116;
+        pass(this.texA, this.fboT, fw, fh, s / fw, 0); pass(this.texT, e.fbo, fw, fh, 0, s / fh);
+      } else {
+        const s = radius * 0.082;
+        pass(this.texA, this.fboT, fw, fh, s / fw, 0); pass(this.texT, e.fbo, fw, fh, 0, s / fh);
+        pass(e.tex, this.fboT, fw, fh, s / fw, 0); pass(this.texT, e.fbo, fw, fh, 0, s / fh);
+      }
       e.ver = this._ver; gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex.scene);
       return e.tex;
@@ -372,12 +424,14 @@ void main(){
       const cw = this.canvas.width, ch = this.canvas.height, dpr = this.dpr;
       if (this.autoUpload || this._sceneDirty || !this._sceneUp) {
         gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex.scene); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scene);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex.scene);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scene);
         this._sceneUp = true; this._sceneDirty = false; this._ver++;
       }
       if (this.overlay && (this.autoUpload || this._overlayDirty || !this._overlayUp)) {
         gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-        gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.tex.overlay); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.overlay);
+        gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.tex.overlay);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.overlay);
         this._overlayUp = true; this._overlayDirty = false;
       }
       const list = this._list || (this._list = []);
@@ -402,8 +456,15 @@ void main(){
         blurTex.clear();
         this._blurMapVer = this._ver; this._blurMapW = cw; this._blurMapH = ch; this._blurMapDpr = dpr;
       }
+      const tbProg = (this.topBlur && this.topBlur[3]) || 0;
+      const tbPrevProg = (this.topBlurPrev && this.topBlurPrev[3]) || 0;
+      const hasTopBlur = tbProg > 0.001 || tbPrevProg > 0.001;
+      const tbBlurKey = Math.round(14 * dpr * 2) / 2;
       this._blurStale = false;
       this._inBlurBatch = true; this._bprogBound = false;
+      if (hasTopBlur && !blurTex.has(tbBlurKey)) {
+        blurTex.set(tbBlurKey, this._blurTex(tbBlurKey));
+      }
       for (let i = 0; i < list.length; i++) {
         const b = (list[i].get('blur') || 0) * dpr;
         if (b > 0.05) {
@@ -412,18 +473,31 @@ void main(){
         }
       }
       this._inBlurBatch = false; this._bprogBound = false;
-      const tbProg = (this.topBlur && this.topBlur[3]) || 0;
+      const tbTex = hasTopBlur ? blurTex.get(tbBlurKey) : null;
+      let boundBlurTex = null;
 
       gl.useProgram(this.prog); gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, cw, ch);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quad); gl.enableVertexAttribArray(this.aLoc); gl.vertexAttribPointer(this.aLoc, 2, gl.FLOAT, false, 0, 0);
-      gl.uniform1i(U.uScene, 0); gl.uniform1i(U.uBlur, 1); gl.uniform1i(U.uUI, 2);
+      gl.uniform1i(U.uScene, 0); gl.uniform1i(U.uBlur, 1); gl.uniform1i(U.uUI, 2); gl.uniform1i(U.uTopMid, 3);
       gl.uniform2f(U.uRes, cw, ch); gl.uniform1f(U.uDpr, dpr); gl.uniform1f(U.uDither, this.dither ? 1 : 0); gl.uniform1f(U.uUseUI, 0);
       gl.uniform4f(U.uTopBlur, this.topBlur[0], this.topBlur[1], this.topBlur[2], tbProg);
+      gl.uniform4f(U.uTopBlurPrev, this.topBlurPrev[0], this.topBlurPrev[1], this.topBlurPrev[2], tbPrevProg);
       gl.uniform1f(U.uTopBlurH, (this.topBlurH || 112) * dpr);
+      gl.uniform1f(U.uTopSplit, (this.topBlurSplit || 0) * dpr);
+      if (hasTopBlur && tbTex) {
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tbTex); boundBlurTex = tbTex;
+        gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this._dsVer === this._ver ? this.texA : tbTex);
+      } else {
+        gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
+      }
+      const tbCut = this.topBlurSheetCut;
+      if (tbCut && tbCut.y !== undefined) gl.uniform2f(U.uSheetCut, Math.max(0.01, tbCut.y * dpr), (tbCut.r || 0) * dpr);
+      else gl.uniform2f(U.uSheetCut, 0, 0);
       gl.disable(gl.BLEND); gl.uniform1f(U.uMode, 2); this._box(0, 0, cw, ch);
       gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
       const S = gl.SCISSOR_TEST;
+      let scissorOn = false;
       for (let li = 0; li < list.length; li++) {
         const g = list[li];
         const inter = !!g.get('interactive'), pp = clamp(inter ? g._pp : g.press, 0, 1.5);
@@ -437,10 +511,11 @@ void main(){
           const sx1 = clamp(Math.round((clipMax !== undefined ? clipMax * dpr : cw)), 0, cw);
           const sy0 = clamp(Math.round(ch - (clipYMax !== undefined ? clipYMax * dpr : ch)), 0, ch);
           const sw = sx1 - sx0, sh2 = ch - sy0;
-          if (sw <= 0 || sh2 <= 0) { gl.disable(S); continue; }
-          gl.enable(S); gl.scissor(sx0, sy0, sw, sh2);
-        } else {
-          gl.disable(S);
+          if (sw <= 0 || sh2 <= 0) { if (scissorOn) { gl.disable(S); scissorOn = false; } continue; }
+          if (!scissorOn) { gl.enable(S); scissorOn = true; }
+          gl.scissor(sx0, sy0, sw, sh2);
+        } else if (scissorOn) {
+          gl.disable(S); scissorOn = false;
         }
         gl.uniform4f(U.uRect, cx, cy, hw, hh); gl.uniform1f(U.uRadius, radius); gl.uniform1f(U.uOpacity, opacity);
         gl.uniform1f(U.uUseUI, g.get('useOverlay') ? 1 : 0);
@@ -463,7 +538,7 @@ void main(){
         gl.uniform1f(U.uMode, 1);
         const blur = g.get('blur') || 0, blurPx = blur * dpr;
         const bt = blurPx > 0.05 ? blurTex.get(Math.round(blurPx * 2) / 2) : null;
-        if (bt) { gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bt); }
+        if (bt && bt !== boundBlurTex) { gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bt); boundBlurTex = bt; }
         gl.uniform1f(U.uBlurMix, bt ? 1 : 0);
         gl.uniform1f(U.uRefH, (g.get('refractionHeight') || 0) * dpr); gl.uniform1f(U.uRefA, (g.get('refractionAmount') || 0) * dpr);
         gl.uniform1f(U.uDepth, g.get('depthEffect') ? 1 : 0);
@@ -473,38 +548,43 @@ void main(){
         gl.uniform1f(U.uBright, g.get('brightness') || 0); gl.uniform1f(U.uContrast, g.get('contrast') === undefined ? 1 : g.get('contrast'));
         gl.uniform1f(U.uSat, g.get('vibrancy') ? 1.5 : (g.get('saturation') === undefined ? 1 : g.get('saturation')));
 
-        let hs = 0, hc = [1, 1, 1, 0.5], ha = (45 * Math.PI) / 180, hf = 1, hwid = dpr, hb = 0.5 * dpr, hal = 1;
+        let hs = 0, hc0 = 1, hc1 = 1, hc2 = 1, hc3 = 0.5, ha = 0.7853981633974483, hf = 1, hwid = dpr, hb = 0.5 * dpr, hal = 1;
         const hl = g.get('highlight');
         if (hl) {
           if (typeof hl === 'object') {
             hs = hl.style === 'ambient' ? 3 : hl.style === 'plain' ? 1 : 2;
-            if (hl.color) hc = parseColor(hl.color);
-            if (hl.angle !== undefined) ha = hl.angle * Math.PI / 180;
+            if (hl.color) { const hpc = parseColor(hl.color); hc0 = hpc[0]; hc1 = hpc[1]; hc2 = hpc[2]; hc3 = hpc[3]; }
+            if (hl.angle !== undefined) ha = hl.angle * 0.017453292519943295;
             if (hl.falloff !== undefined) hf = hl.falloff;
             if (hl.width !== undefined) hwid = hl.width * dpr;
             if (hl.blurRadius !== undefined) hb = hl.blurRadius * dpr;
             if (hl.alpha !== undefined) hal = hl.alpha;
           } else hs = 2;
         }
-        gl.uniform1f(U.uHlStyle, hs); gl.uniform4f(U.uHlColor, hc[0], hc[1], hc[2], hc[3]); gl.uniform1f(U.uHlAngle, ha); gl.uniform1f(U.uHlFalloff, hf);
+        gl.uniform1f(U.uHlStyle, hs); gl.uniform4f(U.uHlColor, hc0, hc1, hc2, hc3); gl.uniform2f(U.uHlDir, Math.cos(ha), Math.sin(ha)); gl.uniform1f(U.uHlFalloff, hf);
         gl.uniform1f(U.uHlWidth, hwid); gl.uniform1f(U.uHlBlur, hb); gl.uniform1f(U.uHlAlpha, hal);
 
-        let hasIn = 0, ic = [0, 0, 0, 0.15], io = [0, 0], ir = 0; const is = g.get('innerShadow');
+        let hasIn = 0, ic0 = 0, ic1 = 0, ic2 = 0, ic3 = 0.15, iox = 0, ioy = 0, ir = 0; const is = g.get('innerShadow');
         if (is) {
           if (typeof is === 'object') {
-            if (is.color) ic = parseColor(is.color).slice();
-            ir = (is.radius !== undefined ? is.radius : 24) * dpr; io = is.offset ? [is.offset.x * dpr, is.offset.y * dpr] : [0, ir];
-            if (is.alpha !== undefined) ic[3] *= is.alpha;
-          } else { ir = 24 * dpr; io = [0, 12 * dpr]; }
-          if (ic[3] > 0.001 && ir > 0.1) hasIn = 1;
+            if (is.color) { const ipc = parseColor(is.color); ic0 = ipc[0]; ic1 = ipc[1]; ic2 = ipc[2]; ic3 = ipc[3]; }
+            ir = (is.radius !== undefined ? is.radius : 24) * dpr;
+            if (is.offset) { iox = is.offset.x * dpr; ioy = is.offset.y * dpr; } else { iox = 0; ioy = ir; }
+            if (is.alpha !== undefined) ic3 *= is.alpha;
+          } else { ir = 24 * dpr; iox = 0; ioy = 12 * dpr; }
+          if (ic3 > 0.001 && ir > 0.1) hasIn = 1;
         }
-        gl.uniform1f(U.uHasInner, hasIn); gl.uniform4f(U.uInnerColor, ic[0], ic[1], ic[2], ic[3]); gl.uniform2f(U.uInnerOff, io[0], io[1]); gl.uniform1f(U.uInnerR, ir);
+        gl.uniform1f(U.uHasInner, hasIn); gl.uniform4f(U.uInnerColor, ic0, ic1, ic2, ic3); gl.uniform2f(U.uInnerOff, iox, ioy); gl.uniform1f(U.uInnerR, ir);
         const sf = parseColor(g.get('surfaceColor')), tt = parseColor(g.get('tint'));
         gl.uniform4f(U.uSurface, sf[0], sf[1], sf[2], sf[3]); gl.uniform4f(U.uTint, tt[0], tt[1], tt[2], tt[3]);
         this._box(cx - hw - 2, cy - hh - 2, cx + hw + 2, cy + hh + 2);
-        if (hasClip) gl.disable(S);
       }
+      if (scissorOn) gl.disable(S);
       gl.disable(gl.BLEND);
+      // Unbind FBO textures from TEXTURE1/TEXTURE3 after draw so next frame's FBO writes never hit feedback loops
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
+      gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
+      gl.activeTexture(gl.TEXTURE0);
       return this;
     }
 

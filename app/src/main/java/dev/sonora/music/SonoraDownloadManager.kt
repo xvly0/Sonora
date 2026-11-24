@@ -94,6 +94,8 @@ object SonoraDownloadManager {
     private val cacheLock = Any()
 
     private val stateLock = Any()
+    private val persistLock = Any()
+    private val persistPending = java.util.concurrent.atomic.AtomicBoolean(false)
     private val entries = LinkedHashMap<String, DownloadEntry>()
 
     @Volatile
@@ -106,6 +108,7 @@ object SonoraDownloadManager {
     )
 
     private val activeDownloads = ConcurrentHashMap<String, ActiveDownload>()
+    private val pendingDeletes = ConcurrentHashMap<String, Job>()
 
     fun attach(context: Context) {
         val ctx = context.applicationContext ?: context
@@ -267,34 +270,60 @@ object SonoraDownloadManager {
         }
     }
 
-    private fun persistStateLocked(context: Context) {
-        runCatching {
-            val arr = JSONArray()
-            entries.values.forEach { arr.put(it.toJson()) }
-            val root = JSONObject().apply {
-                put("version", 1)
-                put("updatedAtMs", System.currentTimeMillis())
-                put("downloads", arr)
-            }
-            val target = File(context.filesDir, STATE_FILE_NAME)
-            val tmp = File(context.filesDir, "$STATE_FILE_NAME.tmp")
-            tmp.writeText(root.toString(), Charsets.UTF_8)
+    private fun persistStateAsync(context: Context) {
+        val ctx = context.applicationContext ?: context
+        if (!persistPending.compareAndSet(false, true)) return
+        scope.launch {
             try {
-                Files.move(
-                    tmp.toPath(),
-                    target.toPath(),
-                    StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.ATOMIC_MOVE
-                )
-            } catch (_: Exception) {
-                if (!tmp.renameTo(target)) {
-                    target.writeText(root.toString(), Charsets.UTF_8)
-                    tmp.delete()
+                // Coalesce bursts of state mutations into a single atomic disk write.
+                kotlinx.coroutines.delay(50L)
+                while (persistPending.getAndSet(false)) {
+                    val snapshot = synchronized(stateLock) { entries.values.toList() }
+                    writeStateSnapshot(ctx, snapshot)
+                }
+            } finally {
+                if (persistPending.get()) {
+                    persistStateAsync(ctx)
                 }
             }
-        }.onFailure { e ->
-            android.util.Log.w(TAG, "Failed persisting download state: ${e.message}")
         }
+    }
+
+    private fun writeStateSnapshot(context: Context, snapshot: List<DownloadEntry>) {
+        synchronized(persistLock) {
+            runCatching {
+                val arr = JSONArray()
+                snapshot.forEach { arr.put(it.toJson()) }
+                val root = JSONObject().apply {
+                    put("version", 1)
+                    put("updatedAtMs", System.currentTimeMillis())
+                    put("downloads", arr)
+                }
+                val payload = root.toString()
+                val target = File(context.filesDir, STATE_FILE_NAME)
+                val tmp = File(context.filesDir, "$STATE_FILE_NAME.tmp")
+                tmp.writeText(payload, Charsets.UTF_8)
+                try {
+                    Files.move(
+                        tmp.toPath(),
+                        target.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE
+                    )
+                } catch (_: Exception) {
+                    if (!tmp.renameTo(target)) {
+                        target.writeText(payload, Charsets.UTF_8)
+                        tmp.delete()
+                    }
+                }
+            }.onFailure { e ->
+                android.util.Log.w(TAG, "Failed persisting download state: ${e.message}")
+            }
+        }
+    }
+
+    private fun persistStateLocked(context: Context) {
+        persistStateAsync(context)
     }
 
     private fun resolveCachedContentLength(cache: SimpleCache, cacheKey: String, knownLength: Long): Long {
@@ -328,27 +357,9 @@ object SonoraDownloadManager {
         val cleanId = normalizeTrackId(rawId)
         if (cleanId.isEmpty() || cleanId.startsWith("local_")) return false
         ensureStateLoaded(ctx)
-        val entry = synchronized(stateLock) { entries[cleanId] } ?: return false
-        if (entry.status != STATUS_COMPLETED) return false
-
-        val cache = getDownloadCache(ctx)
-        val cacheKey = cacheKeyFor(cleanId)
-        val metaLen = runCatching { ContentMetadata.getContentLength(cache.getContentMetadata(cacheKey)) }.getOrDefault(C.LENGTH_UNSET.toLong())
-        val effectiveLen = if (metaLen > 0L) metaLen else entry.contentLength
-        val present = if (effectiveLen > 0L) {
-            runCatching { cache.isCached(cacheKey, 0L, effectiveLen) }.getOrDefault(false)
-        } else {
-            resolveCachedSpanBytes(cache, cacheKey) > 0L
+        return synchronized(stateLock) {
+            entries[cleanId]?.status == STATUS_COMPLETED
         }
-        if (!present) {
-            synchronized(stateLock) {
-                if (entries[cleanId]?.status == STATUS_COMPLETED) {
-                    entries.remove(cleanId)
-                    persistStateLocked(ctx)
-                }
-            }
-        }
-        return present
     }
 
     fun enqueue(context: Context, rawId: String): CompletableDeferred<Boolean> {
@@ -379,6 +390,7 @@ object SonoraDownloadManager {
             try {
                 downloadSemaphore.withPermit {
                     if (!isActive || activeDownloads[cleanId] !== activeRecord) return@withPermit
+                    pendingDeletes[cleanId]?.join()
 
                     // Re-check inside permit in case another job completed it just before
                     if (isTrackDownloaded(ctx, cleanId)) {
@@ -502,7 +514,6 @@ object SonoraDownloadManager {
         writerRef: AtomicReference<CacheWriter?>,
         onProgress: (bytes: Long, totalLen: Long, mime: String) -> Unit
     ): Pair<Boolean, String?> {
-        SonoraAudioResolver.ensureNewPipe()
         val resolvedUrl = SonoraAudioResolver.resolve(cleanId)
         if (resolvedUrl.isNullOrBlank()) {
             return false to "Unable to resolve stream URL"
@@ -666,15 +677,24 @@ object SonoraDownloadManager {
         }
         lastProgressPersistMs.remove(cleanId)
 
-        runCatching {
-            getDownloadCache(ctx).removeResource(cacheKeyFor(cleanId))
-        }
-
         val removed = synchronized(stateLock) {
             val prev = entries.remove(cleanId)
-            persistStateLocked(ctx)
+            persistStateAsync(ctx)
             prev != null
         }
+
+        lateinit var deleteJob: Job
+        deleteJob = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                runCatching {
+                    getDownloadCache(ctx).removeResource(cacheKeyFor(cleanId))
+                }
+            } finally {
+                pendingDeletes.remove(cleanId, deleteJob)
+            }
+        }
+        pendingDeletes[cleanId] = deleteJob
+        deleteJob.start()
         return removed
     }
 
@@ -696,6 +716,11 @@ object SonoraDownloadManager {
         val ctx = context.applicationContext ?: context
         downloadCache?.let { cache ->
             return runCatching { cache.cacheSpace }.getOrDefault(0L)
+        }
+        if (stateLoaded) {
+            return synchronized(stateLock) {
+                entries.values.sumOf { if (it.status == STATUS_COMPLETED) it.bytesDownloaded else 0L }
+            }
         }
         val dir = File(ctx.filesDir, DOWNLOADS_DIR_NAME)
         if (!dir.exists()) return 0L

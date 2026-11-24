@@ -39,9 +39,7 @@ object AppleCatalog {
     @Volatile
     private var client: OkHttpClient = buildClient(null)
 
-    private fun buildClient(cacheBaseDir: File?): OkHttpClient = OkHttpClient.Builder()
-        .connectionPool(SonoraHttpPool.connectionPool)
-        .dispatcher(SonoraHttpPool.dispatcher)
+    private fun buildClient(cacheBaseDir: File?): OkHttpClient = SonoraHttpPool.baseClient.newBuilder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .apply {
@@ -65,6 +63,38 @@ object AppleCatalog {
     private const val DISK_EVICT_BATCH = 150
     private const val MISS_SENTINEL = "__MISS__"
     private const val MISS_CACHE_MS = 24L * 60 * 60 * 1000
+    private const val TOKEN_PREFS_NAME = "apple-catalog-token"
+    private const val LEGACY_PREFS_NAME = "apple-catalog-v7"
+    private const val DISK_CACHE_DIR_NAME = "apple_catalog_v1"
+
+    private val HEX_CHARS = "0123456789abcdef".toCharArray()
+    private val sha256Digest = object : ThreadLocal<java.security.MessageDigest>() {
+        override fun initialValue(): java.security.MessageDigest =
+            java.security.MessageDigest.getInstance("SHA-256")
+    }
+
+    private val TOPIC_SUFFIX_RE = Regex("(?i)\\s*-\\s*topic$")
+    private val FEAT_SUFFIX_RE = Regex("(?i)\\b(feat|ft)\\.?.*$")
+    private val SINGLE_SUFFIX_RE = Regex("""\s*-\s*(?:Single|EP)\s*$""", RegexOption.IGNORE_CASE)
+    private val COMBINING_MARKS_RE = Regex("""\p{InCombiningDiacriticalMarks}+""")
+    private val PAREN_RE = Regex("\\([^)]*\\)")
+    private val BRACKET_RE = Regex("\\[[^]]*]")
+    private val NON_WORD_PLAIN_RE = Regex("[^\\p{L}\\p{N}' ]")
+    private val WHITESPACE_RE = Regex("\\s+")
+    private val INDEX_SCRIPT_RE = Regex("""/assets/[^"']*index[^"']*\.js""")
+    private val JWT_CANDIDATE_RE = Regex("""eyJ[\w-]+\.[\w-]+\.[\w-]+""")
+    private val MZ_JPG_RE = Regex("(/\\d+x\\d+[A-Za-z0-9.]*?)\\.jpg(\\?[^/]*)?$")
+    private val MZ_SIMPLE_RE = Regex("/\\d+x\\d+[a-z]{2}\\.(jpg|png|webp)$")
+    private val MZ_IMG_EXT_RE = Regex("(/\\d+x\\d+[A-Za-z0-9.]*?)\\.(jpg|png)(\\?[^/]*)?$")
+    private val KARAOKE_SPAM_TERMS = listOf("karaoke", "tribute", "nightcore", "8d audio", "parodia", "parody")
+    private val LOGO_KEYS = listOf("musicContentColorLogoTrimmed", "brandLogo", "logo")
+    private val INK_KEYS = listOf("textColor1", "textColor2", "textColor3", "textColor4")
+    private val MOTION_KEYS = listOf("motionDetailTall", "motionTallVideo3x4", "motionDetailSquare")
+    private val BLOCKED_CHART_GENRES = setOf(
+        "children's music", "musica per bambini", "ninne nanne", "lullabies",
+        "soundtrack", "colonne sonore", "fitness & workout", "spoken word",
+        "comedy", "holiday", "natale", "christmas",
+    )
 
     private val cache: MutableMap<String, Any?> = object : LinkedHashMap<String, Any?>(128, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Any?>?): Boolean =
@@ -73,6 +103,16 @@ object AppleCatalog {
 
     fun clearMemoryCache() {
         synchronized(cache) { cache.clear() }
+    }
+
+    fun clearDiskCache() {
+        diskKeys.clear()
+        val dir = diskCacheDir ?: return
+        lookupScope.launch {
+            runCatching {
+                dir.listFiles()?.forEach { it.delete() }
+            }
+        }
     }
 
     private val inFlight = ConcurrentHashMap<String, Deferred<Any?>>()
@@ -87,6 +127,13 @@ object AppleCatalog {
     @Volatile
     private var store: android.content.SharedPreferences? = null
 
+    @Volatile
+    private var diskCacheDir: File? = null
+    private val diskKeys = ConcurrentHashMap.newKeySet<String>()
+    @Volatile
+    private var diskIndexReady = false
+    private val pruneRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+
     fun hasReadyToken(): Boolean {
         if (token != null) return true
         val saved = keptToken() ?: return false
@@ -99,16 +146,49 @@ object AppleCatalog {
         connectivityRef = java.lang.ref.WeakReference(
             appCtx.getSystemService(android.net.ConnectivityManager::class.java),
         )
-        store = appCtx.getSharedPreferences(
-            "apple-catalog-v7",
-            android.content.Context.MODE_PRIVATE,
-        )
-        runCatching {
-            client = buildClient(appCtx.cacheDir)
-        }
-        keptToken()?.let { token = it }
-        if (token == null) {
-            lookupScope.launch {
+        val cacheDirTarget = File(appCtx.cacheDir, DISK_CACHE_DIR_NAME)
+        diskCacheDir = cacheDirTarget
+
+        // Initialize SharedPreferences (token-only), OkHttp disk cache, and catalog file index off the Main thread.
+        lookupScope.launch {
+            val tokenPrefs = appCtx.getSharedPreferences(TOKEN_PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            store = tokenPrefs
+            runCatching {
+                client = buildClient(appCtx.cacheDir)
+            }
+            runCatching {
+                if (!cacheDirTarget.exists()) cacheDirTarget.mkdirs()
+                cacheDirTarget.listFiles()?.forEach { f ->
+                    if (f.isFile && f.name.endsWith(".cat")) {
+                        diskKeys.add(f.name)
+                    }
+                }
+                diskIndexReady = true
+            }
+            var loaded = keptToken()
+            if (loaded == null) {
+                // One-time migration of verified JWT from legacy multi-entry SharedPreferences, then delete bloated XML.
+                runCatching {
+                    val legacy = appCtx.getSharedPreferences(LEGACY_PREFS_NAME, android.content.Context.MODE_PRIVATE)
+                    val legacyJwt = legacy.getString(KEY_TOKEN, null)
+                    val legacyExp = legacy.getLong(KEY_TOKEN_UNTIL, 0L)
+                    if (legacyJwt != null &&
+                        System.currentTimeMillis() <= legacyExp - TOKEN_MARGIN_MS &&
+                        isTokenUsable(legacyJwt)
+                    ) {
+                        rememberToken(legacyJwt)
+                        loaded = legacyJwt
+                    }
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                        appCtx.deleteSharedPreferences(LEGACY_PREFS_NAME)
+                    } else {
+                        legacy.edit().clear().apply()
+                    }
+                }
+            }
+            if (loaded != null) {
+                token = loaded
+            } else {
                 kotlinx.coroutines.delay(350L)
                 if (token == null) {
                     runCatching { token() }
@@ -117,16 +197,37 @@ object AppleCatalog {
         }
     }
 
+    private fun fileNameFor(key: String): String {
+        val md = sha256Digest.get()!!
+        md.reset()
+        val digest = md.digest(key.toByteArray(Charsets.UTF_8))
+        val out = CharArray(32)
+        for (i in 0 until 16) {
+            val v = digest[i].toInt() and 0xFF
+            out[i * 2] = HEX_CHARS[v ushr 4]
+            out[i * 2 + 1] = HEX_CHARS[v and 0x0F]
+        }
+        return "${String(out)}.cat"
+    }
+
     private fun remembered(key: String): DiskEntry? {
-        val prefs = store ?: return null
-        val row = prefs.getString(key, null) ?: return null
+        val dir = diskCacheDir ?: return null
+        val name = fileNameFor(key)
+        if (diskIndexReady && !diskKeys.contains(name)) return null
+        val file = File(dir, name)
+        if (!file.exists()) {
+            diskKeys.remove(name)
+            return null
+        }
+        val row = runCatching { file.readText(Charsets.UTF_8) }.getOrNull() ?: return null
         val cut = row.indexOf('\n')
         if (cut < 0) return null
         val written = row.take(cut).toLongOrNull() ?: return null
         val payload = row.substring(cut + 1)
         val ttl = if (payload == MISS_SENTINEL) MISS_CACHE_MS else CACHE_MS
         if (System.currentTimeMillis() - written > ttl) {
-            prefs.edit().remove(key).apply()
+            runCatching { file.delete() }
+            diskKeys.remove(name)
             return null
         }
         return if (payload == MISS_SENTINEL) DiskEntry.Miss else DiskEntry.Hit(payload)
@@ -173,26 +274,39 @@ object AppleCatalog {
 
 
     private fun remember(key: String, value: String) {
-        val prefs = store ?: return
-        val editor = prefs.edit()
-        val all = prefs.all
-        if (!all.containsKey(key) && all.size >= MAX_DISK_ENTRIES) {
-            val protected = setOf(KEY_TOKEN, KEY_TOKEN_UNTIL, LEGACY_KEY_TOKEN, LEGACY_KEY_TOKEN_UNTIL)
-            val candidates = all.entries
-                .asSequence()
-                .filter { it.key !in protected }
-                .map { entry ->
-                    val ts = (entry.value as? String)?.substringBefore('\n')?.toLongOrNull() ?: 0L
-                    entry.key to ts
+        val dir = diskCacheDir ?: return
+        val name = fileNameFor(key)
+        val payload = System.currentTimeMillis().toString() + "\n" + value
+        lookupScope.launch {
+            runCatching {
+                if (!dir.exists()) dir.mkdirs()
+                val target = File(dir, name)
+                val tmp = File(dir, "$name.${Thread.currentThread().id}.tmp")
+                tmp.writeText(payload, Charsets.UTF_8)
+                if (!tmp.renameTo(target)) {
+                    target.writeText(payload, Charsets.UTF_8)
+                    tmp.delete()
                 }
-                .sortedBy { it.second }
-                .toList()
-            val removeCount = (all.size - MAX_DISK_ENTRIES + DISK_EVICT_BATCH).coerceAtMost(candidates.size)
-            for (i in 0 until removeCount) {
-                editor.remove(candidates[i].first)
+                diskKeys.add(name)
+                if (diskKeys.size > MAX_DISK_ENTRIES && pruneRunning.compareAndSet(false, true)) {
+                    try {
+                        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".cat") }
+                        if (files != null && files.size > MAX_DISK_ENTRIES) {
+                            files.sortBy { it.lastModified() }
+                            val removeCount = (files.size - MAX_DISK_ENTRIES + DISK_EVICT_BATCH).coerceAtMost(files.size)
+                            for (i in 0 until removeCount) {
+                                val f = files[i]
+                                if (f.delete()) {
+                                    diskKeys.remove(f.name)
+                                }
+                            }
+                        }
+                    } finally {
+                        pruneRunning.set(false)
+                    }
+                }
             }
         }
-        editor.putString(key, System.currentTimeMillis().toString() + "\n" + value).apply()
     }
 
     @kotlinx.serialization.Serializable
@@ -225,8 +339,8 @@ object AppleCatalog {
         lang: String = SonoraLocaleManager.resolvedLang,
     ): Artist? {
         if (name.isBlank()) return null
-        val clean = name.replace(Regex("(?i)\\s*-\\s*topic$"), "")
-            .replace(Regex("(?i)\\b(feat|ft)\\.?.*$"), "")
+        val clean = name.replace(TOPIC_SUFFIX_RE, "")
+            .replace(FEAT_SUFFIX_RE, "")
             .trim()
         val key = "artist $storefront/$lang/${clean.lowercase()}"
         synchronized(cache) { if (cache.containsKey(key)) return cache[key] as Artist? }
@@ -428,7 +542,7 @@ object AppleCatalog {
             .filter { row ->
                 val filed = row["name"]?.jsonPrimitive?.content.orEmpty()
                 val filedLow = filed.lowercase()
-                if (listOf("karaoke", "tribute", "nightcore", "8d audio", "parodia", "parody").any {
+                if (KARAOKE_SPAM_TERMS.any {
                         it in filedLow && it !in nameLow
                     }
                 ) {
@@ -460,7 +574,6 @@ object AppleCatalog {
             val releaseDayNum: Int?,
         )
 
-        val singleSuffixRe = Regex("""\s*-\s*(?:Single|EP)\s*$""", RegexOption.IGNORE_CASE)
         val parsed = matches.mapNotNull { row ->
             val coverUrl = row["artwork"]?.jsonObject?.template()?.let { size(it, COVER_PX, COVER_PX) }
                 ?: return@mapNotNull null
@@ -470,7 +583,7 @@ object AppleCatalog {
             if (SonoraApiInterceptor.isUnrequestedTrackVariant(trackName, name)) {
                 return@mapNotNull null
             }
-            val cleanAlbum = albumName.replace(singleSuffixRe, "").trim().ifBlank { albumName }
+            val cleanAlbum = albumName.replace(SINGLE_SUFFIX_RE, "").trim().ifBlank { albumName }
             val genres = row["genreNames"]?.jsonArray
                 ?.mapNotNull { runCatching { it.jsonPrimitive.content }.getOrNull() }
                 .orEmpty()
@@ -489,7 +602,7 @@ object AppleCatalog {
                     it.contains("Colonna sonora", ignoreCase = true)
             } && !SonoraApiInterceptor.hasSoundtrackHint(name, effectiveAlbum)
             val isSingleOrEp = sameTitle(albumName, name) ||
-                singleSuffixRe.containsMatchIn(albumName)
+                SINGLE_SUFFIX_RE.containsMatchIn(albumName)
             val isReissue = SonoraApiInterceptor.isReissueAlbumTitle(albumName) ||
                 SonoraApiInterceptor.isReissueAlbumTitle(trackName)
             val releaseDayNum = SonoraApiInterceptor.parseReleaseDayNum(
@@ -591,7 +704,7 @@ object AppleCatalog {
 
     private fun foldAccents(s: String): String =
         java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
-            .replace(Regex("""\p{InCombiningDiacriticalMarks}+"""), "")
+            .replace(COMBINING_MARKS_RE, "")
 
     private fun sameTitle(a: String, b: String): Boolean =
         a.equals(b, ignoreCase = true) || plain(a).equals(plain(b), ignoreCase = true)
@@ -628,7 +741,7 @@ object AppleCatalog {
         // Palette colors live on the square identity artwork; tall portraits carry padding colors.
         val colourArt = attributes["artwork"]?.jsonObject ?: heroArt
 
-        val logo = listOf("musicContentColorLogoTrimmed", "brandLogo", "logo")
+        val logo = LOGO_KEYS
             .firstNotNullOfOrNull { editorial?.get(it)?.jsonObject }
 
         if (hero == null && logo == null) return LookupOutcome(null, authoritative = true)
@@ -741,11 +854,11 @@ object AppleCatalog {
     }
 
     private fun inkPaletteOf(art: JsonObject?): List<String> =
-        listOf("textColor1", "textColor2", "textColor3", "textColor4")
+        INK_KEYS
             .mapNotNull { art?.get(it)?.jsonPrimitive?.content }
 
     private fun kotlinx.serialization.json.JsonObject.motion(): kotlinx.serialization.json.JsonObject? =
-        listOf("motionDetailTall", "motionTallVideo3x4", "motionDetailSquare")
+        MOTION_KEYS
             .firstNotNullOfOrNull { get("editorialVideo")?.jsonObject?.get(it)?.jsonObject }
 
     // Exclude superHeroTall: it is auto-generated from the square sleeve and slow to generate on cold paths.
@@ -791,12 +904,6 @@ object AppleCatalog {
         val root = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return null
         val results = root["results"]?.jsonObject ?: return null
 
-        val blockedGenres = setOf(
-            "children's music", "musica per bambini", "ninne nanne", "lullabies",
-            "soundtrack", "colonne sonore", "fitness & workout", "spoken word",
-            "comedy", "holiday", "natale", "christmas",
-        )
-
         fun parseChartItems(key: String): List<StorefrontChartItem> {
             val out = ArrayList<StorefrontChartItem>()
             val rawEl = results[key] ?: return out
@@ -815,7 +922,7 @@ object AppleCatalog {
                     val genres = (att["genreNames"] as? kotlinx.serialization.json.JsonArray)
                         ?.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()?.lowercase() }
                         .orEmpty()
-                    if (genres.any { it in blockedGenres }) continue
+                    if (genres.any { it in BLOCKED_CHART_GENRES }) continue
                     val releaseDate = (att["releaseDate"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.trim()
                     val isSingle = (att["isSingle"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toBooleanStrictOrNull() ?: false
                     val template = (att["artwork"] as? JsonObject)?.template()
@@ -846,11 +953,11 @@ object AppleCatalog {
     )
 
     private fun plain(title: String): String = title
-        .replace(Regex("\\([^)]*\\)"), " ")
-        .replace(Regex("\\[[^]]*]"), " ")
+        .replace(PAREN_RE, " ")
+        .replace(BRACKET_RE, " ")
         .substringBefore(" - ")
-        .replace(Regex("[^\\p{L}\\p{N}' ]"), " ")
-        .replace(Regex("\\s+"), " ")
+        .replace(NON_WORD_PLAIN_RE, " ")
+        .replace(WHITESPACE_RE, " ")
         .trim()
 
     private fun storefront(): String = SonoraLocaleManager.storefront()
@@ -942,9 +1049,9 @@ object AppleCatalog {
     private suspend fun doScrapeToken(): String? {
         for (site in listOf("https://beta.music.apple.com", "https://music.apple.com")) {
             val page = get(site, null) ?: continue
-            val script = Regex("""/assets/[^"']*index[^"']*\.js""").find(page)?.value ?: continue
+            val script = INDEX_SCRIPT_RE.find(page)?.value ?: continue
             val bundle = get("$site$script", null) ?: continue
-            val rawCandidates = Regex("""eyJ[\w-]+\.[\w-]+\.[\w-]+""")
+            val rawCandidates = JWT_CANDIDATE_RE
                 .findAll(bundle)
                 .map { it.value }
                 .distinct()
@@ -1067,7 +1174,7 @@ object AppleCatalog {
 
     private fun asWebp(url: String): String =
         if (!url.contains("mzstatic.com")) url
-        else url.replace(Regex("(/\\d+x\\d+[A-Za-z0-9.]*?)\\.jpg(\\?[^/]*)?$"), "$1.webp$2")
+        else url.replace(MZ_JPG_RE, "$1.webp$2")
 
     private fun kotlinx.serialization.json.JsonObject.template(): String? =
         get("url")?.jsonPrimitive?.content
@@ -1085,16 +1192,12 @@ object AppleCatalog {
             .replace("{f}", format)
             .replace("{c}", crop)
 
-        val simple = Regex("/\\d+x\\d+[a-z]{2}\\.(jpg|png|webp)$")
-        if (simple.containsMatchIn(filled)) {
-            return filled.replace(simple, "/" + width + "x" + height + crop + "." + format)
+        if (MZ_SIMPLE_RE.containsMatchIn(filled)) {
+            return filled.replace(MZ_SIMPLE_RE, "/" + width + "x" + height + crop + "." + format)
         }
         // Preserve custom crop segments while requesting WebP when applicable.
         if (format != "webp") return filled
-        return filled.replace(
-            Regex("(/\\d+x\\d+[A-Za-z0-9.]*?)\\.(jpg|png)(\\?[^/]*)?$"),
-            "$1.webp$3",
-        )
+        return filled.replace(MZ_IMG_EXT_RE, "$1.webp$3")
     }
 
     private const val CACHE_MS = 30L * 24 * 60 * 60 * 1000

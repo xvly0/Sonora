@@ -170,27 +170,45 @@ class PcmMixer {
     private fun loop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
         val block = FloatArray(BLOCK_FRAMES * 2)
+        val active = ArrayList<MixerChannel>(4)
         while (running) {
-            val active: List<MixerChannel>
+            active.clear()
             synchronized(lock) {
-                channels.removeAll { it.finished }
-                while (running && channels.none { it.playing }) {
+                var i = channels.size - 1
+                while (i >= 0) {
+                    if (channels[i].finished) channels.removeAt(i)
+                    i--
+                }
+                while (running) {
+                    var anyPlaying = false
+                    for (j in 0 until channels.size) {
+                        if (channels[j].playing) {
+                            anyPlaying = true
+                            break
+                        }
+                    }
+                    if (anyPlaying) break
                     if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                         track.pause()
                         readHead(advancing = false)
                     }
                     lock.wait(250)
                 }
-                active = channels.filter { it.playing }
+                for (j in 0 until channels.size) {
+                    val ch = channels[j]
+                    if (ch.playing) active.add(ch)
+                }
             }
             if (!running) break
             if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
             block.fill(0f)
             runHandover()
-            for (channel in active) {
+            for (j in 0 until active.size) {
+                val channel = active[j]
                 if (channel.slot.held && !channel.orphaned) continue
                 channel.mixInto(block, BLOCK_FRAMES, framesWritten)
             }
+            active.clear()
             softLimitBlock(block)
             var offset = 0
             while (offset < block.size && running) {
@@ -447,7 +465,10 @@ class MixerChannel internal constructor(
     private var queued = 0
     private var consumed = 0L
 
-    private val stamps = ArrayDeque<LongArray>()
+    private val stampFrame = LongArray(MAX_STAMPS)
+    private val stampTimeUs = LongArray(MAX_STAMPS)
+    private var stampHead = 0
+    private var stampCount = 0
     private var lastStampUs = Long.MIN_VALUE
     private var lastGain = -1f
 
@@ -457,7 +478,11 @@ class MixerChannel internal constructor(
     private var historyIndex = 0
     private var historyCount = 0
 
-    private val blocks = ArrayDeque<LongArray>()
+    private val blockTrackFrame = LongArray(MAX_BLOCKS)
+    private val blockConsumed = LongArray(MAX_BLOCKS)
+    private val blockCountFrames = LongArray(MAX_BLOCKS)
+    private var blockHead = 0
+    private var blockCount = 0
     private var playedBase = 0L
 
     @Volatile internal var playing = false
@@ -516,32 +541,46 @@ class MixerChannel internal constructor(
             if (released) return true
             val available = buffer.remaining() / frameBytes
             if (presentationTimeUs >= 0 && presentationTimeUs != lastStampUs) {
-                stamps.addLast(longArrayOf(consumed + queued, presentationTimeUs))
+                if (stampCount == MAX_STAMPS) {
+                    stampHead = (stampHead + 1) % MAX_STAMPS
+                    stampCount--
+                }
+                val tail = (stampHead + stampCount) % MAX_STAMPS
+                stampFrame[tail] = consumed + queued
+                stampTimeUs[tail] = presentationTimeUs
+                stampCount++
                 lastStampUs = presentationTimeUs
-                while (stamps.size > MAX_STAMPS) stamps.removeFirst()
             }
             val room = (if (slot.held) capacity else mixer.liveFrames()) - queued
             val frames = min(available, max(0, room))
-            val data = buffer.duplicate().order(ByteOrder.nativeOrder())
-            var write = (readIndex + queued) % capacity
-            for (f in 0 until frames) {
-                val left: Float
-                val right: Float
-                if (floatInput) {
-                    left = data.getFloat()
-                    right = if (inputChannels > 1) data.getFloat() else left
-                    repeat(max(0, inputChannels - 2)) { data.getFloat() }
-                } else {
-                    left = data.getShort() / 32768f
-                    right = if (inputChannels > 1) data.getShort() / 32768f else left
-                    repeat(max(0, inputChannels - 2)) { data.getShort() }
+            if (frames > 0) {
+                val prevOrder = buffer.order()
+                buffer.order(ByteOrder.nativeOrder())
+                try {
+                    var write = (readIndex + queued) % capacity
+                    val extraChannels = max(0, inputChannels - 2)
+                    for (f in 0 until frames) {
+                        val left: Float
+                        val right: Float
+                        if (floatInput) {
+                            left = buffer.getFloat()
+                            right = if (inputChannels > 1) buffer.getFloat() else left
+                            if (extraChannels > 0) buffer.position(buffer.position() + extraChannels * 4)
+                        } else {
+                            left = buffer.getShort() / 32768f
+                            right = if (inputChannels > 1) buffer.getShort() / 32768f else left
+                            if (extraChannels > 0) buffer.position(buffer.position() + extraChannels * 2)
+                        }
+                        ring[write * 2] = left
+                        ring[write * 2 + 1] = right
+                        write++
+                        if (write == capacity) write = 0
+                    }
+                } finally {
+                    buffer.order(prevOrder)
                 }
-                ring[write * 2] = left
-                ring[write * 2 + 1] = right
-                write = (write + 1) % capacity
+                queued += frames
             }
-            queued += frames
-            buffer.position(buffer.position() + frames * frameBytes)
             return frames == available
         }
     }
@@ -599,9 +638,17 @@ class MixerChannel internal constructor(
         }
         queued -= n
         if (orphaned) orphanDone += n
-        blocks.addLast(longArrayOf(trackFrame, consumed, n.toLong()))
+        if (blockCount == MAX_BLOCKS) {
+            playedBase = blockConsumed[blockHead] + blockCountFrames[blockHead]
+            blockHead = (blockHead + 1) % MAX_BLOCKS
+            blockCount--
+        }
+        val bTail = (blockHead + blockCount) % MAX_BLOCKS
+        blockTrackFrame[bTail] = trackFrame
+        blockConsumed[bTail] = consumed
+        blockCountFrames[bTail] = n.toLong()
+        blockCount++
         consumed += n
-        while (blocks.size > MAX_BLOCKS) blocks.removeFirst().let { playedBase = it[1] + it[2] }
     }
 
     internal fun skip(frames: Int) = synchronized(this) {
@@ -615,7 +662,9 @@ class MixerChannel internal constructor(
     internal fun queuedFrames(): Int = synchronized(this) { queued }
     internal fun consumedFrames(): Long = synchronized(this) { consumed }
     internal fun historyFrames(): Int = synchronized(this) { historyCount }
-    internal fun firstStampUs(): Long? = synchronized(this) { stamps.firstOrNull()?.get(1) }
+    internal fun firstStampUs(): Long? = synchronized(this) {
+        if (stampCount == 0) null else stampTimeUs[stampHead]
+    }
 
     internal fun history(frames: Int): FloatArray = synchronized(this) {
         val target = if (frames == historyScratch.size) historyScratch else FloatArray(frames)
@@ -626,21 +675,47 @@ class MixerChannel internal constructor(
     }
 
     internal fun mediaTimeAt(frame: Long): Long? = synchronized(this) {
-        val before = stamps.lastOrNull { it[0] <= frame } ?: return null
-        val after = stamps.firstOrNull { it[0] > frame }
-        if (after == null || after[0] == before[0]) {
-            return before[1] + (frame - before[0]) * 1_000_000L / PcmMixer.RATE
+        var beforeIdx = -1
+        var afterIdx = -1
+        for (i in 0 until stampCount) {
+            val idx = (stampHead + i) % MAX_STAMPS
+            val sf = stampFrame[idx]
+            if (sf <= frame) {
+                beforeIdx = idx
+            } else {
+                afterIdx = idx
+                break
+            }
         }
-        before[1] + (after[1] - before[1]) * (frame - before[0]) / (after[0] - before[0])
+        if (beforeIdx < 0) return null
+        val bf = stampFrame[beforeIdx]
+        val bt = stampTimeUs[beforeIdx]
+        if (afterIdx < 0 || stampFrame[afterIdx] == bf) {
+            return bt + (frame - bf) * 1_000_000L / PcmMixer.RATE
+        }
+        bt + (stampTimeUs[afterIdx] - bt) * (frame - bf) / (stampFrame[afterIdx] - bf)
     }
 
     internal fun frameAt(timeUs: Long): Long? = synchronized(this) {
-        val before = stamps.lastOrNull { it[1] <= timeUs } ?: return null
-        val after = stamps.firstOrNull { it[1] > timeUs }
-        if (after == null || after[1] == before[1]) {
-            return before[0] + (timeUs - before[1]) * PcmMixer.RATE / 1_000_000L
+        var beforeIdx = -1
+        var afterIdx = -1
+        for (i in 0 until stampCount) {
+            val idx = (stampHead + i) % MAX_STAMPS
+            val st = stampTimeUs[idx]
+            if (st <= timeUs) {
+                beforeIdx = idx
+            } else {
+                afterIdx = idx
+                break
+            }
         }
-        before[0] + (after[0] - before[0]) * (timeUs - before[1]) / (after[1] - before[1])
+        if (beforeIdx < 0) return null
+        val bf = stampFrame[beforeIdx]
+        val bt = stampTimeUs[beforeIdx]
+        if (afterIdx < 0 || stampTimeUs[afterIdx] == bt) {
+            return bf + (timeUs - bt) * PcmMixer.RATE / 1_000_000L
+        }
+        bf + (stampFrame[afterIdx] - bf) * (timeUs - bt) / (stampTimeUs[afterIdx] - bt)
     }
 
     internal fun pileMonoInto(): Int = synchronized(this) {
@@ -654,18 +729,21 @@ class MixerChannel internal constructor(
 
     internal fun playedFrames(): Long = synchronized(this) {
         val heard = mixer.playedFrames()
-        while (blocks.isNotEmpty()) {
-            val first = blocks.first()
-            if (heard >= first[0] + first[2]) {
-                playedBase = max(playedBase, first[1] + first[2])
-                blocks.removeFirst()
+        while (blockCount > 0) {
+            val tf = blockTrackFrame[blockHead]
+            val cf = blockCountFrames[blockHead]
+            if (heard >= tf + cf) {
+                playedBase = max(playedBase, blockConsumed[blockHead] + cf)
+                blockHead = (blockHead + 1) % MAX_BLOCKS
+                blockCount--
             } else {
                 break
             }
         }
-        val first = blocks.firstOrNull() ?: return playedBase
-        if (heard <= first[0]) return playedBase
-        first[1] + (heard - first[0])
+        if (blockCount == 0) return playedBase
+        val firstTf = blockTrackFrame[blockHead]
+        if (heard <= firstTf) return playedBase
+        blockConsumed[blockHead] + (heard - firstTf)
     }
 
     internal fun getPositionUs(): Long = playedFrames() * 1_000_000L / PcmMixer.RATE
@@ -676,8 +754,10 @@ class MixerChannel internal constructor(
         queued = 0
         consumed = 0
         playedBase = 0
-        blocks.clear()
-        stamps.clear()
+        blockHead = 0
+        blockCount = 0
+        stampHead = 0
+        stampCount = 0
         lastStampUs = Long.MIN_VALUE
         historyCount = 0
         rmsEnv = 0.18f

@@ -5,6 +5,7 @@ import android.util.LruCache
 import dev.sonora.music.LyricLine
 import dev.sonora.music.Lyrics
 import dev.sonora.music.LyricsCredit
+import dev.sonora.music.SonoraHttpPool
 import java.io.File
 import java.io.IOException
 import java.net.URLEncoder
@@ -20,7 +21,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -75,21 +77,42 @@ object LyricsLibrary {
     private val LRC_TIMESTAMPS_REGEX = Regex("""\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]\s*|<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>\s*""")
     private val LRC_META_LINE_REGEX = Regex("""^\[[a-zA-Z]+:.*\]$""")
 
-    private val searchHttpClient = OkHttpClient.Builder()
-        .connectTimeout(1200, TimeUnit.MILLISECONDS)
-        .readTimeout(1200, TimeUnit.MILLISECONDS)
-        .callTimeout(1350, TimeUnit.MILLISECONDS)
-        .build()
+    private val HEX_CHARS = "0123456789abcdef".toCharArray()
+    private val sha1Digest = object : ThreadLocal<MessageDigest>() {
+        override fun initialValue(): MessageDigest = MessageDigest.getInstance("SHA-1")
+    }
+
+    private val searchHttpClient: OkHttpClient by lazy {
+        SonoraHttpPool.baseClient.newBuilder()
+            .connectTimeout(1200, TimeUnit.MILLISECONDS)
+            .readTimeout(1200, TimeUnit.MILLISECONDS)
+            .callTimeout(1350, TimeUnit.MILLISECONDS)
+            .build()
+    }
 
     private class Survey(
         val jobs: Map<LyricsSource, Deferred<SourceResult>>,
         val completed: ConcurrentHashMap<LyricsSource, SourceResult>,
+        val progress: MutableStateFlow<Int>,
         val createdAtMs: Long = System.currentTimeMillis(),
+    )
+
+    private data class CachedSearchDoc(
+        val lastModified: Long,
+        val title: String,
+        val artist: String,
+        val album: String,
+        val videoId: String,
+        val lines: List<String>,
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val surveys = LruCache<String, Survey>(32)
+    private val searchDocCache = LruCache<String, CachedSearchDoc>(LYRIC_SEARCH_SCAN_LIMIT)
     private val recheckedKeys = ConcurrentHashMap.newKeySet<String>()
+    private val diskFileSizes = ConcurrentHashMap<String, Long>()
+    @Volatile
+    private var diskIndexReady = false
 
     @Volatile
     private var diskCacheDir: File? = null
@@ -104,14 +127,45 @@ object LyricsLibrary {
     )
 
     fun attach(context: Context) {
-        diskCacheDir = File(context.applicationContext.cacheDir, "sonora_lyrics_cache").apply {
-            if (!exists()) mkdirs()
+        val dir = File(context.applicationContext.cacheDir, "sonora_lyrics_cache")
+        diskCacheDir = dir
+        scope.launch {
+            runCatching {
+                if (!dir.exists()) dir.mkdirs()
+                val files = dir.listFiles()
+                if (files != null) {
+                    for (f in files) {
+                        if (f.isFile && f.name.endsWith(".json")) {
+                            diskFileSizes[f.name] = f.length()
+                        }
+                    }
+                }
+                diskIndexReady = true
+            }
         }
     }
 
     private fun sha1Hex(input: String): String {
-        val bytes = MessageDigest.getInstance("SHA-1").digest(input.toByteArray(Charsets.UTF_8))
-        return bytes.joinToString("") { "%02x".format(it) }
+        val md = sha1Digest.get()!!
+        md.reset()
+        val bytes = md.digest(input.toByteArray(Charsets.UTF_8))
+        val out = CharArray(bytes.size * 2)
+        for (i in bytes.indices) {
+            val v = bytes[i].toInt() and 0xFF
+            out[i * 2] = HEX_CHARS[v ushr 4]
+            out[i * 2 + 1] = HEX_CHARS[v and 0x0F]
+        }
+        return String(out)
+    }
+
+    private fun shallowCopyJson(src: JSONObject): JSONObject {
+        val copy = JSONObject()
+        val keys = src.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            copy.put(k, src.get(k))
+        }
+        return copy
     }
 
     private fun isTopTierWord(obj: JSONObject): Boolean =
@@ -167,9 +221,15 @@ object LyricsLibrary {
     private fun readDiskCache(key: String): JSONObject? {
         val dir = diskCacheDir ?: return null
         val file = diskCacheFile(dir, key)
-        if (!file.exists()) return null
+        if (diskIndexReady && !diskFileSizes.containsKey(file.name)) return null
+        if (!file.exists()) {
+            diskFileSizes.remove(file.name)
+            return null
+        }
         if (System.currentTimeMillis() - file.lastModified() > DISK_CACHE_TTL_MS) {
             runCatching { file.delete() }
+            diskFileSizes.remove(file.name)
+            synchronized(searchDocCache) { searchDocCache.remove(file.name) }
             return null
         }
         return runCatching {
@@ -194,35 +254,61 @@ object LyricsLibrary {
         val linesLen = root.optJSONArray("lines")?.length() ?: 0
         if (linesLen == 0) return
         if (!isSettledForDiskCache(root)) return
-        runCatching {
-            if (!dir.exists()) dir.mkdirs()
-            val diskObj = JSONObject(root.toString())
-            if (title.isNotBlank()) diskObj.put("title", title.trim())
-            if (artist.isNotBlank()) diskObj.put("artist", artist.trim())
-            if (videoId.isNotBlank()) diskObj.put("videoId", videoId.trim())
-            if (album.isNotBlank()) diskObj.put("album", album.trim())
-            diskCacheFile(dir, key).writeText(diskObj.toString(), Charsets.UTF_8)
+        val diskObj = shallowCopyJson(root)
+        val cleanTitle = title.trim()
+        val cleanArtist = artist.trim()
+        val cleanVid = videoId.trim()
+        val cleanAlbum = album.trim()
+        if (cleanTitle.isNotBlank()) diskObj.put("title", cleanTitle)
+        if (cleanArtist.isNotBlank()) diskObj.put("artist", cleanArtist)
+        if (cleanVid.isNotBlank()) diskObj.put("videoId", cleanVid)
+        if (cleanAlbum.isNotBlank()) diskObj.put("album", cleanAlbum)
+        val payload = diskObj.toString()
+        scope.launch {
+            runCatching {
+                if (!dir.exists()) dir.mkdirs()
+                val file = diskCacheFile(dir, key)
+                val bytes = payload.toByteArray(Charsets.UTF_8)
+                file.writeBytes(bytes)
+                diskFileSizes[file.name] = bytes.size.toLong()
+                synchronized(searchDocCache) { searchDocCache.remove(file.name) }
+            }
         }
     }
 
     fun getDiskCacheSizeBytes(): Long {
+        if (diskIndexReady) {
+            var sum = 0L
+            for (v in diskFileSizes.values) sum += v
+            return sum
+        }
         val dir = diskCacheDir ?: return 0L
         if (!dir.exists()) return 0L
         return dir.listFiles()?.sumOf { if (it.isFile) it.length() else 0L } ?: 0L
     }
 
     fun getCachedEntryCount(): Int {
+        if (diskIndexReady) return diskFileSizes.size
         val dir = diskCacheDir ?: return 0
         return dir.listFiles()?.count { it.isFile && it.name.endsWith(".json") } ?: 0
     }
 
     fun clearCache() {
         recheckedKeys.clear()
+        diskFileSizes.clear()
         synchronized(surveys) {
             surveys.evictAll()
         }
-        runCatching {
-            diskCacheDir?.listFiles()?.forEach { it.delete() }
+        synchronized(searchDocCache) {
+            searchDocCache.evictAll()
+        }
+        val dir = diskCacheDir
+        if (dir != null) {
+            scope.launch {
+                runCatching {
+                    dir.listFiles()?.forEach { it.delete() }
+                }
+            }
         }
     }
 
@@ -278,16 +364,18 @@ object LyricsLibrary {
             surveys.remove(cacheKey)
         }
         val completed = ConcurrentHashMap<LyricsSource, SourceResult>()
+        val progress = MutableStateFlow(0)
         val jobs = allSources.associateWith { src ->
             scope.async {
                 val res = withTimeoutOrNull(SOURCE_TIMEOUT_MS) {
                     fetchOne(src, query)
                 } ?: SourceResult(src, "error", null, null)
                 completed[src] = res
+                progress.value = completed.size
                 res
             }
         }
-        Survey(jobs, completed).also { surveys.put(cacheKey, it) }
+        Survey(jobs, completed, progress).also { surveys.put(cacheKey, it) }
     }
 
     private fun hasSettledWordWinner(snap: Map<LyricsSource, SourceResult>): Boolean {
@@ -317,11 +405,14 @@ object LyricsLibrary {
                 }
                 val firstCheck = recheckedKeys.add(cacheKey)
                 val survey = getOrStartSurvey(cacheKey, query, allowRetryErrored = firstCheck)
-                val deadlineMs = survey.createdAtMs + 2_000L
-                while (System.currentTimeMillis() < deadlineMs) {
-                    val snap = survey.completed
-                    if (snap.size >= allSources.size || hasSettledWordWinner(snap) || hasTopTierSettled(snap)) break
-                    delay(40)
+                val waitMs = (survey.createdAtMs + 2_000L) - System.currentTimeMillis()
+                if (waitMs > 0L) {
+                    withTimeoutOrNull(waitMs) {
+                        survey.progress.first {
+                            val snap = survey.completed
+                            snap.size >= allSources.size || hasSettledWordWinner(snap) || hasTopTierSettled(snap)
+                        }
+                    }
                 }
                 val liveRoot = buildJsonResponse(survey.completed, requestedSrc)
                 if (isBetterResult(liveRoot, cachedObj)) {
@@ -343,7 +434,7 @@ object LyricsLibrary {
                             }
                         }
                     }
-                    val patched = JSONObject(cachedObj.toString())
+                    val patched = shallowCopyJson(cachedObj)
                     patched.put("pending", JSONArray(pendingTop))
                     return@withContext patched
                 }
@@ -360,22 +451,36 @@ object LyricsLibrary {
             val initialWait = if (targetSrc != null) 2500L else 2200L
             val maxFallbackWait = if (targetSrc != null) 2500L else 4200L
 
-            while (true) {
-                val surveyElapsed = System.currentTimeMillis() - survey.createdAtMs
-                val callElapsed = System.currentTimeMillis() - callStart
-                val snap = survey.completed
-                if (snap.size >= allSources.size) break
-
-                if (targetSrc != null) {
-                    if (snap.containsKey(targetSrc) || callElapsed >= initialWait) break
-                } else {
+            if (targetSrc != null) {
+                withTimeoutOrNull(initialWait) {
+                    survey.progress.first {
+                        val snap = survey.completed
+                        snap.size >= allSources.size || snap.containsKey(targetSrc)
+                    }
+                }
+            } else {
+                while (true) {
+                    val now = System.currentTimeMillis()
+                    val surveyElapsed = now - survey.createdAtMs
+                    val callElapsed = now - callStart
+                    val snap = survey.completed
+                    val seenCount = survey.progress.value
+                    if (snap.size >= allSources.size) break
                     val hasAnyOk = snap.values.any { it.state == "ok" }
                     if (hasSettledWordWinner(snap)) break
                     if (hasTopTierSettled(snap) && hasAnyOk) break
                     if (surveyElapsed >= initialWait && hasAnyOk && callElapsed >= 250L) break
                     if (surveyElapsed >= maxFallbackWait && callElapsed >= 400L) break
+
+                    val nextGateMs = if (hasAnyOk) {
+                        maxOf(initialWait - surveyElapsed, 250L - callElapsed)
+                    } else {
+                        maxOf(maxFallbackWait - surveyElapsed, 400L - callElapsed)
+                    }.coerceAtLeast(1L)
+                    withTimeoutOrNull(nextGateMs) {
+                        survey.progress.first { it > seenCount }
+                    }
                 }
-                delay(40)
             }
         }
         val root = buildJsonResponse(survey.completed, requestedSrc)
@@ -620,48 +725,61 @@ object LyricsLibrary {
         var exactCount = 0
 
         for ((idx, file) in recentFiles.withIndex()) {
-            if (now - file.lastModified() > DISK_CACHE_TTL_MS) continue
+            val lastMod = file.lastModified()
+            if (now - lastMod > DISK_CACHE_TTL_MS) continue
             runCatching {
-                val obj = JSONObject(file.readText(Charsets.UTF_8))
-                if (obj.has("available") && !obj.optBoolean("available", false)) return@runCatching
-                val title = obj.optNonNullString("title")
-                if (title.isBlank()) return@runCatching
-                val artist = obj.optNonNullString("artist")
-                val dedupKey = "${title.lowercase()}|${artist.lowercase()}"
+                val doc = synchronized(searchDocCache) { searchDocCache.get(file.name) }
+                    ?.takeIf { it.lastModified == lastMod }
+                    ?: run {
+                        val obj = JSONObject(file.readText(Charsets.UTF_8))
+                        if (obj.has("available") && !obj.optBoolean("available", false)) return@runCatching
+                        val title = obj.optNonNullString("title")
+                        if (title.isBlank()) return@runCatching
+                        val artist = obj.optNonNullString("artist")
+                        val candidateLines = ArrayList<String>()
+                        val linesArr = obj.optJSONArray("lines")
+                        if (linesArr != null) {
+                            for (i in 0 until linesArr.length()) {
+                                val lineObj = linesArr.optJSONObject(i)
+                                val text = lineObj?.optNonNullString("text")
+                                    ?: linesArr.optString(i, "").takeIf { !linesArr.isNull(i) }?.trim()
+                                    ?: ""
+                                val cleaned = stripLrcTimestamps(text)
+                                if (cleaned.isNotBlank() && !LRC_META_LINE_REGEX.matches(cleaned)) {
+                                    candidateLines.add(cleaned)
+                                }
+                            }
+                        }
+                        val plain = obj.optNonNullString("plain").ifBlank { obj.optNonNullString("plainLyrics") }
+                        if (plain.isNotBlank()) {
+                            candidateLines.addAll(extractCleanLines(plain))
+                        }
+                        val created = CachedSearchDoc(
+                            lastModified = lastMod,
+                            title = title,
+                            artist = artist,
+                            album = obj.optNonNullString("album"),
+                            videoId = obj.optNonNullString("videoId"),
+                            lines = candidateLines,
+                        )
+                        synchronized(searchDocCache) { searchDocCache.put(file.name, created) }
+                        created
+                    }
+
+                if (doc.lines.isEmpty()) return@runCatching
+                val dedupKey = "${doc.title.lowercase()}|${doc.artist.lowercase()}"
                 if (dedupKey in seenKeys) return@runCatching
 
-                val candidateLines = ArrayList<String>()
-                val linesArr = obj.optJSONArray("lines")
-                if (linesArr != null) {
-                    for (i in 0 until linesArr.length()) {
-                        val lineObj = linesArr.optJSONObject(i)
-                        val text = lineObj?.optNonNullString("text")
-                            ?: linesArr.optString(i, "").takeIf { !linesArr.isNull(i) }?.trim()
-                            ?: ""
-                        val cleaned = stripLrcTimestamps(text)
-                        if (cleaned.isNotBlank() && !LRC_META_LINE_REGEX.matches(cleaned)) {
-                            candidateLines.add(cleaned)
-                        }
-                    }
-                }
-                val plain = obj.optNonNullString("plain").ifBlank { obj.optNonNullString("plainLyrics") }
-                if (plain.isNotBlank()) {
-                    candidateLines.addAll(extractCleanLines(plain))
-                }
-                if (candidateLines.isEmpty()) return@runCatching
-
-                val matched = findBestMatchingLine(candidateLines, normQuery, queryWords) ?: return@runCatching
-                val album = obj.optNonNullString("album")
-                val videoId = obj.optNonNullString("videoId")
+                val matched = findBestMatchingLine(doc.lines, normQuery, queryWords) ?: return@runCatching
                 if (seenKeys.add(dedupKey)) {
                     candidates.add(
                         ScoredLyricHit(
                             hit = LyricSearchHit(
-                                title = title,
-                                artist = artist,
+                                title = doc.title,
+                                artist = doc.artist,
                                 snippet = formatLyricSnippet(matched.first),
-                                album = album,
-                                videoId = videoId,
+                                album = doc.album,
+                                videoId = doc.videoId,
                             ),
                             score = matched.second,
                             order = idx,

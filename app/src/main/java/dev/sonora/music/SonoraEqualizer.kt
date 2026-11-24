@@ -111,7 +111,6 @@ class SonoraEqAudioProcessor : BaseAudioProcessor() {
     private val bands = arrayOfNulls<Biquad>(SonoraEqualizer.FREQUENCIES.size)
     private var activeBandCount = 0
     private var state = DoubleArray(0)
-    private var pcmScratch = ShortArray(0)
 
     override fun onConfigure(
         inputAudioFormat: AudioProcessor.AudioFormat,
@@ -133,7 +132,6 @@ class SonoraEqAudioProcessor : BaseAudioProcessor() {
         bands.fill(null)
         activeBandCount = 0
         state = DoubleArray(0)
-        pcmScratch = ShortArray(0)
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
@@ -177,48 +175,43 @@ class SonoraEqAudioProcessor : BaseAudioProcessor() {
         }
 
         val samples = size ushr 1
-        var scratch = pcmScratch
-        if (scratch.size < samples) {
-            scratch = ShortArray(samples)
-            pcmScratch = scratch
-        }
-
         val prevOrder = inputBuffer.order()
         inputBuffer.order(ByteOrder.LITTLE_ENDIAN)
-        inputBuffer.asShortBuffer().get(scratch, 0, samples)
-        inputBuffer.order(prevOrder)
-        inputBuffer.position(inputBuffer.limit())
-
-        val gain = wanted.inputGain
-        val z = state
-        val bandArr = bands
-        var i = 0
-        while (i + channels <= samples) {
-            for (c in 0 until channels) {
-                var x = scratch[i + c] * gain
-                var s = c * 2
-                for (b in 0 until count) {
-                    val f = bandArr[b]!!
-                    val y = f.b0 * x + z[s]
-                    z[s] = f.b1 * x - f.a1 * y + z[s + 1]
-                    z[s + 1] = f.b2 * x - f.a2 * y
-                    x = y
-                    s += channels * 2
-                }
-                val clamped = when {
-                    x > Short.MAX_VALUE -> Short.MAX_VALUE.toInt()
-                    x < Short.MIN_VALUE -> Short.MIN_VALUE.toInt()
-                    else -> x.roundToInt()
-                }
-                scratch[i + c] = clamped.toShort()
-            }
-            i += channels
-        }
-
         out.order(ByteOrder.LITTLE_ENDIAN)
-        out.asShortBuffer().put(scratch, 0, samples)
-        out.position(0)
-        out.limit(size)
+        try {
+            val gain = wanted.inputGain
+            val z = state
+            val bandArr = bands
+            var i = 0
+            while (i + channels <= samples) {
+                for (c in 0 until channels) {
+                    var x = inputBuffer.getShort() * gain
+                    var s = c * 2
+                    for (b in 0 until count) {
+                        val f = bandArr[b]!!
+                        val y = f.b0 * x + z[s]
+                        z[s] = f.b1 * x - f.a1 * y + z[s + 1]
+                        z[s + 1] = f.b2 * x - f.a2 * y
+                        x = y
+                        s += channels * 2
+                    }
+                    val clamped = when {
+                        x > Short.MAX_VALUE -> Short.MAX_VALUE.toInt()
+                        x < Short.MIN_VALUE -> Short.MIN_VALUE.toInt()
+                        else -> x.roundToInt()
+                    }
+                    out.putShort(clamped.toShort())
+                }
+                i += channels
+            }
+            while (i < samples) {
+                out.putShort(inputBuffer.getShort())
+                i++
+            }
+        } finally {
+            inputBuffer.order(prevOrder)
+        }
+        out.flip()
     }
 
     private fun configure(wanted: SonoraEqualizer.Tuning, sampleRate: Int, channels: Int) {
