@@ -16,6 +16,9 @@ import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.media.ExifInterface
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -90,6 +93,70 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var pendingInstallUpdate: SonoraUpdater.State.Available? = null
     private var updateListener: ((String) -> Unit)? = null
+    @Volatile
+    private var pendingBackupJson: String? = null
+    @Volatile
+    private var isNetworkOnline: Boolean = true
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    private val backupExportLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        val payload = pendingBackupJson
+        pendingBackupJson = null
+        if (uri == null || payload == null) {
+            deliverBackupExportResult(false, "cancelled")
+            return@registerForActivityResult
+        }
+        bgIoExecutor.execute {
+            val ok = try {
+                contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                    out.write(payload.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                } != null
+            } catch (e: Exception) {
+                android.util.Log.e("SonoraBackup", "Export failed", e)
+                false
+            }
+            deliverBackupExportResult(ok, if (ok) "ok" else "write_error")
+        }
+    }
+
+    private val backupImportLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) {
+            deliverBackupImportResult(null, "cancelled")
+            return@registerForActivityResult
+        }
+        bgIoExecutor.execute {
+            val maxBytes = 20L * 1024L * 1024L
+            val content = try {
+                contentResolver.openInputStream(uri)?.use { input ->
+                    val buf = java.io.ByteArrayOutputStream()
+                    val chunk = ByteArray(16384)
+                    var total = 0L
+                    while (true) {
+                        val n = input.read(chunk)
+                        if (n <= 0) break
+                        total += n
+                        if (total > maxBytes) throw java.io.IOException("Backup file too large")
+                        buf.write(chunk, 0, n)
+                    }
+                    buf.toString(Charsets.UTF_8.name())
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("SonoraBackup", "Import read failed", e)
+                null
+            }
+            if (content == null) {
+                deliverBackupImportResult(null, "read_error")
+            } else {
+                deliverBackupImportResult(content, "ok")
+            }
+        }
+    }
 
     private val updatePermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -228,6 +295,7 @@ class MainActivity : AppCompatActivity() {
 
         // Configure YouTube cache/locale before attaching; service startup is deferred until after WebView boot.
         SonoraLocaleManager.attach(this)
+        setupNetworkMonitor()
         com.metrolist.innertube.YouTube.cacheDir = java.io.File(cacheDir, "innertube")
         com.metrolist.innertube.YouTube.locale = SonoraLocaleManager.youtubeLocale()
         SonoraApiInterceptor.attach(this)
@@ -352,12 +420,12 @@ class MainActivity : AppCompatActivity() {
                     val imeDp = if (density > 0) imeInsets.bottom / density else 0f
                     nativeBridge.currentKeyboardHeightDp = imeDp
                     val now = android.os.SystemClock.elapsedRealtime()
-                    val deltaOk = lastAnimImeDp.isNaN() || kotlin.math.abs(imeDp - lastAnimImeDp) >= 4f
-                    if (deltaOk && (lastAnimImePushMs == 0L || now - lastAnimImePushMs >= 32L)) {
+                    val deltaOk = lastAnimImeDp.isNaN() || kotlin.math.abs(imeDp - lastAnimImeDp) >= 0.5f
+                    if (deltaOk && (lastAnimImePushMs == 0L || now - lastAnimImePushMs >= 8L)) {
                         lastAnimImeDp = imeDp
                         lastAnimImePushMs = now
                         webView.evaluateJavascript(
-                            "if (typeof window.updateKeyboardInset === 'function') window.updateKeyboardInset($imeDp);",
+                            "if (typeof window.updateKeyboardInset === 'function') window.updateKeyboardInset($imeDp, true);",
                             null
                         )
                     }
@@ -694,6 +762,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         isUiResumed = false
+        networkCallback?.let { cb ->
+            runCatching { connectivityManager?.unregisterNetworkCallback(cb) }
+        }
+        networkCallback = null
+        connectivityManager = null
         if (SonoraPlaybackService.playbackListener === servicePlaybackListener) {
             SonoraPlaybackService.playbackListener = null
         }
@@ -740,6 +813,87 @@ class MainActivity : AppCompatActivity() {
                 )
             }
         }
+    }
+
+    private fun deliverBackupExportResult(ok: Boolean, status: String) {
+        val qStatus = JSONObject.quote(status)
+        runOnUiThread {
+            if (::webView.isInitialized) {
+                webView.evaluateJavascript(
+                    "if (window.onSonoraBackupExportResult) window.onSonoraBackupExportResult($ok, $qStatus);",
+                    null
+                )
+            }
+        }
+    }
+
+    private fun deliverBackupImportResult(rawJson: String?, status: String) {
+        val qData = if (rawJson != null) JSONObject.quote(rawJson) else "null"
+        val qStatus = JSONObject.quote(status)
+        runOnUiThread {
+            if (::webView.isInitialized) {
+                webView.evaluateJavascript(
+                    "if (window.onSonoraBackupImportData) window.onSonoraBackupImportData($qData, $qStatus);",
+                    null
+                )
+            }
+        }
+    }
+
+    private fun computeNetworkOnline(cm: ConnectivityManager?): Boolean {
+        if (cm == null) return true
+        return try {
+            val net = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(net) ?: return false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ||
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    private fun pushNetworkState(online: Boolean) {
+        val changed = isNetworkOnline != online
+        isNetworkOnline = online
+        if (!changed) return
+        runOnUiThread {
+            if (::webView.isInitialized) {
+                webView.evaluateJavascript(
+                    "if (window.onSonoraNetworkChange) window.onSonoraNetworkChange($online);",
+                    null
+                )
+            }
+        }
+    }
+
+    private fun setupNetworkMonitor() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        connectivityManager = cm
+        isNetworkOnline = computeNetworkOnline(cm)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                pushNetworkState(true)
+            }
+
+            override fun onLost(network: Network) {
+                // Re-query activeNetwork because another transport (e.g. cellular/Wi-Fi) may still be up
+                pushNetworkState(computeNetworkOnline(cm))
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                val ok = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
+                pushNetworkState(ok || computeNetworkOnline(cm))
+            }
+        }
+        networkCallback = cb
+        runCatching { cm.registerDefaultNetworkCallback(cb) }
     }
 
     private fun decodeUriToDataUrl(uri: Uri): String? {
@@ -1269,6 +1423,39 @@ class MainActivity : AppCompatActivity() {
             webView.post {
                 webView.performHapticFeedback(flag, HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING)
             }
+        }
+
+        @JavascriptInterface
+        fun isOnline(): Boolean = isNetworkOnline
+
+        @JavascriptInterface
+        fun exportBackup(jsonData: String, suggestedName: String?): Boolean {
+            if (jsonData.isBlank()) return false
+            val fileName = suggestedName?.trim()?.takeIf { it.isNotEmpty() } ?: "sonora-backup.sonora.json"
+            pendingBackupJson = jsonData
+            runOnUiThread {
+                try {
+                    backupExportLauncher.launch(fileName)
+                } catch (e: Exception) {
+                    pendingBackupJson = null
+                    android.util.Log.e("SonoraBackup", "Failed to open SAF create document", e)
+                    deliverBackupExportResult(false, "launch_error")
+                }
+            }
+            return true
+        }
+
+        @JavascriptInterface
+        fun importBackup(): Boolean {
+            runOnUiThread {
+                try {
+                    backupImportLauncher.launch(arrayOf("application/json", "application/octet-stream", "*/*"))
+                } catch (e: Exception) {
+                    android.util.Log.e("SonoraBackup", "Failed to open SAF open document", e)
+                    deliverBackupImportResult(null, "launch_error")
+                }
+            }
+            return true
         }
 
         @JavascriptInterface

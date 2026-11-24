@@ -23,8 +23,8 @@ android {
         applicationId = "dev.sonora.music"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.0.2-beta"
+        versionCode = 5
+        versionName = "1.0.3-beta"
     }
 
     signingConfigs {
@@ -41,7 +41,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release")
         }

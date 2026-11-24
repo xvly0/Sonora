@@ -69,15 +69,20 @@ vec2 reflectUV(vec2 uv){ vec2 m = mod(abs(uv), 2.0); return mix(m, 2.0 - m, step
 
 vec3 bd(vec2 q, float blurMix){
   vec2 uv = reflectUV(q / uRes);
-  vec3 s;
-  if (blurMix >= 0.999) s = texture2D(uBlur, uv).rgb;
-  else if (blurMix <= 0.001) s = texture2D(uScene, uv).rgb;
-  else s = mix(texture2D(uScene, uv).rgb, texture2D(uBlur, uv).rgb, blurMix);
   if (uUseUI > 0.5) {
     vec4 u = texture2D(uUI, uv);
+    vec3 s;
+    if (blurMix <= 0.001) {
+      s = texture2D(uScene, uv).rgb;
+    } else {
+      float barMask = smoothstep(0.01, 0.08, u.a);
+      s = mix(texture2D(uScene, uv).rgb, texture2D(uBlur, uv).rgb, blurMix * barMask);
+    }
     return u.rgb + s * (1.0 - u.a);
   }
-  return s;
+  if (blurMix >= 0.999) return texture2D(uBlur, uv).rgb;
+  if (blurMix <= 0.001) return texture2D(uScene, uv).rgb;
+  return mix(texture2D(uScene, uv).rgb, texture2D(uBlur, uv).rgb, blurMix);
 }
 vec3 colorControls(vec3 col){
   if (uBright == 0.0 && uContrast == 1.0 && uSat == 1.0) return col;
@@ -113,10 +118,24 @@ void main(){
           float t = clamp(q.y / max(1.0, uTopBlurH), 0.0, 1.0);
           vec3 bHi = texture2D(uBlur, uv).rgb;
           vec3 bMid = texture2D(uTopMid, uv).rgb;
-          float wHi = 1.0 - smoothstep(0.04, 0.68, t);
-          float wMid = (1.0 - smoothstep(0.30, 1.0, t)) * (1.0 - wHi);
-          vec3 blurred = col * (1.0 - wHi - wMid) + bMid * wMid + bHi * wHi;
+          vec2 px = (1.6 * uDpr) / uRes;
+          vec3 bLow = 0.25 * (
+            texture2D(uScene, clamp(uv + vec2(px.x, px.y), 0.0, 1.0)).rgb +
+            texture2D(uScene, clamp(uv + vec2(-px.x, px.y), 0.0, 1.0)).rgb +
+            texture2D(uScene, clamp(uv + vec2(px.x, -px.y), 0.0, 1.0)).rgb +
+            texture2D(uScene, clamp(uv + vec2(-px.x, -px.y), 0.0, 1.0)).rgb
+          );
+          // Smooth 4-stop progressive blur matching original 6-band CSS curve (24px -> 8px -> 2.5px -> sharp)
+          vec3 blurred;
+          if (t < 0.36) {
+            blurred = mix(bHi, bMid, smoothstep(0.08, 0.36, t));
+          } else if (t < 0.72) {
+            blurred = mix(bMid, bLow, smoothstep(0.36, 0.72, t));
+          } else {
+            blurred = mix(bLow, col, smoothstep(0.72, 1.0, t));
+          }
           col = mix(col, blurred, p);
+          // Original smooth top-to-bottom shadow/tint scrim (0.82 -> 0) blended over the progressive blur
           float tintA = 0.82 * (1.0 - t) * p;
           col = mix(col, tb.rgb, tintA);
         }
@@ -213,7 +232,17 @@ void main(){
 }`;
 
   const BVS = 'attribute vec2 a; varying vec2 v; void main(){ v = a * 0.5 + 0.5; gl_Position = vec4(a, 0.0, 1.0); }';
-  const DFS = 'precision mediump float; varying vec2 v; uniform sampler2D uImage; void main(){ gl_FragColor = texture2D(uImage, v); }';
+  const DFS = `
+precision mediump float;
+varying vec2 v; uniform sampler2D uImage; uniform vec2 uTexel;
+void main(){
+  vec4 c = texture2D(uImage, v) * 0.5;
+  c += (texture2D(uImage, v + vec2(-uTexel.x, -uTexel.y))
+      + texture2D(uImage, v + vec2( uTexel.x, -uTexel.y))
+      + texture2D(uImage, v + vec2(-uTexel.x,  uTexel.y))
+      + texture2D(uImage, v + vec2( uTexel.x,  uTexel.y))) * 0.125;
+  gl_FragColor = c;
+}`;
   const BFS = `
 precision mediump float;
 varying vec2 v; uniform sampler2D uImage; uniform vec2 uStep;
@@ -294,7 +323,7 @@ void main(){
         'uBright', 'uContrast', 'uSat', 'uHlStyle', 'uHlColor', 'uHlDir', 'uHlFalloff', 'uHlWidth', 'uHlBlur', 'uHlAlpha', 'uHasInner', 'uInnerColor', 'uInnerOff', 'uInnerR', 'uSurface', 'uTint', 'uShadowC', 'uShadowP', 'uTopBlur', 'uTopBlurPrev', 'uTopBlurH', 'uTopSplit', 'uSheetCut'];
       this.U = {}; names.forEach((n) => { this.U[n] = gl.getUniformLocation(this.prog, n); });
       this.BU = { uImage: gl.getUniformLocation(this.bprog, 'uImage'), uStep: gl.getUniformLocation(this.bprog, 'uStep') };
-      this.DU = { uImage: gl.getUniformLocation(this.dprog, 'uImage') };
+      this.DU = { uImage: gl.getUniformLocation(this.dprog, 'uImage'), uTexel: gl.getUniformLocation(this.dprog, 'uTexel') };
       this.aLoc = gl.getAttribLocation(this.prog, 'a'); this.bLoc = gl.getAttribLocation(this.bprog, 'a'); this.dLoc = gl.getAttribLocation(this.dprog, 'a');
       this.quad = gl.createBuffer(); this.tri = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quad); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1]), gl.STATIC_DRAW);
@@ -308,7 +337,7 @@ void main(){
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0])); return t;
       };
       this.tex = { scene: mk(0), blur: mk(1), overlay: mk(2) };
-      this.texA = mk(3); this.texH = mk(3); this.fboA = gl.createFramebuffer(); this.fboH = gl.createFramebuffer();
+      this.texA = mk(3); this.texH = mk(3); this.texHT = mk(3); this.fboA = gl.createFramebuffer(); this.fboH = gl.createFramebuffer(); this.fboHT = gl.createFramebuffer();
       this.texT = mk(3); this.fboT = gl.createFramebuffer(); this._bl = new Map(); this._ver = 0; this._dsVer = -1;
       gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex.scene);
@@ -355,12 +384,13 @@ void main(){
         gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
         gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
       };
-      if (this._bw !== fw || this._bh !== fh) {
-        alloc(this.texH, this.fboH, hw, hh); alloc(this.texA, this.fboA, fw, fh); alloc(this.texT, this.fboT, fw, fh);
+      if (this._bw !== hw || this._bh !== hh) {
+        alloc(this.texH, this.fboH, hw, hh); alloc(this.texHT, this.fboHT, hw, hh); alloc(this.texA, this.fboA, fw, fh); alloc(this.texT, this.fboT, fw, fh);
         for (const e of this._bl.values()) { gl.deleteTexture(e.tex); gl.deleteFramebuffer(e.fbo); }
-        this._bl.clear(); gl.bindFramebuffer(gl.FRAMEBUFFER, null); this._bw = fw; this._bh = fh; this._dsVer = -1;
+        this._bl.clear(); gl.bindFramebuffer(gl.FRAMEBUFFER, null); this._bw = hw; this._bh = hh; this._dsVer = -1;
       }
       const key = Math.round(radius * 2) / 2; let e = this._bl.get(key);
+      const useHalf = key <= 6.0;
       if (e && e.ver === this._ver && this._dsVer === this._ver) return e.tex;
       if (this._blurFreeze && e) { this._blurStale = true; this._blurMapVer = -1; return e.tex; }
       // Unbind any FBO textures from TEXTURE1/TEXTURE3 before rendering to FBOs (prevents WebGL2 feedback loops)
@@ -370,7 +400,9 @@ void main(){
         gl.useProgram(this.dprog); gl.disable(gl.BLEND);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.tri); gl.enableVertexAttribArray(this.dLoc); gl.vertexAttribPointer(this.dLoc, 2, gl.FLOAT, false, 0, 0);
         gl.uniform1i(this.DU.uImage, 0);
+        gl.uniform2f(this.DU.uTexel, 1.0 / cw, 1.0 / ch);
         gl.viewport(0, 0, hw, hh); gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboH); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex.scene); gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.uniform2f(this.DU.uTexel, 1.0 / hw, 1.0 / hh);
         gl.viewport(0, 0, fw, fh); gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboA); gl.bindTexture(gl.TEXTURE_2D, this.texH); gl.drawArrays(gl.TRIANGLES, 0, 3);
         this._dsVer = this._ver;
         this._bprogBound = false;
@@ -395,15 +427,24 @@ void main(){
         gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        alloc(tex, fbo, fw, fh); e = { tex, fbo, ver: -1 }; this._bl.set(key, e);
+        alloc(tex, fbo, useHalf ? hw : fw, useHalf ? hh : fh); e = { tex, fbo, ver: -1 }; this._bl.set(key, e);
       }
-      if (radius <= 5.0) {
-        const s = radius * 0.116;
-        pass(this.texA, this.fboT, fw, fh, s / fw, 0); pass(this.texT, e.fbo, fw, fh, 0, s / fh);
+      if (useHalf) {
+        // Half-res blur for light glass (tabbar/miniplayer/buttons): 4x more pixels + Dual-Kawase prefilter eliminates white-text shimmer
+        const passes = radius > 4.5 ? 2 : 1;
+        const s = (radius * 0.232) / Math.sqrt(passes);
+        pass(this.texH, this.fboHT, hw, hh, s / hw, 0); pass(this.texHT, e.fbo, hw, hh, 0, s / hh);
+        if (passes > 1) {
+          pass(e.tex, this.fboHT, hw, hh, s / hw, 0); pass(this.texHT, e.fbo, hw, hh, 0, s / hh);
+        }
       } else {
-        const s = radius * 0.082;
+        // Clamp per-pass step <= 1.2 quarter-res px and chain passes to stay Nyquist-clean (zero ghosting/striping)
+        const passes = radius > 18.0 ? 4 : (radius > 10.0 ? 3 : 2);
+        const s = Math.min(1.2, (radius * 0.145) / Math.sqrt(passes));
         pass(this.texA, this.fboT, fw, fh, s / fw, 0); pass(this.texT, e.fbo, fw, fh, 0, s / fh);
-        pass(e.tex, this.fboT, fw, fh, s / fw, 0); pass(this.texT, e.fbo, fw, fh, 0, s / fh);
+        for (let pi = 1; pi < passes; pi++) {
+          pass(e.tex, this.fboT, fw, fh, s / fw, 0); pass(this.texT, e.fbo, fw, fh, 0, s / fh);
+        }
       }
       e.ver = this._ver; gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex.scene);
@@ -459,11 +500,13 @@ void main(){
       const tbProg = (this.topBlur && this.topBlur[3]) || 0;
       const tbPrevProg = (this.topBlurPrev && this.topBlurPrev[3]) || 0;
       const hasTopBlur = tbProg > 0.001 || tbPrevProg > 0.001;
-      const tbBlurKey = Math.round(14 * dpr * 2) / 2;
+      const tbBlurKey = Math.round(16 * dpr * 2) / 2;
+      const tbMidKey = Math.round(6 * dpr * 2) / 2;
       this._blurStale = false;
       this._inBlurBatch = true; this._bprogBound = false;
-      if (hasTopBlur && !blurTex.has(tbBlurKey)) {
-        blurTex.set(tbBlurKey, this._blurTex(tbBlurKey));
+      if (hasTopBlur) {
+        if (!blurTex.has(tbBlurKey)) blurTex.set(tbBlurKey, this._blurTex(tbBlurKey));
+        if (!blurTex.has(tbMidKey)) blurTex.set(tbMidKey, this._blurTex(tbMidKey));
       }
       for (let i = 0; i < list.length; i++) {
         const b = (list[i].get('blur') || 0) * dpr;
@@ -474,6 +517,7 @@ void main(){
       }
       this._inBlurBatch = false; this._bprogBound = false;
       const tbTex = hasTopBlur ? blurTex.get(tbBlurKey) : null;
+      const tbMidTex = hasTopBlur ? blurTex.get(tbMidKey) : null;
       let boundBlurTex = null;
 
       gl.useProgram(this.prog); gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, cw, ch);
@@ -486,7 +530,7 @@ void main(){
       gl.uniform1f(U.uTopSplit, (this.topBlurSplit || 0) * dpr);
       if (hasTopBlur && tbTex) {
         gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tbTex); boundBlurTex = tbTex;
-        gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this._dsVer === this._ver ? this.texA : tbTex);
+        gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, tbMidTex || tbTex);
       } else {
         gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.tex.blur);
       }

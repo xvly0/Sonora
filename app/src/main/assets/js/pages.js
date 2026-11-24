@@ -340,7 +340,12 @@ function songRow(c, P, y, t, list, idx, o) {
     c.restore();
     if (isSw) c.restore();
     const swMeta = { rowTrack: t, rowKey: rKey, pressKey: pk };
-    hit(0, y, W - 60, h, () => { if (o.single) playOne(t); else playList(list, idx); }, swMeta);
+    hit(0, y, W - 60, h, () => {
+      if (P && P.kind === 'search' && typeof addSearchHistoryItem === 'function') {
+        addSearchHistoryItem(t);
+      }
+      if (o.single) playOne(t); else playList(list, idx);
+    }, swMeta);
     const sy = y + h / 2 + T.y;
     hit(W - 60, y, 60, h, () => {
       let ctx = 'search', meta = {};
@@ -1486,7 +1491,13 @@ function drawTintedFilterChips(c, P, y, railId, filters, curF, animState, chipPr
 }
 function searchFilters(c, P, y) {
   return drawTintedFilterChips(c, P, y, 'sfilt', getSearchFilters(), NAV.sFilter || 'all', _searchChipAnim, 's_chip', id => {
-    if (NAV.sFilter !== id) { NAV.sFilter = id; P.scroll = 0; P.vel = 0; redraw(); }
+    if (NAV.sFilter !== id) {
+      NAV.sFilter = id;
+      P.scroll = 0;
+      P.vel = 0;
+      if (typeof LIVE !== 'undefined' && LIVE) LIVE._searchResFadeT0 = performance.now();
+      redraw();
+    }
   }, { noTopBar: true }) + 12;
 }
 function searchHead(c, P, y, s) {
@@ -1986,7 +1997,7 @@ PAGES.settings = (c, P) => {
     const pCtrl = lqCtrl('prev_nav', (P.prevTab || 0) / 3);
     if (!pCtrl.pressed) pCtrl.val.t = (P.prevTab || 0) / 3;
     const pVal = clamp(pCtrl.val.x, 0, 1) * 3, pPP = clamp(pCtrl.pp.x, 0, 1);
-    const pVel = pCtrl.vel.x / 10, pVx = clamp(pVel * .75, -.2, .2), pVy = clamp(pVel * .25, -.2, .2);
+    const pVel = Math.abs(pCtrl.vel.x) / 10, pVx = clamp(pVel * .35, 0, .11), pVy = clamp(pVel * .12, 0, .06);
     const pScale = 1 + (74 / 56 - 1) * pPP;
     const pSx = pScale / (1 - pVx), pSy = pScale * (1 - pVy);
     const barX = px + 18, barW = pw - 36, barH = 58, barY = y + ph - barH - 16;
@@ -2039,7 +2050,7 @@ PAGES.settings = (c, P) => {
           kind: 'prevBar',
           cardX: px + T.x, cardY: y + T.y, cardW: pw, cardH: ph,
           x: barX + T.x, y: barY + T.y, w: barW, h: barH,
-          tw, pVal, pPP, bCx: bCx + T.x, bCy: bCy + T.y, bHw, bHh, slosh: pCtrl.vel.x * tw * .02
+          tw, pVal, pPP, bCx: bCx + T.x, bCy: bCy + T.y, bHw, bHh, slosh: pCtrl.vel.x * tw * .014
         });
       }
       const barSpan = Math.max(1, barW - tw);
@@ -2205,6 +2216,16 @@ PAGES.settings = (c, P) => {
       });
     }
     y += chH + 18;
+
+    eyebrow(c, t('settings.backup_section'), 26, y + 12); y += 22;
+    pillBtn(c, 20, y, W - 40, 48, t('settings.backup_export'), 'share', () => {
+      if (typeof window.exportLibraryBackup === 'function') window.exportLibraryBackup();
+    });
+    y += 58;
+    pillBtn(c, 20, y, W - 40, 48, t('settings.backup_import'), 'down', () => {
+      if (typeof window.importLibraryBackup === 'function') window.importLibraryBackup();
+    });
+    y += 66;
 
     eyebrow(c, t('settings.storage_actions'), 26, y + 12); y += 22;
     pillBtn(c, 20, y, W - 40, 48, t('settings.storage_import'), 'folder', () => { if (typeof pickLocalAudio === 'function') pickLocalAudio(); });

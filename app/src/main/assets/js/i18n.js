@@ -98,13 +98,20 @@
 
       // Prompt modal & playlist creation
       'prompt.new_playlist_title': 'Nuova playlist',
-      'prompt.new_playlist_sub': 'Crea una nuova raccolta personale',
+      'prompt.new_playlist_sub': 'Inserisci un titolo o incolla un link YouTube Music / Spotify',
       'prompt.rename_playlist_sub': 'Scegli un nuovo titolo per la raccolta',
-      'prompt.playlist_placeholder': 'Titolo della playlist',
+      'prompt.playlist_placeholder': 'Titolo o link playlist…',
       'prompt.cancel': 'Annulla',
       'prompt.create': 'Crea',
+      'prompt.import': 'Importa',
       'prompt.save': 'Salva',
       'prompt.new_playlist_btn': '+ Nuova playlist',
+      'prompt.importing_title': 'Importazione playlist',
+      'prompt.importing_sub': 'Risolvo i brani dal link…',
+      'prompt.import_download_title': 'Playlist importata',
+      'prompt.import_download_msg': 'Importati {count} brani in “{name}”. Vuoi scaricarli per l’ascolto offline?',
+      'prompt.not_now': 'Non ora',
+      'prompt.download_now': 'Scarica',
 
       // Toasts
       'toast.browser_blocked': 'Riproduzione bloccata dal browser: tocca play',
@@ -152,6 +159,25 @@
       'toast.cache_cleared': 'Cache svuotata',
       'toast.recs_error': 'Errore caricamento consigli',
       'toast.locale_updated': 'Lingua e regione aggiornate',
+      'toast.backup_exported': 'Backup libreria esportato',
+      'toast.backup_export_failed': 'Impossibile esportare il backup',
+      'toast.backup_restored': 'Libreria ripristinata dal backup',
+      'toast.backup_invalid': 'File di backup non valido',
+      'toast.offline_mode': 'Modalità offline attiva',
+      'toast.back_online': 'Connessione ripristinata',
+      'toast.playlist_imported': 'Importati {count} brani in “{name}”',
+      'toast.playlist_import_failed': 'Importazione non riuscita: {err}',
+
+      // Offline mode & Search history
+      'offline.title': 'Sei offline',
+      'offline.sub': 'Ascolta i brani scaricati e i file locali senza connessione',
+      'offline.downloads_btn': 'Download ({count})',
+      'offline.local_btn': 'File locali ({count})',
+      'offline.no_downloads': 'Nessun brano scaricato disponibile offline',
+      'offline.search_badge': 'Risultati offline (Download e file locali)',
+      'search.recent_title': 'DALLE TUE RICERCHE',
+      'search.clear_history': 'Svuota',
+      'search.suggestions': 'Suggerimenti',
 
       // Downloads
       'download.loading_tracks': 'Caricamento brani…',
@@ -467,6 +493,12 @@
       'settings.storage_covers_sub': '{count} immagini · {mb} MB',
       'settings.storage_lyrics_sub': '{count} testi · {mb} MB',
       'settings.storage_actions': 'AZIONI ARCHIVIO',
+      'settings.backup_section': 'BACKUP LIBRERIA',
+      'settings.backup_export': 'Esporta backup libreria (.sonora)',
+      'settings.backup_import': 'Ripristina libreria da backup',
+      'backup.confirm_title': 'Ripristina backup',
+      'backup.confirm_msg': 'Ripristinare {playlists} playlist, {favs} preferiti e {pins} fissati? I dati locali attuali verranno sostituiti.',
+      'backup.restore_btn': 'Ripristina',
       'settings.storage_import': 'Importa file audio dal dispositivo',
       'settings.storage_clear': 'Svuota cache audio, testi e copertine',
       'settings.updates_section': 'AGGIORNAMENTI',
@@ -480,7 +512,7 @@
       'update.installing': 'Aspetto la tua conferma',
       'update.needs_permission': 'Consenti l’installazione — tocca',
       'update.failed': 'Non adesso — tocca per riprovare',
-      'settings.version_label': 'Sonora v1.0.2-beta · LiquidGlass',
+      'settings.version_label': 'Sonora v1.0.3-beta · LiquidGlass',
 
       // Language & Region settings
       'settings.lang_section_app': 'LINGUA INTERFACCIA',
@@ -563,13 +595,20 @@
 
       // Prompt modal & playlist creation
       'prompt.new_playlist_title': 'New Playlist',
-      'prompt.new_playlist_sub': 'Create a new personal collection',
+      'prompt.new_playlist_sub': 'Enter a title or paste a YouTube Music / Spotify link',
       'prompt.rename_playlist_sub': 'Choose a new title for this collection',
-      'prompt.playlist_placeholder': 'Playlist title',
+      'prompt.playlist_placeholder': 'Playlist title or link…',
       'prompt.cancel': 'Cancel',
       'prompt.create': 'Create',
+      'prompt.import': 'Import',
       'prompt.save': 'Save',
       'prompt.new_playlist_btn': '+ New Playlist',
+      'prompt.importing_title': 'Importing playlist',
+      'prompt.importing_sub': 'Matching tracks from link…',
+      'prompt.import_download_title': 'Playlist imported',
+      'prompt.import_download_msg': 'Imported {count} tracks into “{name}”. Download them for offline listening?',
+      'prompt.not_now': 'Not now',
+      'prompt.download_now': 'Download',
 
       // Toasts
       'toast.browser_blocked': 'Playback blocked by browser: tap play',
@@ -617,6 +656,25 @@
       'toast.cache_cleared': 'Cache cleared',
       'toast.recs_error': 'Error loading recommendations',
       'toast.locale_updated': 'Language and region updated',
+      'toast.backup_exported': 'Library backup exported',
+      'toast.backup_export_failed': 'Could not export backup',
+      'toast.backup_restored': 'Library restored from backup',
+      'toast.backup_invalid': 'Invalid backup file',
+      'toast.offline_mode': 'Offline mode active',
+      'toast.back_online': 'Back online',
+      'toast.playlist_imported': 'Imported {count} tracks into “{name}”',
+      'toast.playlist_import_failed': 'Import failed: {err}',
+
+      // Offline mode & Search history
+      'offline.title': 'You’re offline',
+      'offline.sub': 'Listen to downloaded songs and local files without connection',
+      'offline.downloads_btn': 'Downloads ({count})',
+      'offline.local_btn': 'Local files ({count})',
+      'offline.no_downloads': 'No downloaded songs available offline',
+      'offline.search_badge': 'Offline results (Downloads & local files)',
+      'search.recent_title': 'FROM YOUR SEARCHES',
+      'search.clear_history': 'Clear',
+      'search.suggestions': 'Suggestions',
 
       // Downloads
       'download.loading_tracks': 'Loading tracks…',
@@ -932,6 +990,12 @@
       'settings.storage_covers_sub': '{count} images · {mb} MB',
       'settings.storage_lyrics_sub': '{count} lyrics · {mb} MB',
       'settings.storage_actions': 'STORAGE ACTIONS',
+      'settings.backup_section': 'LIBRARY BACKUP',
+      'settings.backup_export': 'Export library backup (.sonora)',
+      'settings.backup_import': 'Restore library from backup',
+      'backup.confirm_title': 'Restore backup',
+      'backup.confirm_msg': 'Restore {playlists} playlists, {favs} favorites, and {pins} pins? Current local library data will be replaced.',
+      'backup.restore_btn': 'Restore',
       'settings.storage_import': 'Import audio files from device',
       'settings.storage_clear': 'Clear audio, lyrics & cover cache',
       'settings.updates_section': 'UPDATES',
@@ -945,7 +1009,7 @@
       'update.installing': 'Waiting for you to confirm',
       'update.needs_permission': 'Allow installing — tap',
       'update.failed': 'Not now — tap to retry',
-      'settings.version_label': 'Sonora v1.0.2-beta · LiquidGlass',
+      'settings.version_label': 'Sonora v1.0.3-beta · LiquidGlass',
 
       // Language & Region settings
       'settings.lang_section_app': 'INTERFACE LANGUAGE',

@@ -116,6 +116,10 @@ function _redrawAfterArt(it) {
   const cTr = typeof cur === 'function' ? cur() : null;
   const isCur = Boolean(it && cTr && (cTr.id === it.id || (it.kind === 'album' && cTr.album === it.id)));
   const isCm = Boolean(typeof CM !== 'undefined' && CM && CM.open && CM.tr && it && CM.tr.id === it.id);
+  if (typeof _scheduleCoverDirty === 'function') {
+    _scheduleCoverDirty(isCur || isCm);
+    return;
+  }
   if (isCur || isCm) {
     if (typeof redraw === 'function') redraw();
   } else if (typeof SH !== 'undefined' && SH && SH.t >= 0.999 && typeof redrawSheetContent === 'function') {
@@ -139,7 +143,7 @@ function _enqueueArtUp(target, pri) {
     if (!_artUpTimer) {
       const busy = _isScrollOrAnimBusy();
       if ((typeof window !== 'undefined' && window.__IN_DRAW_SCENE) || busy) {
-        if (typeof setTimeout === 'function') _artUpTimer = setTimeout(_pumpArtUpQ, busy ? 28 : 0);
+        if (typeof setTimeout === 'function') _artUpTimer = setTimeout(_pumpArtUpQ, busy ? 140 : 16);
       } else {
         _pumpArtUpQ();
       }
@@ -157,7 +161,11 @@ function _pumpArtUpQ() {
   _artUpTimer = 0;
   if (!_artUpQ.length) return;
   const busy = _isScrollOrAnimBusy();
-  const maxConc = busy ? 2 : 6;
+  if (busy) {
+    if (typeof setTimeout === 'function') _artUpTimer = setTimeout(_pumpArtUpQ, 140);
+    return;
+  }
+  const maxConc = 4;
   while (_artUpAct < maxConc && _artUpQ.length) {
     const it = _artUpQ.shift();
     if (!it) continue;
@@ -253,7 +261,7 @@ function _pumpArtUpQ() {
     }).finally(() => {
       _artUpAct = Math.max(0, _artUpAct - 1);
       if (_artUpQ.length && !_artUpTimer && typeof setTimeout === 'function') {
-        _artUpTimer = setTimeout(_pumpArtUpQ, _isScrollOrAnimBusy() ? 36 : 0);
+        _artUpTimer = setTimeout(_pumpArtUpQ, _isScrollOrAnimBusy() ? 140 : 0);
       }
     });
   }
@@ -450,7 +458,7 @@ function artFadeAlpha(im) {
   const now = performance.now();
   if (im._fadePending) {
     im._fadePending = false;
-    if (im._loadedAt && (now - im._loadedAt) < 600) {
+    if (!_isScrollOrAnimBusy() && im._loadedAt && (now - im._loadedAt) < 600) {
       im._t0 = now;
     } else {
       im._t0 = 0;
@@ -458,6 +466,10 @@ function artFadeAlpha(im) {
     }
   }
   if (!im._t0) return 1;
+  if (_isScrollOrAnimBusy()) {
+    im._t0 = 0;
+    return 1;
+  }
   const dt = now - im._t0;
   const dur = 180;
   if (dt >= dur) {
@@ -495,8 +507,9 @@ function drawRowPressTint(c, key, x, y, w, h, rad) {
   else c.fillRect(x, y, w, h);
   c.restore();
 }
-let _tileBudgetRaf = 0, _tileBuiltFrame = 0;
+let _tileBudgetRaf = 0, _tileBuiltFrame = 0, _tileIdleTimer = 0;
 const _TILE_LRU = new Map(), _TILE_LRU_MAX = 96;
+const _tileBuildQ = [], _tileBuildSet = new Set();
 function _evictOldestTile() {
   const first = _TILE_LRU.keys().next();
   if (first.done) return;
@@ -509,64 +522,115 @@ function _evictOldestTile() {
     if (entry.cv && 'width' in entry.cv) { try { entry.cv.width = entry.cv.height = 0; } catch (e) {} }
   }
 }
+function _bakeArtTile(im, s, rad, pw, key) {
+  if (!im || !im._real || im.width <= 0 || pw <= 0) return null;
+  if (im._tiles && im._tiles[key]) return im._tiles[key];
+  const tc = document.createElement('canvas');
+  tc.width = tc.height = pw;
+  const tx = tc.getContext('2d');
+  const sx = pw / s;
+  tx.save();
+  tx.scale(sx, sx);
+  rrPath(tx, 0, 0, s, s, rad);
+  tx.clip();
+  tx.drawImage(im, 0, 0, s, s);
+  tx.restore();
+  tx.save();
+  tx.scale(sx, sx);
+  rrPath(tx, .5, .5, s - 1, s - 1, rad);
+  tx.lineWidth = 1;
+  tx.strokeStyle = 'rgba(128,128,128,.22)';
+  tx.stroke();
+  tx.restore();
+  try {
+    if (!im._tiles) im._tiles = {};
+    const tKeys = Object.keys(im._tiles);
+    if (tKeys.length >= 3) {
+      const oldKey = tKeys[0];
+      const oldT = im._tiles[oldKey];
+      delete im._tiles[oldKey];
+      if (oldT) {
+        if (oldT._lruId != null) _TILE_LRU.delete(oldT._lruId);
+        if ('width' in oldT) { try { oldT.width = oldT.height = 0; } catch (e) {} }
+      }
+    }
+    while (_TILE_LRU.size >= _TILE_LRU_MAX) _evictOldestTile();
+    const lruId = ++_TILE_LRU_SEQ;
+    tc._lruId = lruId;
+    _TILE_LRU.set(lruId, { im, key, cv: tc });
+    im._tiles[key] = tc;
+  } catch (e) {}
+  return tc;
+}
+function _pumpTileBuildQ() {
+  _tileIdleTimer = 0;
+  if (!_tileBuildQ.length) return;
+  if (_isScrollOrAnimBusy()) {
+    _tileIdleTimer = setTimeout(_pumpTileBuildQ, 120);
+    return;
+  }
+  const t0 = performance.now();
+  let built = 0;
+  while (_tileBuildQ.length && built < 2 && (performance.now() - t0) < 2.0) {
+    const job = _tileBuildQ.shift();
+    if (!job) continue;
+    _tileBuildSet.delete(job.qKey);
+    if (job.im && job.im._real && job.im.width > 0 && !(job.im._tiles && job.im._tiles[job.key])) {
+      _bakeArtTile(job.im, job.s, job.rad, job.pw, job.key);
+      built++;
+    }
+  }
+  if (_tileBuildQ.length) {
+    _tileIdleTimer = setTimeout(_pumpTileBuildQ, 16);
+  }
+}
+function _enqueueTileBake(im, s, rad, pw, key) {
+  if (!im || !im._real || im.width <= 0 || pw <= 0) return;
+  if (im._tiles && im._tiles[key]) return;
+  const qKey = (im._url || '') + '|' + key;
+  if (_tileBuildSet.has(qKey)) return;
+  if (_tileBuildQ.length >= 48) {
+    const dropped = _tileBuildQ.shift();
+    if (dropped) _tileBuildSet.delete(dropped.qKey);
+  }
+  _tileBuildSet.add(qKey);
+  _tileBuildQ.push({ im, s, rad, pw, key, qKey });
+  if (!_tileIdleTimer && typeof setTimeout === 'function') {
+    _tileIdleTimer = setTimeout(_pumpTileBuildQ, _isScrollOrAnimBusy() ? 120 : 24);
+  }
+}
 function drawArt(c, item, x, y, s, r) {
   const im = artOf(item);
   const rad = r == null ? Math.max(4, s * .07) : r;
   const a = (im && im._real) ? artFadeAlpha(im) : 1;
-  if (a >= 0.999 && s <= 240 && Math.abs(s - Math.round(s)) < 0.01 && im && im._real && im.width > 0) {
+  if (s <= 240 && Math.abs(s - Math.round(s)) < 0.01 && im && im._real && im.width > 0) {
     const dpr = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 2, 2);
     const pw = Math.round(s * dpr), pr = Math.round(rad * dpr), key = pw + ':' + pr;
     let tc = im._tiles && im._tiles[key];
     const busy = _isScrollOrAnimBusy();
-    const fastScroll = busy && ((typeof INP !== 'undefined' && INP && INP.down) ||
-      (typeof topPage === 'function' && topPage() && Math.abs(topPage().vel || 0) > 180) ||
-      (typeof NAV !== 'undefined' && NAV && (NAV.popP > 0.01 || NAV.pushP > 0.01 || NAV.popT > 0.01)) ||
-      (typeof _tabTrans !== 'undefined' && _tabTrans && _tabTrans.active) ||
-      (typeof SH !== 'undefined' && SH && (SH.drag || (SH.t > 0.01 && SH.t < 0.99))));
-    const frameCap = busy ? 1 : 3;
-    if (!tc && !fastScroll && _tileBuiltFrame < frameCap && pw > 0) {
-      if (!_tileBudgetRaf && typeof requestAnimationFrame === 'function') {
-        _tileBudgetRaf = requestAnimationFrame(() => { _tileBudgetRaf = 0; _tileBuiltFrame = 0; });
-      }
-      _tileBuiltFrame++;
-      tc = document.createElement('canvas');
-      tc.width = tc.height = pw;
-      const tx = tc.getContext('2d');
-      const sx = pw / s;
-      tx.save();
-      tx.scale(sx, sx);
-      rrPath(tx, 0, 0, s, s, rad);
-      tx.clip();
-      tx.drawImage(im, 0, 0, s, s);
-      tx.restore();
-      tx.save();
-      tx.scale(sx, sx);
-      rrPath(tx, .5, .5, s - 1, s - 1, rad);
-      tx.lineWidth = 1;
-      tx.strokeStyle = 'rgba(128,128,128,.22)';
-      tx.stroke();
-      tx.restore();
-      try {
-        if (!im._tiles) im._tiles = {};
-        const tKeys = Object.keys(im._tiles);
-        if (tKeys.length >= 3) {
-          const oldKey = tKeys[0];
-          const oldT = im._tiles[oldKey];
-          delete im._tiles[oldKey];
-          if (oldT) {
-            if (oldT._lruId != null) _TILE_LRU.delete(oldT._lruId);
-            if ('width' in oldT) { try { oldT.width = oldT.height = 0; } catch (e) {} }
-          }
+    if (!tc && pw > 0) {
+      if (!busy && a >= 0.999 && _tileBuiltFrame < 2) {
+        if (!_tileBudgetRaf && typeof requestAnimationFrame === 'function') {
+          _tileBudgetRaf = requestAnimationFrame(() => { _tileBudgetRaf = 0; _tileBuiltFrame = 0; });
         }
-        while (_TILE_LRU.size >= _TILE_LRU_MAX) _evictOldestTile();
-        const lruId = ++_TILE_LRU_SEQ;
-        tc._lruId = lruId;
-        _TILE_LRU.set(lruId, { im, key, cv: tc });
-        im._tiles[key] = tc;
-      } catch (e) {}
+        _tileBuiltFrame++;
+        tc = _bakeArtTile(im, s, rad, pw, key);
+      } else {
+        _enqueueTileBake(im, s, rad, pw, key);
+      }
     }
     if (tc) {
+      if (a >= 0.999) {
+        c.drawImage(tc, x, y, s, s);
+        return;
+      }
+      c.save();
+      rrPath(c, x, y, s, s, rad);
+      c.fillStyle = (typeof pal !== 'undefined' && pal && !pal.dark) ? '#e6e6ec' : '#18181c';
+      c.fill();
+      c.globalAlpha *= a;
       c.drawImage(tc, x, y, s, s);
+      c.restore();
       return;
     }
   }
@@ -1022,6 +1086,20 @@ function icon(c, n, x, y, s, col, o) {
       c.stroke();
       break;
     }
+    case 'wifi-off':
+      c.lineWidth = o.lw || 2;
+      c.beginPath(); c.arc(0, 6.2, 1.5, 0, TAU); c.fill();
+      c.beginPath(); c.arc(0, 6.2, 6.4, -Math.PI * .76, -Math.PI * .24); c.stroke();
+      c.beginPath(); c.arc(0, 6.2, 11.2, -Math.PI * .76, -Math.PI * .24); c.stroke();
+      c.beginPath(); c.moveTo(-9, -8.5); c.lineTo(9, 9.5); c.stroke();
+      break;
+    case 'arrow-ul':
+      c.lineWidth = o.lw || 2.1;
+      c.beginPath();
+      c.moveTo(6.5, 6.5); c.lineTo(-5.5, -5.5);
+      c.moveTo(-5.5, 2.5); c.lineTo(-5.5, -5.5); c.lineTo(2.5, -5.5);
+      c.stroke();
+      break;
   }
   c.restore();
 }

@@ -608,6 +608,28 @@ function _lyQuantBlur(blurPx) {
 function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
   const sPos = PL.sPos != null ? PL.sPos : PL.pos;
   const objs = lyObjs(t);
+  const isPlaceholder = Boolean(objs.length === 1 && objs[0] && objs[0]._placeholder);
+  const nowLy = performance.now();
+  if (!SH._lyTrans || SH._lyTrans.tid !== t.id) {
+    SH._lyTrans = { tid: t.id, wasPh: isPlaceholder, t0: 0, loadText: isPlaceholder ? (objs[0].text || '') : '' };
+  } else if (isPlaceholder) {
+    SH._lyTrans.wasPh = true;
+    SH._lyTrans.t0 = 0;
+    SH._lyTrans.loadText = objs[0].text || SH._lyTrans.loadText;
+  } else if (SH._lyTrans.wasPh) {
+    SH._lyTrans.wasPh = false;
+    SH._lyTrans.t0 = nowLy;
+  }
+  const lyTrP = SH._lyTrans.t0 ? clamp((nowLy - SH._lyTrans.t0) / 340, 0, 1) : 1;
+  if (lyTrP >= 1 && SH._lyTrans.t0) SH._lyTrans.t0 = 0;
+  if (lyTrP < 1) {
+    if (typeof scheduleSceneAnimRedraw === 'function') scheduleSceneAnimRedraw();
+    else if (typeof scheduleAnimRedraw === 'function') scheduleAnimRedraw();
+  }
+  const lyInP = lyTrP < 1 ? clamp((lyTrP - 0.10) / 0.90, 0, 1) : 1;
+  const lyInE = lyInP < 1 ? (1 - Math.pow(1 - lyInP, 3)) : 1;
+  const lyShiftY = (1 - lyInE) * 14;
+  const effFadeAlpha = fadeAlpha * lyInE;
   const mw = W - 48, lay = lyLayout(c, t, objs, mw), blocks = lay.blocks, times = lay.times;
   if (SH.lSnap) SH.lyLay = lay;
   let ci = -1;
@@ -667,12 +689,23 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
     }
   }
   const ink = shInk(t);
+  if (lyTrP < 0.45 && SH._lyTrans && SH._lyTrans.loadText) {
+    const uOut = clamp(lyTrP / 0.45, 0, 1);
+    const outA = (1 - uOut) * (1 - uOut) * fadeAlpha;
+    if (outA > 0.005) {
+      c.save();
+      c.globalAlpha *= outA;
+      txt(c, SH._lyTrans.loadText, 24, L.regTop + 20 + LY_FS - 8 - uOut * 8, F(700, LY_FS), ink.hi, 'left', mw);
+      c.restore();
+    }
+  }
+  if (lyShiftY > 0.05) c.translate(0, lyShiftY);
   if (introVis) {
     const iy = L.regTop + 20 + introH * 0.5 - SH.lScroll;
     if (iy >= L.regTop - 40 && iy <= L.regBot + 40) {
       const edge = lyEdgeY(L, iy);
       c.save();
-      c.globalAlpha *= fadeAlpha * edge;
+      c.globalAlpha *= effFadeAlpha * edge;
       drawWavyRingLoader(c, W / 2, iy, 36, introProg, introAlpha, sPos, ink);
       c.restore();
     }
@@ -694,7 +727,7 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
         if (gy >= L.regTop - 40 && gy <= L.regBot + 40) {
           const edge = lyEdgeY(L, gy);
           c.save();
-          c.globalAlpha *= fadeAlpha * edge;
+          c.globalAlpha *= effFadeAlpha * edge;
           drawWavyRingLoader(c, W / 2, gy, 36, gs.prog, gs.alpha, sPos, ink);
           c.restore();
         }
@@ -731,10 +764,10 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
         if (needsBuild) blurBuiltThisFrame++;
         const cv = drawBlurredLyBlock(c, b, Math.max(.34, effBlur), fnt, fb, ink);
         const bw = b._bW || W, bPad = b._bPad || _LY_BLUR_PAD, bH = b._bH || bh, dy = byTop - bPad;
-        const al = distFade * fadeAlpha * blurW;
+        const al = distFade * effFadeAlpha * blurW;
         if (al > .004) drawLyMasked(c, cv, dy, bw, bH, al, L);
         if (blurW >= .995 && actK < .02) {
-          if (REG && activeHit && fadeAlpha > .5 && byBot > L.regTop && byTop < L.regBot) {
+          if (REG && activeHit && effFadeAlpha > .5 && byBot > L.regTop && byTop < L.regBot) {
             const cy0 = Math.max(L.regTop, byTop), cy1 = Math.min(L.regBot, byBot);
             shit(0, cy0, W, cy1 - cy0, () => seek((times[i] || 0) + .2), 'lyrics');
           }
@@ -751,7 +784,7 @@ function drawLyrics(c, t, L, fadeAlpha = 1, activeHit = true) {
         /* match the exact edge fade curve of the cached blurred pass (lyEdgeY) to avoid any opacity jump on handoff */
         const edge = isAnim ? lyEdgeY(L, yy - 12) : (clamp((yy - L.regTop) / 48, 0, 1) * clamp((L.regBot - yy + 30) / 70, 0, 1));
         c.save();
-        c.globalAlpha = edge * distFade * fadeAlpha * paintK;
+        c.globalAlpha = edge * distFade * effFadeAlpha * paintK;
         if (lineSc !== 1 && !bgl) { c.translate(24, blockMidY); c.scale(lineSc, lineSc); c.translate(-24, -blockMidY); }
         for (let ri = 0; ri < r.it.length; ri++) {
           const it = r.it[ri];
@@ -1446,55 +1479,104 @@ function drawQueue(c, L, fadeAlpha = 1) {
     }
   };
   txt(qc, window.t('queue.up_next'), 24, base + 14, F(700, 18), qInk.hi);
+  const nowMs = performance.now();
   const subTxt = (PL.shuffle && PL.smartShuffle) ? window.t('queue.smart_shuffle_sub') : (PL.infinity ? window.t('queue.autoplay_sub') : window.t('queue.end_sub'));
-  txt(qc, subTxt, 24, base + 34, F(400, 14), qInk.rgba(.62, true));
+  if (!SH._qSubText) {
+    SH._qSubText = subTxt;
+  } else if (SH._qSubText !== subTxt) {
+    SH._qSubPrev = SH._qSubText;
+    SH._qSubText = subTxt;
+    SH._qSubFadeT0 = nowMs;
+  }
+  const subDt = SH._qSubFadeT0 ? Math.max(0, nowMs - SH._qSubFadeT0) : 9999;
+  if (SH._qSubFadeT0 && subDt < 220 && SH._qSubPrev) {
+    const sp = clamp(subDt / 220, 0, 1);
+    const sep = 1 - Math.pow(1 - sp, 3);
+    qc.save(); qc.globalAlpha *= (1 - sep);
+    txt(qc, SH._qSubPrev, 24, base + 34 - sep * 3, F(400, 14), qInk.rgba(.62, true));
+    qc.restore();
+    qc.save(); qc.globalAlpha *= sep;
+    txt(qc, subTxt, 24, base + 34 + (1 - sep) * 3, F(400, 14), qInk.rgba(.62, true));
+    qc.restore();
+    if (typeof _skulletActive !== 'undefined') _skulletActive = true;
+    if (typeof window !== 'undefined' && window.__IN_DRAW_SCENE && typeof scheduleSceneAnimRedraw === 'function') scheduleSceneAnimRedraw();
+    else if (typeof scheduleAnimRedraw === 'function') scheduleAnimRedraw();
+  } else {
+    SH._qSubFadeT0 = 0;
+    SH._qSubPrev = '';
+    txt(qc, subTxt, 24, base + 34, F(400, 14), qInk.rgba(.62, true));
+  }
   const hasRemoving = Boolean(SH.qRemoving && SH.qRemoving.length);
   const showSkelRows = !rowCount && !hasRemoving && !!LIVE.radioBusy;
-  const nowMs = performance.now();
+  const wantEmpty = (!rowCount && !showSkelRows && !hasRemoving && !PL.infinity) ? 1 : 0;
+  if (SH._qEmptyP == null) SH._qEmptyP = wantEmpty;
+  SH._qEmptyTarget = wantEmpty;
+  const drawEmptyReminder = (emA) => {
+    if (emA <= 0.005) return;
+    const ep = emA * emA * (3 - 2 * emA);
+    const cy = Math.max(base + 82, Math.round((base + 52 + bot) * 0.5) - 10) + (1 - ep) * 10;
+    const fontMain = F(600, 15);
+    const pref = window.t('queue.infinity_off_prefix');
+    const suff = window.t('queue.infinity_off_suffix');
+    const _qtw = (fnt, s) => (typeof measureTw === 'function' ? measureTw(qc, fnt, s) : (qc.font = fnt, qc.measureText(s).width));
+    const wPref = _qtw(fontMain, pref);
+    const wSuff = _qtw(fontMain, suff);
+    const icSz = 19, icGap = 6, icSlot = 20;
+    const totalW = wPref + icGap + icSlot + icGap + wSuff;
+    const mainCol = qInk.rgba(.78, true);
+    const icCol = qInk.rgba(.88, true);
+    qc.save();
+    qc.globalAlpha *= ep;
+    if (totalW <= W - 32) {
+      const startX = (W - totalW) * 0.5;
+      txt(qc, pref, startX, cy, fontMain, mainCol);
+      icon(qc, 'infinity', startX + wPref + icGap + icSlot * 0.5, cy - 4.5, icSz, icCol);
+      txt(qc, suff, startX + wPref + icGap + icSlot + icGap, cy, fontMain, mainCol);
+    } else {
+      const line1W = wPref + icGap + icSlot;
+      const startX = (W - line1W) * 0.5;
+      txt(qc, pref, startX, cy - 10, fontMain, mainCol);
+      icon(qc, 'infinity', startX + wPref + icGap + icSlot * 0.5, cy - 14.5, icSz, icCol);
+      txt(qc, suff, W * 0.5, cy + 10, fontMain, mainCol, 'center', W - 48);
+    }
+    txt(qc, window.t('queue.infinity_off_hint'), W * 0.5, cy + (totalW <= W - 32 ? 23 : 33), F(400, 13), qInk.rgba(.52, true), 'center', W - 48);
+    qc.restore();
+  };
   let skelCount = 0;
   if (!rowCount) {
+    SH._qPrevRows = 0;
     SH._qSkelFadeT0 = 0;
+    SH._qRowsFadeT0 = 0;
     if (showSkelRows) {
       SH._qSkelSeen = true;
       SH._qSkelSeenMs = nowMs;
-      skelCount = drawQueueSkeleton(qc, base + 52, top, bot, qInk);
-    } else if (!hasRemoving && !PL.infinity) {
-      const cy = Math.max(base + 82, Math.round((base + 52 + bot) * 0.5) - 10);
-      const fontMain = F(600, 15);
-      const pref = window.t('queue.infinity_off_prefix');
-      const suff = window.t('queue.infinity_off_suffix');
-      const _qtw = (fnt, s) => (typeof measureTw === 'function' ? measureTw(qc, fnt, s) : (qc.font = fnt, qc.measureText(s).width));
-      const wPref = _qtw(fontMain, pref);
-      const wSuff = _qtw(fontMain, suff);
-      const icSz = 19, icGap = 6, icSlot = 20;
-      const totalW = wPref + icGap + icSlot + icGap + wSuff;
-      const mainCol = qInk.rgba(.78, true);
-      const icCol = qInk.rgba(.88, true);
-      if (totalW <= W - 32) {
-        const startX = (W - totalW) * 0.5;
-        txt(qc, pref, startX, cy, fontMain, mainCol);
-        icon(qc, 'infinity', startX + wPref + icGap + icSlot * 0.5, cy - 4.5, icSz, icCol);
-        txt(qc, suff, startX + wPref + icGap + icSlot + icGap, cy, fontMain, mainCol);
-      } else {
-        const line1W = wPref + icGap + icSlot;
-        const startX = (W - line1W) * 0.5;
-        txt(qc, pref, startX, cy - 10, fontMain, mainCol);
-        icon(qc, 'infinity', startX + wPref + icGap + icSlot * 0.5, cy - 14.5, icSz, icCol);
-        txt(qc, suff, W * 0.5, cy + 10, fontMain, mainCol, 'center', W - 48);
+      const skelA = clamp(1 - (SH._qEmptyP || 0), 0, 1);
+      if (skelA > 0.01) {
+        qc.save();
+        qc.globalAlpha *= skelA;
+        skelCount = drawQueueSkeleton(qc, base + 52, top, bot, qInk);
+        qc.restore();
       }
-      txt(qc, window.t('queue.infinity_off_hint'), W * 0.5, cy + (totalW <= W - 32 ? 23 : 33), F(400, 13), qInk.rgba(.52, true), 'center', W - 48);
     }
+    if (SH._qEmptyP > 0.005) drawEmptyReminder(SH._qEmptyP);
     if (hasRemoving) drawRemovingQueueRows(qc);
   } else {
+    if (SH._qEmptyP > 0.005) drawEmptyReminder(SH._qEmptyP);
     if (SH._qSkelSeen) {
       SH._qSkelSeen = false;
       SH._qSkelFadeT0 = (SH._qSkelSeenMs && (nowMs - SH._qSkelSeenMs) < 1500) ? nowMs : 0;
+      if (!SH._qSkelFadeT0) SH._qRowsFadeT0 = nowMs;
+    } else if (SH._qPrevRows === 0) {
+      SH._qRowsFadeT0 = nowMs;
     }
-    let qFadeK = 1;
+    SH._qPrevRows = rowCount;
+    let qFadeK = 1, qSlideDy = 0;
     const qFadeDt = SH._qSkelFadeT0 ? Math.max(0, nowMs - SH._qSkelFadeT0) : 9999;
-    if (SH._qSkelFadeT0 && qFadeDt < 260) {
-      const rp = clamp(qFadeDt / 260, 0, 1);
+    const qRowsDt = SH._qRowsFadeT0 ? Math.max(0, nowMs - SH._qRowsFadeT0) : 9999;
+    if (SH._qSkelFadeT0 && qFadeDt < 280) {
+      const rp = clamp(qFadeDt / 280, 0, 1);
       qFadeK = 1 - Math.pow(1 - rp, 3);
+      qSlideDy = (1 - qFadeK) * 8;
       if ((1 - qFadeK) > 0.005) {
         qc.save();
         qc.globalAlpha *= (1 - qFadeK);
@@ -1507,8 +1589,19 @@ function drawQueue(c, L, fadeAlpha = 1) {
       } else if (typeof scheduleAnimRedraw === 'function') {
         scheduleAnimRedraw();
       }
+    } else if (SH._qRowsFadeT0 && qRowsDt < 280) {
+      const rp = clamp(qRowsDt / 280, 0, 1);
+      qFadeK = 1 - Math.pow(1 - rp, 3);
+      qSlideDy = (1 - qFadeK) * 12;
+      if (typeof _skulletActive !== 'undefined') _skulletActive = true;
+      if (typeof window !== 'undefined' && window.__IN_DRAW_SCENE && typeof scheduleSceneAnimRedraw === 'function') {
+        scheduleSceneAnimRedraw();
+      } else if (typeof scheduleAnimRedraw === 'function') {
+        scheduleAnimRedraw();
+      }
     } else {
       SH._qSkelFadeT0 = 0;
+      SH._qRowsFadeT0 = 0;
       _releaseQFadeCv();
     }
 
@@ -1635,7 +1728,7 @@ function drawQueue(c, L, fadeAlpha = 1) {
       fc.clearRect(0, 0, mw, mh);
       fc.save();
       fc.scale(dpr, dpr);
-      fc.translate(0, -y0);
+      fc.translate(0, -y0 + qSlideDy);
       renderQueueRows(fc);
       fc.restore();
       if (qFadeK > 0.005) {

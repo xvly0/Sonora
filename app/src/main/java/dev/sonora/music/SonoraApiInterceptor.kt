@@ -2197,6 +2197,11 @@ object SonoraApiInterceptor {
                 path == "/api/home" -> handleHome(uri)
                 path == "/api/search" -> handleSearch(
                     uri.getQueryParameter("q").orEmpty(),
+                    uri.getQueryParameter("type")?.takeIf { it.isNotBlank() } ?: "all",
+                    uri.getQueryParameter("fast") == "1"
+                )
+                path == "/api/search_enrich" -> handleSearchEnrich(
+                    uri.getQueryParameter("q").orEmpty(),
                     uri.getQueryParameter("type")?.takeIf { it.isNotBlank() } ?: "all"
                 )
                 path == "/api/lyrics_search" -> handleLyricsSearchEndpoint(uri.getQueryParameter("q").orEmpty())
@@ -2221,6 +2226,7 @@ object SonoraApiInterceptor {
                     uri.getQueryParameter("s")?.toIntOrNull() ?: 544
                 )
                 path.startsWith("/api/artist/") -> handleArtist(path.removePrefix("/api/artist/"), uri)
+                path == "/api/import_playlist" -> handleImportPlaylist(uri.getQueryParameter("url").orEmpty())
                 path.startsWith("/api/playlist/") -> handlePlaylist(path.removePrefix("/api/playlist/"))
                 path == "/api/radio_feed" -> handleRadioFeed()
                 path == "/api/playlist_recs" -> handlePlaylistRecs(uri, requestHeaders)
@@ -3575,7 +3581,34 @@ object SonoraApiInterceptor {
 
     internal fun normCompactKey(s: String): String = normSearchKey(s).replace(" ", "")
 
-    private suspend fun buildSearchJson(cleanQ: String, type: String): Pair<String, Boolean> {
+    private data class SearchBuildResult(
+        val json: String,
+        val valid: Boolean,
+        val needsEnrich: Boolean
+    )
+
+    private data class PendingSearchEnrich(
+        val cleanQ: String,
+        val type: String,
+        val locKey: String,
+        val topKind: String,
+        val topSongs: List<SongItem>,
+        val albums: List<AlbumItem>,
+        val artists: List<ArtistItem>,
+        val playlists: List<PlaylistItem>,
+        val createdAtMs: Long = System.currentTimeMillis()
+    )
+
+    private val pendingSearchEnrich = ConcurrentHashMap<String, PendingSearchEnrich>()
+    private val searchGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+    @Volatile private var activeSearchJob: kotlinx.coroutines.Job? = null
+    @Volatile private var activeSearchEnrichJob: kotlinx.coroutines.Job? = null
+
+    private suspend fun buildSearchJson(
+        cleanQ: String,
+        type: String,
+        skipEnrich: Boolean = false
+    ): SearchBuildResult {
         val songs = mutableListOf<SongItem>()
         val albums = mutableListOf<AlbumItem>()
         val artists = mutableListOf<ArtistItem>()
@@ -3761,7 +3794,23 @@ object SonoraApiInterceptor {
         val canonMap = ConcurrentHashMap<Int, CanonicalSongMeta>()
         val resolvedArtistThumbs = ConcurrentHashMap<String, String>()
         val resolvedAlbumThumbs = ConcurrentHashMap<String, String>()
-        if (canonicalTargets.isNotEmpty() || artistThumbTargets.isNotEmpty() || albumThumbTargets.isNotEmpty()) {
+        val hasUnresolved = canonicalTargets.isNotEmpty() || artistThumbTargets.isNotEmpty() || albumThumbTargets.isNotEmpty()
+        val needsEnrich = skipEnrich && hasUnresolved
+        if (needsEnrich) {
+            val locKey = SonoraLocaleManager.cacheTag()
+            val enrichKey = "$locKey:$type:${cleanQ.lowercase()}"
+            if (pendingSearchEnrich.size > 24) pendingSearchEnrich.clear()
+            pendingSearchEnrich[enrichKey] = PendingSearchEnrich(
+                cleanQ = cleanQ,
+                type = type,
+                locKey = locKey,
+                topKind = topKind,
+                topSongs = topSongs,
+                albums = albums.take(limit),
+                artists = artists.take(limit),
+                playlists = playlists.take(limit)
+            )
+        } else if (hasUnresolved) {
             val songSem = Semaphore(8)
             val songDefs = canonicalTargets.map { (idx, triple) ->
                 attachScope.async {
@@ -3842,6 +3891,7 @@ object SonoraApiInterceptor {
         val root = JSONObject().apply {
             put("q", cleanQ)
             put("topKind", topKind)
+            put("needsEnrich", needsEnrich)
             put("songs", songsArr)
             put("albums", albumsArr)
             put("artists", artistsArr)
@@ -3849,12 +3899,156 @@ object SonoraApiInterceptor {
         }
         android.util.Log.d(
             "SonoraSearch",
-            "Search '$cleanQ' type='$type' topKind='$topKind': songs=${songsArr.length()}, albums=${albumsArr.length()}, artists=${artistsArr.length()}, playlists=${playlistsArr.length()}",
+            "Search '$cleanQ' type='$type' fast=$skipEnrich needsEnrich=$needsEnrich topKind='$topKind': songs=${songsArr.length()}, albums=${albumsArr.length()}, artists=${artistsArr.length()}, playlists=${playlistsArr.length()}",
         )
-        return root.toString() to valid
+        return SearchBuildResult(root.toString(), valid, needsEnrich)
     }
 
-    private fun handleSearch(q: String, typeParam: String = "all"): WebResourceResponse {
+    private fun handleSearchEnrich(q: String, typeParam: String = "all"): WebResourceResponse {
+        val cleanQ = q.trim()
+        val type = if (typeParam.isBlank()) "all" else typeParam
+        val locKey = SonoraLocaleManager.cacheTag()
+        val enrichKey = "$locKey:$type:${cleanQ.lowercase()}"
+        val pending = pendingSearchEnrich.remove(enrichKey)
+            ?: return jsonResponse("{\"q\":\"\",\"songs\":[],\"albums\":[],\"artists\":[]}")
+        if (System.currentTimeMillis() - pending.createdAtMs > 25_000L || pending.locKey != locKey) {
+            return jsonResponse("{\"q\":\"\",\"songs\":[],\"albums\":[],\"artists\":[]}")
+        }
+        val myGen = searchGeneration.get()
+        activeSearchEnrichJob?.cancel()
+        val job = attachScope.async {
+            val topSongs = pending.topSongs
+            val songResolveLimit = if (type == "all") 12 else 16
+            val canonicalTargets = topSongs.take(songResolveLimit).mapIndexedNotNull { idx, song ->
+                val firstArtist = primaryArtistName(song)
+                val albName = song.album?.name?.trim().orEmpty()
+                val isComp = albName.isEmpty() || isLikelyCompilationAlbum(albName, song.title, firstArtist)
+                val hintAlb = if (isComp) "" else albName
+                if (firstArtist.isNotBlank() && peekCachedCanonicalSongMeta(song.title, firstArtist, hintAlb) == null) {
+                    idx to Triple(song, firstArtist, hintAlb)
+                } else null
+            }
+            val artistLimit = if (type == "all") 4 else 8
+            val artistThumbTargets = pending.artists.take(artistLimit).filter { peekCachedArtistThumb(it.title, 544) == null }
+            val albumLimit = if (type == "all") 6 else 10
+            val albumThumbTargets = pending.albums.take(albumLimit).filter { alb ->
+                val artistName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
+                peekCachedAlbumThumb(alb.title, artistName, 544) == null
+            }
+            val songFallbackThumbs = ConcurrentHashMap<Int, String>()
+            val canonMap = ConcurrentHashMap<Int, CanonicalSongMeta>()
+            val resolvedArtistThumbs = ConcurrentHashMap<String, String>()
+            val resolvedAlbumThumbs = ConcurrentHashMap<String, String>()
+            if (canonicalTargets.isNotEmpty() || artistThumbTargets.isNotEmpty() || albumThumbTargets.isNotEmpty()) {
+                val songSem = Semaphore(8)
+                coroutineScope {
+                    val songDefs = canonicalTargets.map { (idx, triple) ->
+                        async(Dispatchers.IO) {
+                            val (song, firstArtist, hintAlb) = triple
+                            val meta = songSem.withPermit {
+                                withTimeoutOrNull(2200L) {
+                                    resolveCanonicalSongMeta(song.title, firstArtist, hintAlb)
+                                }
+                            }
+                            if (meta != null) {
+                                canonMap[idx] = meta
+                            } else if (hintAlb.isNotBlank()) {
+                                val fallbackAlb = songSem.withPermit {
+                                    withTimeoutOrNull(1000L) {
+                                        resolveAlbumThumb(hintAlb, firstArtist, 544)
+                                    }
+                                }
+                                if (fallbackAlb != null) songFallbackThumbs[idx] = fallbackAlb
+                            }
+                        }
+                    }
+                    val artistDefs = artistThumbTargets.map { artistItem ->
+                        async(Dispatchers.IO) {
+                            val thumb = withTimeoutOrNull(1300L) {
+                                resolveArtistThumb(artistItem.title, size = 544)
+                            }
+                            if (thumb != null) resolvedArtistThumbs[artistItem.id] = thumb
+                        }
+                    }
+                    val albumDefs = albumThumbTargets.map { alb ->
+                        val artistName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
+                        async(Dispatchers.IO) {
+                            val thumb = withTimeoutOrNull(1300L) {
+                                resolveAlbumThumb(alb.title, artistName, 544)
+                            }
+                            if (thumb != null) resolvedAlbumThumbs[alb.browseId] = thumb
+                        }
+                    }
+                    withTimeoutOrNull(1800L) {
+                        songDefs.awaitAll()
+                        artistDefs.awaitAll()
+                        albumDefs.awaitAll()
+                    }
+                }
+            }
+            val songsArr = JSONArray()
+            topSongs.forEachIndexed { idx, song ->
+                val override = canonMap[idx]
+                val obj = song.toJson(preResolvedCanonical = override, skipCanonicalPeek = override != null)
+                if (override == null) {
+                    val fbThumb = songFallbackThumbs[idx] ?: run {
+                        val albName = song.album?.name?.trim().orEmpty()
+                        val firstArtist = primaryArtistName(song)
+                        if (albName.isNotEmpty() && !isLikelyCompilationAlbum(albName, song.title, firstArtist)) {
+                            peekCachedAlbumThumb(albName, firstArtist, 544)
+                        } else null
+                    }
+                    fbThumb?.let { obj.put("thumb", it) }
+                }
+                songsArr.put(obj)
+            }
+            val albumsArr = JSONArray()
+            pending.albums.forEach { alb ->
+                val artistName = cleanArtistsList(alb.artists).firstOrNull()?.name ?: alb.artists?.firstOrNull()?.name.orEmpty()
+                val hqThumb = resolvedAlbumThumbs[alb.browseId] ?: peekCachedAlbumThumb(alb.title, artistName, 544)
+                albumsArr.put(alb.toJson(thumbSize = 544, hqThumb = hqThumb))
+            }
+            val artistsArr = JSONArray()
+            pending.artists.forEach { item ->
+                val thumb = peekCachedArtistThumb(item.title, 544) ?: resolvedArtistThumbs[item.id] ?: upgradeThumb(item.thumbnail, 544)
+                artistsArr.put(item.toJson(thumb))
+            }
+            val playlistsArr = JSONArray()
+            pending.playlists.forEach { playlistsArr.put(it.toJson()) }
+
+            val fullRoot = JSONObject().apply {
+                put("q", cleanQ)
+                put("topKind", pending.topKind)
+                put("needsEnrich", false)
+                put("songs", songsArr)
+                put("albums", albumsArr)
+                put("artists", artistsArr)
+                put("playlists", playlistsArr)
+            }.toString()
+
+            val cacheKey = "search_v14:$locKey:$type:${cleanQ.lowercase()}"
+            if (SonoraLocaleManager.cacheTag() == locKey && AppleCatalog.hasReadyToken()) {
+                ApiCache.put(cacheKey, fullRoot, 600)
+                SnapshotDiskCache.putAsync(cacheKey, fullRoot)
+            }
+            fullRoot
+        }
+        activeSearchEnrichJob = job
+        return try {
+            val res = runBlocking { job.await() }
+            if (searchGeneration.get() != myGen) {
+                jsonResponse("{\"q\":\"\",\"aborted\":true,\"songs\":[],\"albums\":[],\"artists\":[]}")
+            } else {
+                jsonResponse(res)
+            }
+        } catch (_: kotlinx.coroutines.CancellationException) {
+            jsonResponse("{\"q\":\"\",\"aborted\":true,\"songs\":[],\"albums\":[],\"artists\":[]}")
+        } finally {
+            if (activeSearchEnrichJob === job) activeSearchEnrichJob = null
+        }
+    }
+
+    private fun handleSearch(q: String, typeParam: String = "all", fast: Boolean = false): WebResourceResponse {
         val cleanQ = q.trim()
         val type = if (typeParam.isBlank()) "all" else typeParam
         if (cleanQ.isBlank()) return jsonResponse(JSONObject().apply {
@@ -3879,28 +4073,55 @@ object SonoraApiInterceptor {
                 SnapshotDiskCache.revalidate(cacheKey) {
                     if (SonoraLocaleManager.cacheTag() != locKey) return@revalidate
                     ensureLocale()
-                    val (fresh, valid) = buildSearchJson(cleanQ, type)
-                    if (valid && AppleCatalog.hasReadyToken() && SonoraLocaleManager.cacheTag() == locKey) {
-                        ApiCache.put(cacheKey, fresh, 600)
-                        SnapshotDiskCache.put(cacheKey, fresh)
+                    val res = buildSearchJson(cleanQ, type, skipEnrich = false)
+                    if (res.valid && AppleCatalog.hasReadyToken() && SonoraLocaleManager.cacheTag() == locKey) {
+                        ApiCache.put(cacheKey, res.json, 600)
+                        SnapshotDiskCache.put(cacheKey, res.json)
                     }
                 }
             }
             return jsonResponse(disk.data)
         }
 
+        if (fast) {
+            val myGen = searchGeneration.incrementAndGet()
+            activeSearchJob?.cancel()
+            activeSearchEnrichJob?.cancel()
+            val job = attachScope.async { buildSearchJson(cleanQ, type, skipEnrich = true) }
+            activeSearchJob = job
+            return try {
+                val res = runBlocking { job.await() }
+                if (searchGeneration.get() != myGen) {
+                    return jsonResponse("{\"q\":\"\",\"aborted\":true,\"songs\":[],\"albums\":[],\"artists\":[],\"playlists\":[]}")
+                }
+                if (res.valid && SonoraLocaleManager.cacheTag() == locKey) {
+                    if (!res.needsEnrich && AppleCatalog.hasReadyToken()) {
+                        ApiCache.put(cacheKey, res.json, 600)
+                        SnapshotDiskCache.putAsync(cacheKey, res.json)
+                    } else {
+                        ApiCache.put(cacheKey, res.json, 15)
+                    }
+                }
+                jsonResponse(res.json)
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                jsonResponse("{\"q\":\"\",\"aborted\":true,\"songs\":[],\"albums\":[],\"artists\":[],\"playlists\":[]}")
+            } finally {
+                if (activeSearchJob === job) activeSearchJob = null
+            }
+        }
+
         return coalescedApi("search:$cacheKey") {
             ApiCache.get(cacheKey)?.let { return@coalescedApi ApiOutcome(200, it) }
-            val (rootStr, valid) = buildSearchJson(cleanQ, type)
-            if (valid && SonoraLocaleManager.cacheTag() == locKey) {
+            val res = buildSearchJson(cleanQ, type, skipEnrich = false)
+            if (res.valid && SonoraLocaleManager.cacheTag() == locKey) {
                 if (AppleCatalog.hasReadyToken()) {
-                    ApiCache.put(cacheKey, rootStr, 600)
-                    SnapshotDiskCache.putAsync(cacheKey, rootStr)
+                    ApiCache.put(cacheKey, res.json, 600)
+                    SnapshotDiskCache.putAsync(cacheKey, res.json)
                 } else {
-                    ApiCache.put(cacheKey, rootStr, 10)
+                    ApiCache.put(cacheKey, res.json, 10)
                 }
             }
-            ApiOutcome(200, rootStr)
+            ApiOutcome(200, res.json)
         }
     }
 
@@ -4448,6 +4669,198 @@ object SonoraApiInterceptor {
         } else {
             errorResponse(404, localizedMsg("Playlist non trovata", "Playlist not found"))
         }
+    }
+
+    private val SPOTIFY_PLAYLIST_ID_REGEX = Regex("""(?:open\.spotify\.com/(?:intl-[a-z-]+/)?(?:embed/)?playlist/|spotify:playlist:)([A-Za-z0-9]{10,40})""", RegexOption.IGNORE_CASE)
+    private val SPOTIFY_NEXT_DATA_REGEX = Regex("""<script\s+id="__NEXT_DATA__"[^>]*>(.*?)</script>""", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+    private val YT_PLAYLIST_LIST_REGEX = Regex("""[?&]list=([A-Za-z0-9_-]{8,100})""")
+
+    private fun extractSpotifyPlaylistId(rawUrl: String): String? {
+        SPOTIFY_PLAYLIST_ID_REGEX.find(rawUrl)?.groupValues?.getOrNull(1)?.let { return it }
+        if (rawUrl.contains("spotify.link", ignoreCase = true) || rawUrl.contains("spoti.fi", ignoreCase = true)) {
+            val resolved = runCatching {
+                val req = Request.Builder()
+                    .url(rawUrl)
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+                    .build()
+                okHttp.newCall(req).execute().use { resp -> resp.request.url.toString() }
+            }.getOrNull()
+            if (!resolved.isNullOrBlank()) {
+                SPOTIFY_PLAYLIST_ID_REGEX.find(resolved)?.groupValues?.getOrNull(1)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun extractYouTubePlaylistId(rawUrl: String): String? {
+        val m = YT_PLAYLIST_LIST_REGEX.find(rawUrl)?.groupValues?.getOrNull(1)
+        if (!m.isNullOrBlank()) {
+            return if (m.startsWith("VL") && m.length > 4) m.removePrefix("VL") else m
+        }
+        val trimmed = rawUrl.trim()
+        if (trimmed.startsWith("PL") || trimmed.startsWith("OLAK") || trimmed.startsWith("RDCLAK") || trimmed.startsWith("VLPL")) {
+            return if (trimmed.startsWith("VL")) trimmed.removePrefix("VL") else trimmed
+        }
+        return null
+    }
+
+    private data class SpotifyTrackStub(val title: String, val artist: String, val durationSec: Int)
+
+    private fun handleImportPlaylist(rawUrl: String): WebResourceResponse = runBlocking {
+        val cleaned = rawUrl.trim()
+        if (cleaned.isEmpty()) {
+            return@runBlocking errorResponse(400, localizedMsg("Inserisci un link valido", "Please enter a valid link"))
+        }
+
+        // 1. Spotify public playlist import
+        val spotifyId = extractSpotifyPlaylistId(cleaned)
+        if (!spotifyId.isNullOrBlank()) {
+            val embedUrl = "https://open.spotify.com/embed/playlist/$spotifyId"
+            val html = runCatching {
+                withContext(Dispatchers.IO) {
+                    val req = Request.Builder()
+                        .url(embedUrl)
+                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+                        .header("Accept-Language", "en-US,en;q=0.9")
+                        .build()
+                    okHttp.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) null else resp.body.string()
+                    }
+                }
+            }.getOrNull()
+
+            if (html.isNullOrBlank()) {
+                return@runBlocking errorResponse(404, localizedMsg("Playlist Spotify non raggiungibile o privata", "Spotify playlist unreachable or private"))
+            }
+
+            val nextMatch = SPOTIFY_NEXT_DATA_REGEX.find(html)?.groupValues?.getOrNull(1)
+            val entity = runCatching {
+                val root = JSONObject(nextMatch ?: "")
+                root.optJSONObject("props")
+                    ?.optJSONObject("pageProps")
+                    ?.optJSONObject("state")
+                    ?.optJSONObject("data")
+                    ?.optJSONObject("entity")
+            }.getOrNull()
+
+            if (entity == null) {
+                return@runBlocking errorResponse(404, localizedMsg("Impossibile leggere la playlist Spotify (verifica che sia pubblica)", "Could not read Spotify playlist (make sure it is public)"))
+            }
+
+            val plTitle = entity.optString("name").trim().ifEmpty { localizedMsg("Playlist Spotify", "Spotify Playlist") }
+            val rawCover = entity.optJSONObject("coverArt")
+                ?.optJSONArray("sources")
+                ?.optJSONObject(0)
+                ?.optString("url")
+                ?.trim()
+                .orEmpty()
+            val coverThumb = if (rawCover.startsWith("http")) {
+                "/api/cover?u=${URLEncoder.encode(rawCover, "UTF-8")}&s=544"
+            } else ""
+
+            val trackList = entity.optJSONArray("trackList") ?: JSONArray()
+            val stubs = ArrayList<SpotifyTrackStub>(minOf(trackList.length(), 100))
+            val cap = minOf(trackList.length(), 100)
+            for (i in 0 until cap) {
+                val obj = trackList.optJSONObject(i) ?: continue
+                val tTitle = obj.optString("title").replace('\u00A0', ' ').trim()
+                val tSub = obj.optString("subtitle").replace('\u00A0', ' ').trim()
+                val durSec = (obj.optLong("duration", 0L) / 1000L).toInt().coerceAtLeast(0)
+                if (tTitle.isNotEmpty()) {
+                    stubs.add(SpotifyTrackStub(tTitle, tSub, durSec))
+                }
+            }
+            if (stubs.isEmpty()) {
+                return@runBlocking errorResponse(404, localizedMsg("Nessun brano trovato in questa playlist Spotify", "No tracks found in this Spotify playlist"))
+            }
+
+            val sem = Semaphore(6)
+            val resolvedSongs = coroutineScope {
+                stubs.map { stub ->
+                    async(Dispatchers.IO) {
+                        sem.withPermit {
+                            val leadArtist = stub.artist.split(',', '&').firstOrNull()?.trim().orEmpty()
+                            val query = if (leadArtist.isNotEmpty()) "${stub.title} $leadArtist" else stub.title
+                            val res = runCatching {
+                                YouTube.search(query, YouTube.SearchFilter.FILTER_SONG).getOrNull()
+                            }.getOrNull()
+                            val candidates = res?.items.orEmpty().filterIsInstance<SongItem>()
+                            if (candidates.isEmpty()) return@withPermit null
+                            val clean = candidates.filter { !shouldFilterTrack(it) && !isNoisyVideoTitle(it.title) }
+                            val pool = if (clean.isNotEmpty()) clean else candidates
+                            if (stub.durationSec > 0) {
+                                pool.minByOrNull { s ->
+                                    val d = s.duration ?: stub.durationSec
+                                    kotlin.math.abs(d - stub.durationSec) + (if (s.isVideoSong) 20 else 0)
+                                } ?: pool.first()
+                            } else {
+                                pool.firstOrNull { !it.isVideoSong } ?: pool.first()
+                            }
+                        }
+                    }
+                }.awaitAll().filterNotNull().distinctBy { it.id }
+            }
+
+            if (resolvedSongs.isEmpty()) {
+                return@runBlocking errorResponse(404, localizedMsg("Nessun brano corrispondente trovato su YouTube Music", "No matching tracks found on YouTube Music"))
+            }
+
+            val tracksArr = enrichSongsToJson(resolvedSongs, maxResolve = 40, withTrackNo = true)
+            val resp = JSONObject().apply {
+                put("ok", true)
+                put("source", "spotify")
+                put("title", plTitle)
+                put("thumb", coverThumb)
+                put("totalCount", stubs.size)
+                put("matchedCount", resolvedSongs.size)
+                put("tracks", tracksArr)
+            }
+            return@runBlocking jsonResponse(resp.toString())
+        }
+
+        // 2. YouTube / YouTube Music public playlist import
+        val ytListId = extractYouTubePlaylistId(cleaned)
+        if (!ytListId.isNullOrBlank()) {
+            val page = YouTube.playlist(ytListId).getOrNull()
+                ?: return@runBlocking errorResponse(404, localizedMsg("Playlist YouTube non trovata o privata", "YouTube playlist not found or private"))
+
+            val allSongs = LinkedHashMap<String, SongItem>()
+            page.songs.forEach { if (it.id.isNotBlank()) allSongs.putIfAbsent(it.id, it) }
+
+            var cont = page.songsContinuation
+            var pagesFetched = 0
+            while (!cont.isNullOrBlank() && pagesFetched < 3 && allSongs.size < 250) {
+                val nextPage = YouTube.playlistContinuation(cont).getOrNull() ?: break
+                if (nextPage.songs.isEmpty()) break
+                nextPage.songs.forEach { if (it.id.isNotBlank()) allSongs.putIfAbsent(it.id, it) }
+                cont = nextPage.continuation
+                pagesFetched++
+            }
+
+            val songList = allSongs.values.toList()
+            if (songList.isEmpty()) {
+                return@runBlocking errorResponse(404, localizedMsg("Questa playlist YouTube non contiene brani", "This YouTube playlist has no tracks"))
+            }
+
+            val plTitle = page.playlist.title.trim().ifEmpty { localizedMsg("Playlist YouTube", "YouTube Playlist") }
+            val rawThumb = page.playlist.thumbnail?.trim().orEmpty()
+            val coverThumb = if (rawThumb.startsWith("http")) {
+                "/api/cover?u=${URLEncoder.encode(rawThumb, "UTF-8")}&s=544"
+            } else ""
+            val tracksArr = enrichSongsToJson(songList, maxResolve = 50, withTrackNo = true)
+            val resp = JSONObject().apply {
+                put("ok", true)
+                put("source", "youtube")
+                put("title", plTitle)
+                put("thumb", coverThumb)
+                put("totalCount", songList.size)
+                put("matchedCount", songList.size)
+                put("tracks", tracksArr)
+            }
+            return@runBlocking jsonResponse(resp.toString())
+        }
+
+        errorResponse(400, localizedMsg("Link non riconosciuto. Usa un link pubblico di YouTube Music o Spotify.", "Unsupported link. Please paste a public YouTube Music or Spotify playlist URL."))
     }
 
     private fun handleRadio(videoId: String): WebResourceResponse = runBlocking {

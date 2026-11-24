@@ -491,7 +491,7 @@ function isSpinnerActive() {
   if (PL.loading && PL.loadingSince && (performance.now() - PL.loadingSince > 800)) return true;
   return false;
 }
-const LIVE = { on: false, ly: {}, lySel: {}, lyV: 0, radio: [], radioBusy: false, res: {}, recent: [], known: {}, home: null, homeErr: null, charts: null, chartsErr: null, toast: '', toastT: 0, errRun: 0 };
+const LIVE = { on: false, offline: false, _offlineP: 0, ly: {}, lySel: {}, lyV: 0, radio: [], radioBusy: false, res: {}, searchHistory: [], recent: [], known: {}, home: null, homeErr: null, charts: null, chartsErr: null, toast: '', toastT: 0, errRun: 0 };
 const durOf = t => t.dur;
 let _lastNextTrackKey = null;
 function syncNativeNextTrack(force) {
@@ -2123,11 +2123,11 @@ function initGlass() {
   const setCtrlNames = [];
   for (let i = 0; i < 24; i++) setCtrlNames.push('setCtrl' + i);
   const names = ['tab', 'thumb', 'search', 'mini', 'more', 'av', 'back', 'apill', 'pSearch', 'backPrev', 'apillPrev', 'pSearchPrev', 'hShufPrev', 'hDownPrev', 'hShuf', 'hDown', 'menu', 'cm', 'outDrawer', 'prompt', 'sStar', 'sMore', 'sP1', 'sP2', 'sP3', 'sP4',
-    'recapPlay', 'recapMonth', 'filt0', 'filt1', 'filt2', 'filt3', 'filt4', 'filtAct', 'sLyAnim', 'sLyClassic',
+    'recapPlay', 'recapMonth', 'filt0', 'filt1', 'filt2', 'filt3', 'filt4', 'filtAct', 'sLyAnim', 'sLyClassic', 'offlineBanner',
     'setPrevBar', 'setPrevThumb', ...setCtrlNames];
   names.forEach(n => { G[n] = lg.add({ visible: false, x: 0, y: 0, width: 10, height: 10 }); });
   G.hShuf.set({ layer: 0 }); G.hDown.set({ layer: 0 }); G.hShufPrev.set({ layer: 0 }); G.hDownPrev.set({ layer: 0 });
-  ['recapPlay', 'recapMonth', 'filt0', 'filt1', 'filt2', 'filt3', 'filt4', 'filtAct'].forEach(n => G[n].set({ layer: 0 }));
+  ['recapPlay', 'recapMonth', 'filt0', 'filt1', 'filt2', 'filt3', 'filt4', 'filtAct', 'offlineBanner'].forEach(n => G[n].set({ layer: 0 }));
   G.sLyAnim.set({ layer: 1 }); G.sLyClassic.set({ layer: 1 });
   G.tab.set({ layer: 1 }); G.mini.set({ layer: 1 }); G.thumb.set({ layer: 2, useOverlay: true });
   G.setPrevBar.set({ layer: 1 }); G.setPrevThumb.set({ layer: 2, useOverlay: true });
@@ -2185,6 +2185,14 @@ function applyStyles() {
   [G.recapPlay, G.recapMonth, G.filt0, G.filt1, G.filt2, G.filt3, G.filt4, G.filtAct].forEach(g => g.set(liquidBtn));
   [G.sStar, G.sMore, G.sP1, G.sP2, G.sP3].forEach(g => g.set(Object.assign({}, tinted, { shadow: false, tint: TINT_NEU })));
   [G.sLyAnim, G.sLyClassic].forEach(g => g.set(Object.assign({}, liquidBtn, { shadow: false, tint: TINT_NEU })));
+  if (G.offlineBanner) G.offlineBanner.set({
+    blur: Math.max(4, bBlur * 2.2), refractionHeight: rH, refractionAmount: rAmt, chromaticAberration: chrom, vibrancy: true,
+    tint: d ? 'rgba(255,255,255,.12)' : 'rgba(255,255,255,.62)',
+    surfaceColor: d ? 'rgba(24,24,28,.42)' : 'rgba(245,245,250,.50)',
+    highlight: { width: 1, blurRadius: .5, alpha: d ? .28 : .55, style: 'default', angle: 45, falloff: 1 },
+    innerShadow: null,
+    shadow: { radius: 22, offsetY: 8, color: d ? 'rgba(0,0,0,.38)' : 'rgba(0,0,0,.12)' }
+  });
   [G.menu, G.cm, G.outDrawer, G.prompt].forEach(g => g && g.set({ blur: Math.max(4, bBlur * 2.5), refractionHeight: rH, refractionAmount: rAmt, chromaticAberration: chrom, vibrancy: true,
     tint: d ? 'rgba(255,255,255,.15)' : 'rgba(255,255,255,.55)',
     surfaceColor: d ? 'rgba(20,20,24,.45)' : 'rgba(245,245,250,.48)',
