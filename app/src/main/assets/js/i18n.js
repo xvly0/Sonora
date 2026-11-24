@@ -512,7 +512,7 @@
       'update.installing': 'Aspetto la tua conferma',
       'update.needs_permission': 'Consenti l’installazione — tocca',
       'update.failed': 'Non adesso — tocca per riprovare',
-      'settings.version_label': 'Sonora v1.0.3-beta · LiquidGlass',
+      'settings.version_label': 'Sonora v1.0.4-beta · LiquidGlass',
 
       // Language & Region settings
       'settings.lang_section_app': 'LINGUA INTERFACCIA',
@@ -1009,7 +1009,7 @@
       'update.installing': 'Waiting for you to confirm',
       'update.needs_permission': 'Allow installing — tap',
       'update.failed': 'Not now — tap to retry',
-      'settings.version_label': 'Sonora v1.0.3-beta · LiquidGlass',
+      'settings.version_label': 'Sonora v1.0.4-beta · LiquidGlass',
 
       // Language & Region settings
       'settings.lang_section_app': 'INTERFACE LANGUAGE',

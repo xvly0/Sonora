@@ -1034,6 +1034,29 @@ function scheduleSceneAnimRedraw(withOv) {
   D.gl = true;
 }
 if (typeof window !== 'undefined') window.scheduleSceneAnimRedraw = scheduleSceneAnimRedraw;
+function onPagePush() {
+  if (typeof document === 'undefined' || !S || S.width <= 0 || S.height <= 0) return;
+  const Punder = topPage();
+  if (!Punder) return;
+  if (!_underPageCv) { _underPageCv = document.createElement('canvas'); _underPageCtx = _underPageCv.getContext('2d'); }
+  if (_underPageCv.width !== S.width || _underPageCv.height !== S.height) {
+    _underPageCv.width = S.width; _underPageCv.height = S.height;
+  }
+  _underPageCtx.setTransform(1, 0, 0, 1, 0, 0);
+  _underPageCtx.clearRect(0, 0, _underPageCv.width, _underPageCv.height);
+  _underPageCtx.drawImage(S, 0, 0);
+  const st = _underPageState;
+  st.page = Punder;
+  st.kind = Punder.kind;
+  st.scroll = Punder.scroll;
+  st.w = W;
+  st.h = H;
+  st.dpr = S.width;
+  st.dark = pal.dark;
+  st.snap = true;
+  st.glass = typeof SET_GLASS !== 'undefined' ? SET_GLASS.slice() : [];
+}
+if (typeof window !== 'undefined') window.onPagePush = onPagePush;
 function drawScene() {
   window.__IN_DRAW_SCENE = true;
   try {
@@ -1069,16 +1092,17 @@ function drawScene() {
       }
       if (s.length > 1 && pp > .001) {
         const Punder = s[s.length - 2], oxUnder = -W * .28 * (1 - pp), underAmt = 1 - pp;
-        const canUseUnderCache = typeof document !== 'undefined' && S.width > 0 && S.height > 0 &&
-          !(typeof _skulletActive !== 'undefined' && _skulletActive) && !(typeof window !== 'undefined' && window._artFadeActive);
+        const st = _underPageState;
+        const hasSnap = Boolean(st.snap && st.page === Punder && st.kind === Punder.kind && st.w === W && st.h === H && st.dpr === S.width && st.dark === pal.dark && _underPageCv);
+        const canUseUnderCache = hasSnap || (typeof document !== 'undefined' && S.width > 0 && S.height > 0 &&
+          !(typeof _skulletActive !== 'undefined' && _skulletActive) && !(typeof window !== 'undefined' && window._artFadeActive));
         if (canUseUnderCache) {
           if (!_underPageCv) { _underPageCv = document.createElement('canvas'); _underPageCtx = _underPageCv.getContext('2d'); }
           if (_underPageCv.width !== S.width || _underPageCv.height !== S.height) {
             _underPageCv.width = S.width; _underPageCv.height = S.height;
-            _underPageState.page = null;
+            st.page = null; st.snap = false;
           }
-          const st = _underPageState;
-          if (st.page !== Punder || st.kind !== Punder.kind || st.scroll !== Punder.scroll || st.w !== W || st.h !== H || st.dpr !== S.width || st.dark !== pal.dark) {
+          if (!hasSnap && (st.page !== Punder || st.kind !== Punder.kind || st.scroll !== Punder.scroll || st.w !== W || st.h !== H || st.dpr !== S.width || st.dark !== pal.dark)) {
             const uc = _underPageCtx;
             const gStart = typeof SET_GLASS !== 'undefined' ? SET_GLASS.length : 0;
             uc.setTransform(S.width / W, 0, 0, S.height / H, 0, 0);
@@ -1094,10 +1118,10 @@ function drawScene() {
             } else {
               st.glass = [];
             }
-            const hadAnim = (typeof _skulletActive !== 'undefined' && _skulletActive) || _waveVis || (typeof window !== 'undefined' && !!window._artFadeActive);
+            const hadAnim = (typeof _skulletActive !== 'undefined' && _skulletActive) || (typeof window !== 'undefined' && !!window._artFadeActive);
             if (typeof window !== 'undefined' && prevArtFade) window._artFadeActive = true;
             st.page = hadAnim ? null : Punder;
-            st.kind = Punder.kind; st.scroll = Punder.scroll; st.w = W; st.h = H; st.dpr = S.width; st.dark = pal.dark;
+            st.kind = Punder.kind; st.scroll = Punder.scroll; st.w = W; st.h = H; st.dpr = S.width; st.dark = pal.dark; st.snap = false;
           }
           c.save();
           c.beginPath(); c.rect(0, 0, Math.min(W, pp * W + 2), H); c.clip();
@@ -1112,6 +1136,7 @@ function drawScene() {
         }
       } else if (_underPageState.page) {
         _underPageState.page = null;
+        _underPageState.snap = false;
         _underPageState.glass = [];
       }
       drawPageAt(c, P, pp * W, 0);
@@ -2880,8 +2905,14 @@ function physics(dt) {
   { const pt = hasPill(P) ? clamp((P.scroll - 30) / 110, 0, 1) : 0; if (Math.abs(NAV.pk - pt) > .001) { NAV.pk = ease(NAV.pk, pt, 14, dt); if (Math.abs(NAV.pk - pt) <= .001) NAV.pk = pt; redraw(); } else if (NAV.pk !== pt) { NAV.pk = pt; redraw(); } }
   { const qt = hasPill(P) && P.qOpen ? 1 : 0; P.qT = P.qT || 0; if (Math.abs(P.qT - qt) > .001) { P.qT = ease(P.qT, qt, 16, dt); if (Math.abs(P.qT - qt) <= .001) P.qT = qt; redraw(); } else if (P.qT !== qt) { P.qT = qt; redraw(); } }
   if (!(INP.down && INP.mode === 'edge') && NAV.popP !== NAV.popT) {
-    NAV.popP = ease(NAV.popP, NAV.popT, 13, dt);
-    if (Math.abs(NAV.popP - NAV.popT) < .0015) { NAV.popP = NAV.popT; if (NAV.popT === 1) { stackOf().pop(); NAV.popP = NAV.popT = 0; } }
+    NAV.popP = ease(NAV.popP, NAV.popT, 14.5, dt);
+    if (Math.abs(NAV.popP - NAV.popT) < .0025) {
+      NAV.popP = NAV.popT;
+      NAV.pushP = 0;
+      if (NAV.popT === 1) { stackOf().pop(); NAV.popP = NAV.popT = 0; }
+      if (typeof _covPump === 'function') _covPump();
+      if (typeof _pumpArtUpQ === 'function') _pumpArtUpQ();
+    }
     redraw();
   }
   if (!(INP.down && INP.mode === 'scroll')) {

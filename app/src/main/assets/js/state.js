@@ -1737,6 +1737,7 @@ function push(kind, data) {
     if (typeof INP !== 'undefined') INP.focusPending = false;
     if (typeof $q !== 'undefined' && $q) $q.blur();
   }
+  if (typeof window !== 'undefined' && typeof window.onPagePush === 'function') window.onPagePush();
   stackOf().push(mkPage(kind, data)); NAV.popP = 1; NAV.popT = 0; NAV.pushP = 1; if (typeof armHistory === 'function') armHistory(); redraw();
 }
 function pop() { if (stackOf().length > 1) { NAV.popT = 1; NAV.pushP = 0; redraw(); } }

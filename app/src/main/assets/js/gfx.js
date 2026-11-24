@@ -107,7 +107,7 @@ function _isScrollOrAnimBusy() {
     const tp = topPage();
     if (tp && Math.abs(tp.vel || 0) > 45) return true;
   }
-  if (typeof NAV !== 'undefined' && NAV && (NAV.popP > 0.01 || NAV.pushP > 0.01 || NAV.popT > 0.01)) return true;
+  if (typeof NAV !== 'undefined' && NAV && (NAV.popP > 0.002 || NAV.popT > 0.002)) return true;
   if (typeof _tabTrans !== 'undefined' && _tabTrans && _tabTrans.active) return true;
   if (typeof SH !== 'undefined' && SH && (SH.drag || (SH.t > 0.01 && SH.t < 0.99) || Math.abs(SH.qVel || 0) > 25 || Math.abs(SH.lVel || 0) > 25)) return true;
   return false;
